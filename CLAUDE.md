@@ -50,7 +50,7 @@ echo "target/\n__pycache__/\n*.pyc\n.env\nmodels/" > .gitignore
 - [ ] **Install ROCm 6.0+** for AMD GPU support
 - [ ] **Verify GPU access**: `rocm-smi` shows your Radeon 9060 XT
 - [ ] **Install Rust**: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-- [ ] **Install Python 3.10+**: `sudo apt install python3.10 python3.10-venv`
+- [ ] **Install Python 3.10+**: `sudo apt install python3.14 python3.14-venv`
 - [ ] **Install Docker** (optional): `sudo apt install docker.io docker-compose`
 - [ ] **Create Python virtual environment**: `python3 -m venv venv`
 

@@ -1,0 +1,35 @@
+[package]
+name = "worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# gRPC
+tonic = { version = "0.12.0", features = ["transport"] }
+prost = "0.13.0"
+
+# Burn (AMD GPU)
+burn = { version = "0.6.0", features = ["gpu"] }
+# Optional: add "cpu" if you also want CPU fallback
+# burn = { version = "0.6.0", features = ["cpu", "gpu"] }
+
+# Logging
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["fmt"] }
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+
+[build-dependencies]
+tonic-build = "0.12.0"
+
+[features]
+default = []
+hip = []
+
+worker/build.rs
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_build::compile_protos("cluster.proto")?;
+    Ok(())
+}

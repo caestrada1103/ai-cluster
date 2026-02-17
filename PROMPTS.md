@@ -9,7 +9,7 @@ Use this markdown as prompts for an AI assistant (like Cursor, GitHub Copilot, o
 # 📁 Project Structure to Generate
 
 ```
-ai-cluster/
+AICluster/
 ├── Cargo.toml                 # Rust workspace config
 ├── pyproject.toml             # Python project config
 ├── docker-compose.yml         # Multi-container setup
@@ -17,50 +17,50 @@ ai-cluster/
 │
 ├── coordinator/               # Python orchestration layer
 │   ├── __init__.py
-│   ├── main.py                # FastAPI server
-│   ├── coordinator.py         # Core coordinator logic
-│   ├── models.py              # Model registry
-│   ├── discovery.py           # Worker discovery
-│   ├── router.py              # Request routing
-│   └── requirements.txt       # Python dependencies
+│   ├── coordinator/main.py                # FastAPI server
+│   ├── coordinator/coordinator.py         # Core coordinator logic
+│   ├── coordinator/models.py              # Model registry
+│   ├── coordinator/discovery.py           # Worker discovery
+│   ├── coordinator/router.py              # Request routing
+│   └── coordinator/requirements.txt       # Python dependencies
 │
 ├── worker/                    # Rust worker implementation
-│   ├── Cargo.toml             # Worker dependencies
-│   ├── build.rs                # Protobuf compilation
-│   ├── src/
-│   │   ├── main.rs             # Entry point
-│   │   ├── worker.rs            # gRPC service
-│   │   ├── model_loader.rs      # Load models
-│   │   ├── models/
-│   │   │   ├── mod.rs
-│   │   │   ├── deepseek.rs      # DeepSeek architecture
-│   │   │   └── llama.rs         # Llama architecture
-│   │   ├── gpu_manager.rs       # Multi-GPU support
-│   │   ├── parallelism.rs       # Model parallelism
-│   │   └── metrics.rs           # Prometheus metrics
-│   └── examples/
-│       └── simple_inference.rs  # Test example
+│   ├── worker/Cargo.toml             # Worker dependencies
+│   ├── worker/build.rs                # Protobuf compilation
+│   ├── worker/src/
+│   │   ├── worker/src/main.rs             # Entry point
+│   │   ├── worker/src/worker.rs            # gRPC service
+│   │   ├── worker/src/model_loader.rs      # Load models
+│   │   ├── worker/src/models/
+│   │   │   ├── worker/src/models/mod.rs
+│   │   │   ├── worker/src/models/deepseek.rs      # DeepSeek architecture
+│   │   │   └── worker/src/models/llama.rs         # Llama architecture
+│   │   ├── worker/src/gpu_manager.rs       # Multi-GPU support
+│   │   ├── worker/src/parallelism.rs       # Model parallelism
+│   │   └── worker/src/metrics.rs           # Prometheus metrics
+│   └── worker/examples/
+│       └── worker/examples/simple_inference.rs  # Test example
 │
 ├── proto/                      # gRPC definitions
-│   └── cluster.proto
+│   └── proto/cluster.proto
 │
 ├── scripts/                     # Utility scripts
-│   ├── convert_model.py         # HF to Burn converter
-│   ├── benchmark.py             # Load testing
-│   └── setup_rocm.sh            # ROCm setup helper
+│   ├── scripts/convert_model.py         # HF to Burn converter
+│   ├── scripts/benchmark.py             # Load testing
+│   └── scripts/setup_rocm.sh            # ROCm setup helper
 │
 ├── config/                      # Configuration
-│   ├── coordinator.yaml
-│   ├── worker.toml
-│   └── models.toml
+│   ├── config/coordinator.yaml
+│   ├── config/worker.toml
+│   └── config/models.toml
 │
 ├── tests/                       # Integration tests
-│   ├── test_coordinator.py
-│   └── test_worker.rs
+│   ├── tests/test_coordinator.py
+│   └── tests/test_worker.rs
 │
 └── docs/                        # Documentation
-    ├── architecture.md
-    └── api_reference.md
+    ├── docs/architecture.md
+    └── docs/api_reference.md
 ```
 
 ---
@@ -72,11 +72,11 @@ Copy and paste this prompt to your AI assistant:
 ```
 Generate the complete project initialization files for an AI cluster system using Python (coordinator) and Rust (workers) with Burn framework. Include:
 
-1. Top-level README.md explaining the project
-2. Cargo.toml for Rust workspace
-3. pyproject.toml for Python project
-4. docker-compose.yml for containerization
-5. Basic .gitignore
+Top-level README.md explaining the project
+Cargo.toml for Rust workspace
+pyproject.toml for Python project
+docker-compose.yml for containerization
+Basic .gitignore
 
 The system should support:
 - Multi-GPU inference on AMD (ROCm) and NVIDIA (CUDA)
