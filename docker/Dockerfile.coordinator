@@ -1,0 +1,106 @@
+# Multi-stage build for Python coordinator
+# ========================================
+
+# Stage 1: Build stage
+FROM python:3.10-slim AS builder
+
+# Set build arguments
+ARG DEBIAN_FRONTEND=noninteractive
+ARG POETRY_VERSION=1.7.0
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Poetry
+RUN pip install --no-cache-dir "poetry==${POETRY_VERSION}"
+
+# Set working directory
+WORKDIR /build
+
+# Copy dependency files
+COPY coordinator/pyproject.toml coordinator/poetry.lock* ./
+
+# Configure Poetry
+RUN poetry config virtualenvs.create false \
+    && poetry config installer.max-workers 10
+
+# Install dependencies
+RUN poetry install --no-interaction --no-ansi --no-root --only main
+
+# Copy source code
+COPY coordinator/ ./coordinator/
+COPY proto/ ./proto/
+
+# Generate gRPC code
+RUN python -m grpc_tools.protoc \
+    -I./proto \
+    --python_out=./coordinator \
+    --grpc_python_out=./coordinator \
+    ./proto/cluster.proto
+
+# Fix imports in generated files
+RUN sed -i 's/import cluster_pb2 as cluster__pb2/import coordinator.cluster_pb2 as cluster__pb2/' \
+    ./coordinator/cluster_pb2_grpc.py
+
+# Install the package
+RUN poetry install --no-interaction --no-ansi --only main
+
+# Stage 2: Runtime stage
+FROM python:3.10-slim
+
+# Set labels
+LABEL maintainer="Carlos Estrada <caestrada1103@gmail.com>"
+LABEL description="AI Cluster Coordinator"
+LABEL version="0.1.0"
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN groupadd -r -g 1000 coordinator && \
+    useradd -r -g coordinator -u 1000 -m -d /app coordinator
+
+# Create necessary directories
+RUN mkdir -p /app/config /app/models /app/data /app/logs && \
+    chown -R coordinator:coordinator /app
+
+# Set working directory
+WORKDIR /app
+
+# Copy from builder
+COPY --from=builder --chown=coordinator:coordinator /usr/local/lib/python3.10/site-packages/ /usr/local/lib/python3.10/site-packages/
+COPY --from=builder --chown=coordinator:coordinator /build/coordinator /app/coordinator
+COPY --chown=coordinator:coordinator config/coordinator.yaml /app/config/
+COPY --chown=coordinator:coordinator config/models.toml /app/config/
+COPY --chown=coordinator:coordinator config/logging.yaml /app/config/
+
+# Switch to non-root user
+USER coordinator
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Expose ports
+EXPOSE 8000  # HTTP API
+EXPOSE 9090  # Metrics
+
+# Set entrypoint
+ENTRYPOINT ["python", "-m", "uvicorn"]
+
+# Default command
+CMD ["coordinator.main:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"]

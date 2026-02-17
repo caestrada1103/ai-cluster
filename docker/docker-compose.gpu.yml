@@ -1,0 +1,124 @@
+# Docker Compose for GPU workers
+# ===============================
+
+version: '3.8'
+
+services:
+  # AMD GPU worker
+  worker-amd-0:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+      args:
+        GPU_BACKEND: hip
+    image: ai-worker:amd
+    container_name: ai-worker-amd-0
+    runtime: runc
+    privileged: true
+    environment:
+      - WORKER_ID=amd-gpu-0
+      - GRPC_PORT=50051
+      - METRICS_PORT=9091
+      - GPU_IDS=0
+      - RUST_LOG=info
+      - ROCM_VISIBLE_DEVICES=0
+      - HIP_VISIBLE_DEVICES=0
+    volumes:
+      - ../config:/app/config:ro
+      - ../models:/app/models:ro
+      - ../data:/app/data
+      - /opt/rocm:/opt/rocm:ro
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    devices:
+      - /dev/kfd
+      - /dev/dri/renderD128
+    group_add:
+      - video
+      - render
+    networks:
+      - ai-cluster-net
+    ports:
+      - "50051:50051"
+      - "9091:9091"
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: amd
+              count: 1
+              capabilities: [gpu, compute]
+
+  # NVIDIA GPU worker
+  worker-nvidia-0:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+      args:
+        GPU_BACKEND: cuda
+    image: ai-worker:nvidia
+    container_name: ai-worker-nvidia-0
+    runtime: nvidia
+    environment:
+      - WORKER_ID=nvidia-gpu-0
+      - GRPC_PORT=50052
+      - METRICS_PORT=9092
+      - GPU_IDS=0
+      - RUST_LOG=info
+      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ../config:/app/config:ro
+      - ../models:/app/models:ro
+      - ../data:/app/data
+    networks:
+      - ai-cluster-net
+    ports:
+      - "50052:50052"
+      - "9092:9092"
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, utility]
+
+  # CPU-only worker (fallback)
+  worker-cpu-0:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+      args:
+        GPU_BACKEND: wgpu
+    image: ai-worker:cpu
+    container_name: ai-worker-cpu-0
+    environment:
+      - WORKER_ID=cpu-0
+      - GRPC_PORT=50053
+      - METRICS_PORT=9093
+      - RUST_LOG=info
+    volumes:
+      - ../config:/app/config:ro
+      - ../models:/app/models:ro
+      - ../data:/app/data
+    networks:
+      - ai-cluster-net
+    ports:
+      - "50053:50053"
+      - "9093:9093"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 32G
+
+networks:
+  ai-cluster-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

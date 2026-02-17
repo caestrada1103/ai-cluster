@@ -1,0 +1,89 @@
+# Prometheus Configuration
+# =======================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: ai-cluster
+    environment: production
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+# Rule files
+rule_files:
+  - "alerts.yml"
+
+# Scrape configurations
+scrape_configs:
+  # Coordinator metrics
+  - job_name: "coordinator"
+    static_configs:
+      - targets: ["coordinator:9090"]
+    metrics_path: /metrics
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    scheme: http
+    basic_auth:
+      username: prometheus
+      password: password
+
+  # Worker metrics
+  - job_name: "workers"
+    static_configs:
+      - targets:
+          - "worker-amd-0:9091"
+          - "worker-amd-1:9091"
+          - "worker-nvidia-0:9091"
+    metrics_path: /metrics
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    scheme: http
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: "([^:]+).*"
+        replacement: "${1}"
+
+  # Node metrics (system)
+  - job_name: "node"
+    static_configs:
+      - targets:
+          - "node-exporter:9100"
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+  # GPU metrics (via DCGM for NVIDIA)
+  - job_name: "dcgm"
+    static_configs:
+      - targets: ["dcgm-exporter:9400"]
+    scrape_interval: 15s
+    scrape_timeout: 5s
+
+  # GPU metrics (via ROCm for AMD)
+  - job_name: "rocm"
+    static_configs:
+      - targets: ["rocm-exporter:9445"]
+    scrape_interval: 15s
+    scrape_timeout: 5s
+
+  # Process metrics
+  - job_name: "process"
+    static_configs:
+      - targets: ["process-exporter:9256"]
+    scrape_interval: 30s
+    scrape_timeout: 5s
+
+  # Model metrics
+  - job_name: "models"
+    static_configs:
+      - targets: ["coordinator:9090"]
+    metrics_path: /metrics/models
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    scheme: http

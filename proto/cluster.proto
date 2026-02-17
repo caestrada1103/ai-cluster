@@ -1,0 +1,163 @@
+syntax = "proto3";
+
+package cluster;
+
+// Worker service - runs on each GPU node
+service Worker {
+    // Load a model onto the worker's GPU(s)
+    rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+    
+    // Run inference on loaded model
+    rpc Infer(InferenceRequest) returns (stream InferenceResponse);
+    
+    // Get worker status (GPUs, memory, health)
+    rpc GetStatus(Empty) returns (WorkerStatus);
+    
+    // Unload model and free GPU memory
+    rpc UnloadModel(UnloadModelRequest) returns (Empty);
+    
+    // Health check for liveness probes
+    rpc HealthCheck(Empty) returns (HealthCheckResponse);
+}
+
+// Empty message for requests with no parameters
+message Empty {}
+
+// GPU information
+message GPUInfo {
+    int32 id = 1;                       // GPU index (0, 1, 2...)
+    string name = 2;                     // GPU model name
+    uint64 total_memory = 3;              // Total VRAM in bytes
+    uint64 available_memory = 4;          // Free VRAM in bytes
+    float utilization = 5;                 // GPU utilization (0-100)
+    float temperature = 6;                 // Temperature in Celsius
+    uint32 power_usage = 7;                // Power usage in watts
+    repeated string capabilities = 8;       // e.g., ["fp16", "tensorcore"]
+}
+
+// Model loading request
+message LoadModelRequest {
+    string model_name = 1;                 // e.g., "deepseek-7b"
+    string model_path = 2;                 // Path to model weights
+    ModelConfig config = 3;                 // Model configuration
+    repeated int32 gpu_ids = 4;             // Which GPUs to use (empty = all)
+    Quantization quantization = 5;           // Quantization type
+    ParallelismStrategy parallelism = 6;     // How to parallelize across GPUs
+}
+
+// Model configuration
+message ModelConfig {
+    string architecture = 1;                 // e.g., "deepseek_v2", "llama"
+    uint32 num_layers = 2;
+    uint32 hidden_size = 3;
+    uint32 num_attention_heads = 4;
+    uint32 num_kv_heads = 5;
+    uint32 vocab_size = 6;
+    uint32 max_position_embeddings = 7;
+    uint32 intermediate_size = 8;
+    float rms_norm_eps = 9;
+    map<string, string> metadata = 10;       // Additional arch-specific params
+}
+
+// Quantization types
+enum Quantization {
+    NONE = 0;
+    FP16 = 1;
+    INT8 = 2;
+    INT4 = 3;
+    FP8 = 4;
+}
+
+// Parallelism strategies
+enum ParallelismStrategy {
+    AUTO = 0;                    // Automatically select best strategy
+    SINGLE_DEVICE = 1;           // Single GPU
+    PIPELINE = 2;                 // Split layers across GPUs
+    TENSOR = 3;                   // Split tensors across GPUs
+    DATA = 4;                     // Replicate model, split batch
+    EXPERT = 5;                   // Split experts across GPUs (MoE models)
+}
+
+message LoadModelResponse {
+    bool success = 1;
+    string message = 2;
+    uint64 memory_used = 3;                // VRAM used by model in bytes
+    repeated int32 loaded_on_gpus = 4;       // GPUs where model is loaded
+}
+
+// Inference request
+message InferenceRequest {
+    string model_name = 1;                   // Which model to use
+    string prompt = 2;                       // Input text
+    uint32 max_tokens = 3;                    // Maximum tokens to generate
+    float temperature = 4;                     // Sampling temperature (0-2)
+    float top_p = 5;                           // Nucleus sampling parameter (0-1)
+    uint32 top_k = 6;                          // Top-k sampling parameter
+    uint32 seed = 7;                           // Random seed (0 = random)
+    bool stream = 8;                           // Whether to stream response
+    string request_id = 9;                     // Unique request ID for tracing
+    map<string, string> parameters = 10;        // Additional model-specific params
+}
+
+// Inference response (streamed)
+message InferenceResponse {
+    string request_id = 1;
+    string text = 2;                            // Generated text chunk
+    uint32 tokens_generated = 3;                 // Total tokens so far
+    bool finished = 4;                           // Whether generation is complete
+    FinishReason finish_reason = 5;               // Why generation stopped
+    uint64 processing_time_ms = 6;                 // Time spent on this chunk
+}
+
+// Reasons why generation finished
+enum FinishReason {
+    UNKNOWN = 0;
+    STOP = 1;                                      // Reached stop token
+    LENGTH = 2;                                     // Reached max_tokens
+    TIMEOUT = 3;                                     // Request timeout
+    ERROR = 4;                                        // Error during generation
+}
+
+// Worker status response
+message WorkerStatus {
+    string worker_id = 1;
+    string version = 2;
+    uint64 uptime_seconds = 3;
+    repeated GPUInfo gpus = 4;
+    repeated LoadedModelInfo loaded_models = 5;
+    float cpu_utilization = 6;
+    uint64 memory_available = 7;
+    uint64 memory_total = 8;
+    uint32 active_requests = 9;
+    uint32 queued_requests = 10;
+}
+
+// Information about loaded models
+message LoadedModelInfo {
+    string model_name = 1;
+    uint64 memory_used = 2;
+    repeated int32 gpu_ids = 3;
+    Quantization quantization = 4;
+    ParallelismStrategy parallelism = 5;
+    uint64 loaded_at_timestamp = 6;
+    uint64 num_inferences = 7;
+}
+
+// Request to unload a model
+message UnloadModelRequest {
+    string model_name = 1;
+    repeated int32 gpu_ids = 2;               // Empty = unload from all GPUs
+    bool force = 3;                             // Force unload even if busy
+}
+
+// Health check response
+message HealthCheckResponse {
+    enum ServingStatus {
+        UNKNOWN = 0;
+        SERVING = 1;
+        NOT_SERVING = 2;
+        DRAINING = 3;                           // Gracefully shutting down
+    }
+    ServingStatus status = 1;
+    string message = 2;
+}

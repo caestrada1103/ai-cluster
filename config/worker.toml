@@ -1,0 +1,237 @@
+# AI Worker Configuration
+# =======================
+
+[worker]
+id = "worker-1"  # Auto-generated if not specified
+version = "0.1.0"
+environment = "production"  # development, staging, production
+
+[grpc]
+port = 50051
+max_message_size_mb = 100
+keepalive_time_ms = 10000
+keepalive_timeout_ms = 5000
+max_pings_without_data = 0
+keepalive_permit_without_calls = true
+concurrent_streams = 100
+
+[metrics]
+port = 9091
+enabled = true
+path = "/metrics"
+histogram_buckets = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+
+[logging]
+level = "info"  # debug, info, warn, error
+format = "json"  # json, text
+output = "stdout"  # stdout, stderr, file
+file_path = "/var/log/ai-cluster/worker.log"
+max_size_mb = 100
+max_backups = 10
+max_age_days = 30
+compress = true
+
+[gpu]
+# Device selection
+device_ids = [0, 1]  # Empty = use all available GPUs
+
+# Memory management
+min_memory_free_gb = 1.0  # Minimum free memory to keep
+memory_fraction = 0.9  # Max fraction of GPU memory to use
+enable_memory_pooling = true
+memory_pool_size_gb = 2.0  # Pool size per GPU
+
+# Performance
+compute_preference = "performance"  # performance, power_saver, balanced
+enable_peer_access = true  # Enable P2P between GPUs
+enable_unified_memory = false
+enable_mps = false  # NVIDIA Multi-Process Service
+enable_migs = false  # Multi-Instance GPU
+
+# Synchronization
+sync_streams = true
+default_stream_priority = 0
+max_concurrent_kernels = 32
+
+[model_loader]
+cache_dir = "/data/models"
+download_dir = "/data/downloads"
+max_concurrent_loads = 2
+load_timeout_seconds = 300
+verify_checksums = true
+enable_mmap = true
+pin_memory = true
+prefetch_size_gb = 2.0
+
+[inference]
+# Generation defaults
+default_max_tokens = 512
+default_temperature = 0.7
+default_top_p = 0.95
+default_top_k = 40
+
+# Performance
+max_batch_size = 32
+batch_timeout_ms = 50
+enable_continuous_batching = true
+max_queued_requests = 1000
+request_timeout_seconds = 60
+
+# KV Cache
+kv_cache:
+  enabled = true
+  max_cache_size_gb = 8.0
+  cache_block_size = 16  # Tokens per block
+  enable_prefix_caching = true
+  eviction_policy = "lru"  # lru, lfu, fifo
+  enable_compression = false
+  compression_algorithm = "zstd"
+
+# Quantization
+supported_quantizations = ["fp16", "int8", "int4"]
+default_quantization = "fp16"
+dynamic_quantization = true
+quantization_calibration_size = 100
+
+# Speculative decoding
+enable_speculative = false
+draft_model_path = "/data/models/tiny-model"
+num_speculative_tokens = 5
+verify_probability = 0.8
+
+[parallelism]
+# Strategy selection
+default_strategy = "auto"  # auto, single, pipeline, tensor, data, expert
+
+# Pipeline parallelism
+pipeline_num_stages = 2
+pipeline_num_microbatches = 4
+enable_interleaved_schedule = true
+
+# Tensor parallelism
+tensor_parallel_size = 2
+enable_sequence_parallel = false
+all_gather_comm = "nccl"  # nccl, rccl, custom
+
+# Data parallelism
+data_parallel_replicas = 1
+gradient_sync_mode = "all_reduce"  # all_reduce, reduce_scatter
+sync_interval_steps = 1
+
+# Expert parallelism (for MoE models)
+num_experts_per_gpu = 8
+expert_routing = "top_k"  # top_k, random, round_robin
+enable_load_balancing = true
+load_balance_threshold = 0.2
+
+[communication]
+# NCCL/RCCL settings
+nccl:
+  timeout_seconds = 30
+  min_ctas = 1
+  max_ctas = 32
+  cga_cluster_size = 2
+  enable_nvlink = true
+  enable_infiniband = true
+
+# RCCL settings (AMD)
+rccl:
+  timeout_seconds = 30
+  enable_xgmi = true
+  enable_pcie = true
+  max_parallel_transfers = 4
+
+# Custom communication
+custom:
+  enable_gdr = false  # GPUDirect RDMA
+  enable_roce = false  # RDMA over Converged Ethernet
+  mpi_path = "/usr/lib/x86_64-linux-gnu/openmpi"
+  use_tcp = false
+  tcp_interface = "eth0"
+
+[tensor]
+# Tensor operations
+enable_tf32 = true  # NVIDIA TF32 precision
+enable_fp16 = true
+enable_bf16 = true  # bfloat16
+enable_int8 = true
+enable_fp8 = false  # FP8 (H100 only)
+
+# Optimization
+enable_tensor_cores = true
+enable_cudnn = true
+enable_cublas = true
+enable_triton = false  # OpenAI Triton kernels
+cudnn_benchmark = false
+allow_tf32 = true
+
+[cache]
+# Model cache
+model_cache_size_gb = 50
+model_cache_ttl_seconds = 3600
+model_cache_eviction_policy = "lru"
+
+# Weight cache
+weight_cache_enabled = true
+weight_cache_size_gb = 10
+weight_cache_compress = true
+
+# Kernel cache
+kernel_cache_enabled = true
+kernel_cache_size = 1000
+kernel_cache_dir = "/tmp/ai-worker/kernels"
+
+[monitoring]
+# Profiling
+enable_profiling = false
+profile_dir = "/tmp/profiles"
+profile_interval_ms = 100
+trace_gpu_kernels = true
+trace_cpu_ops = true
+
+# Alerts
+alert_on_oom = true
+alert_on_timeout = true
+alert_on_error_rate = 0.1
+alert_on_gpu_temp = 85
+alert_on_power_limit = true
+
+[security]
+# Worker security
+enable_isolation = false
+sandbox_path = "/tmp/worker-sandbox"
+enable_seccomp = true
+enable_apparmor = false
+apparmor_profile = "ai-worker"
+
+# Authentication
+require_auth = false
+auth_token = "your-secret-token-here"
+allowed_coordinators = ["192.168.1.100"]
+
+[resources]
+# Resource limits
+max_memory_gb = 128
+max_cpu_cores = 32
+max_threads = 64
+max_open_files = 65535
+nice_level = -5  # Higher priority
+scheduler_policy = "fifo"  # fifo, rr, other
+
+[advanced]
+# Development settings
+debug = false
+trace_allocations = false
+validate_kernels = false
+sync_after_each_op = false
+detect_anomalies = false
+compile_verbose = false
+dump_graphs = false
+graph_dump_dir = "/tmp/graphs"
+
+# Error handling
+panic_on_error = false
+recover_from_oom = true
+auto_restart_on_failure = true
+max_restarts = 5
+restart_delay_seconds = 10

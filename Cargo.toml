@@ -1,18 +1,29 @@
 [workspace]
-  members = [
-      "coordinator",
-      "worker",
-  ]
+members = ["worker"]
+resolver = "2"
 
-  [workspace.dependencies]
-  burn = "0.4"
-  burn-tensor = "0.4"
-  burn-optimizer = "0.4"
-  burn-core = "0.4"
-  anyhow = "1.0"
-  tokio = { version = "1", features = ["full"] }
-  tonic = "0.9"
-  prost = "0.9"
-  serde = { version = "1.0", features = ["derive"] }
-  serde_json = "1.0"
-  prometheus = "0.13"
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Carlos Estrada <caestrada1103@gmail.com>"]
+
+[workspace.dependencies]
+burn = { version = "0.19", default-features = false }
+burn-cubecl = "0.19"
+burn-tensor = "0.19"
+tokio = { version = "1.35", features = ["full"] }
+tonic = "0.10"
+prost = "0.12"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+prometheus = "0.13"
+metrics = "0.21"
+metrics-exporter-prometheus = "0.12"
+futures = "0.3"
+async-trait = "0.1"

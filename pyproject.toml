@@ -1,21 +1,59 @@
-[build-system]
-requires = ["setuptools>=42", "wheel", "setuptools_scm"]
-build-backend = "setuptools.build_meta"
-
 [project]
-name = "ai-cluster"
-description = "Python coordinator + Rust workers using Burn"
+name = "ai-cluster-coordinator"
 version = "0.1.0"
+description = "Python coordinator for distributed AI inference cluster"
 readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Carlos Estrada", email = "caestrada1103@gmail.com" }
+]
+
 dependencies = [
-    "fastapi>=0.110.0",
-    "uvicorn[standard]>=0.30.0",
-    "grpcio>=1.65.0",
-    "grpcio-tools>=1.65.0",
-    "pydantic>=2.6.0",
-    "httpx>=0.27.0",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "grpcio>=1.59.0",
+    "grpcio-tools>=1.59.0",
+    "aiohttp>=3.9.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "pyyaml>=6.0",
+    "toml>=0.10.2",
+    "prometheus-client>=0.19.0",
+    "python-multipart>=0.0.6",
+    "httpx>=0.25.0",
+    "tenacity>=8.2.0",
+    "circuitbreaker>=1.4.0",
+    "asyncio-throttle>=1.0.0",
+    "huggingface-hub>=0.20.0",
+    "safetensors>=0.4.0",
+    "numpy>=1.24.0",
+    "torch>=2.1.0",  # For conversion scripts only
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "mypy>=1.8", "ruff>=0.1.10"]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.11.0",
+    "ruff>=0.1.0",
+    "mypy>=1.7.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "B"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true

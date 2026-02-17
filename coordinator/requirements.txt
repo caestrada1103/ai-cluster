@@ -1,0 +1,35 @@
+# Core dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+grpcio==1.59.2
+grpcio-tools==1.59.2
+pydantic==2.5.0
+pydantic-settings==2.1.0
+pyyaml==6.0.1
+toml==0.10.2
+
+# Async HTTP
+aiohttp==3.9.1
+httpx==0.25.1
+
+# Monitoring
+prometheus-client==0.19.0
+
+# Resilience
+tenacity==8.2.3
+circuitbreaker==1.4.0
+asyncio-throttle==1.0.0
+
+# Model conversion (optional)
+huggingface-hub==0.20.1
+safetensors==0.4.1
+numpy==1.24.4
+torch==2.1.1
+
+# Development
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+black==23.11.0
+ruff==0.1.6
+mypy==1.7.1

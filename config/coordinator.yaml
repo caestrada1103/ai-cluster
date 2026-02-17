@@ -1,0 +1,182 @@
+# AI Cluster Coordinator Configuration
+# ====================================
+
+# Server settings
+server:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4  # Number of worker processes
+  timeout_seconds: 60
+  max_request_size_mb: 100
+
+# API settings
+api:
+  prefix: "/v1"
+  enable_docs: true
+  enable_auth: false
+  rate_limit_per_minute: 60
+  cors_origins:
+    - "*"
+
+# Worker discovery
+discovery:
+  method: "mdns"  # Options: static, mdns, broadcast, consul
+  static_workers:
+    - "192.168.1.10:50051"
+    - "192.168.1.11:50051"
+    - "worker1.local:50051"
+  mdns:
+    service_name: "_ai-worker._tcp.local."
+    discovery_interval_seconds: 30
+  broadcast:
+    interface: "eth0"
+    port: 50052
+    broadcast_address: "255.255.255.255"
+  consul:
+    host: "consul.service.consul"
+    port: 8500
+    service_name: "ai-worker"
+    datacenter: "dc1"
+
+# Health monitoring
+health:
+  check_interval_seconds: 30
+  check_timeout_seconds: 5
+  max_failures: 3
+  recovery_timeout_seconds: 60
+  startup_grace_period_seconds: 10
+
+# Request routing
+routing:
+  strategy: "least_load"  # Options: round_robin, least_load, random, affinity
+  queue_size: 1000
+  request_timeout_seconds: 60
+  max_retries: 3
+  retry_delay_ms: 100
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    recovery_timeout_seconds: 30
+    half_open_requests: 3
+
+# Model management
+models:
+  config_file: "config/models.toml"
+  cache_dir: "/data/models"
+  download_dir: "/data/downloads"
+  auto_load_on_startup: true
+  auto_unload_after_idle_minutes: 60
+  max_loaded_models_per_worker: 5
+  default_model: "deepseek-7b"
+  warm_up_models: true
+  warm_up_prompts:
+    - "Hello, how are you?"
+    - "Explain quantum computing"
+    - "Write a short poem"
+
+# Performance tuning
+performance:
+  enable_batching: true
+  max_batch_size: 32
+  batch_timeout_ms: 50
+  enable_streaming: true
+  enable_compression: true
+  compression_threshold_bytes: 1024
+  prewarm_workers: true
+  max_concurrent_requests_per_worker: 10
+
+# Security
+security:
+  enable_tls: false
+  cert_file: "/etc/ai-cluster/cert.pem"
+  key_file: "/etc/ai-cluster/key.pem"
+  enable_auth: false
+  auth_method: "api_key"  # Options: none, api_key, jwt, oauth2
+  api_keys:
+    - "sk-1234567890abcdef"
+    - "sk-0987654321fedcba"
+  jwt_secret: "your-secret-key-here"
+  jwt_algorithm: "HS256"
+  allowed_users:
+    - "admin"
+    - "user1"
+
+# Logging
+logging:
+  level: "info"  # Options: debug, info, warning, error
+  format: "json"  # Options: json, text
+  output: "stdout"  # Options: stdout, stderr, file
+  file: "/var/log/ai-cluster/coordinator.log"
+  max_size_mb: 100
+  max_backups: 10
+  max_age_days: 30
+  compress: true
+
+# Monitoring
+monitoring:
+  enabled: true
+  metrics_port: 9090
+  metrics_path: "/metrics"
+  prometheus:
+    enabled: true
+    histogram_buckets: [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+  grafana:
+    dashboard_path: "monitoring/grafana-dashboards"
+  tracing:
+    enabled: false
+    jaeger_host: "jaeger.service.consul"
+    jaeger_port: 6831
+    sample_rate: 0.1
+
+# Resource limits
+resources:
+  max_memory_gb: 128
+  max_cpu_cores: 32
+  disk_cache_gb: 500
+  max_open_files: 65535
+
+# Database (for request tracking and analytics)
+database:
+  enabled: false
+  type: "sqlite"  # Options: sqlite, postgres, mysql
+  sqlite_path: "/data/coordinator.db"
+  postgres_dsn: "postgresql://user:pass@localhost:5432/ai-cluster"
+  mysql_dsn: "mysql://user:pass@localhost:3306/ai-cluster"
+  max_connections: 10
+  connection_timeout_seconds: 5
+
+# Cache settings
+cache:
+  enabled: true
+  type: "memory"  # Options: memory, redis, memcached
+  memory_max_size_mb: 1024
+  redis_host: "redis.service.consul"
+  redis_port: 6379
+  redis_password: ""
+  memcached_hosts:
+    - "memcached1:11211"
+    - "memcached2:11211"
+  ttl_seconds: 3600
+
+# Notifications
+notifications:
+  enabled: false
+  slack_webhook_url: "https://hooks.slack.com/services/xxx/yyy/zzz"
+  email_smtp_host: "smtp.gmail.com"
+  email_smtp_port: 587
+  email_username: "alerts@example.com"
+  email_password: "password"
+  email_recipients:
+    - "admin@example.com"
+    - "oncall@example.com"
+
+# Advanced settings
+advanced:
+  debug_mode: false
+  profile_memory: false
+  profile_cpu: false
+  enable_pprof: false
+  pprof_port: 6060
+  enable_reflection: true  # gRPC reflection for debugging
+  enable_health_check: true
+  shutdown_timeout_seconds: 30

@@ -1,48 +1,184 @@
-version: "3.9"
+# Root docker-compose.yml
+# =======================
+# Primary Docker Compose configuration for the AI Cluster
+
+version: '3.8'
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
+  # Coordinator
   coordinator:
     build:
       context: .
-      dockerfile: Dockerfile.coordinator
+      dockerfile: docker/Dockerfile.coordinator
+    image: ai-coordinator:latest
+    container_name: ai-coordinator
+    environment:
+      - COORDINATOR_HOST=0.0.0.0
+      - COORDINATOR_PORT=8000
+      - DISCOVERY_METHOD=mdns
+      - RUST_LOG=info
+      - CONFIG_FILE=/app/config/coordinator.yaml
+    volumes:
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+    networks:
+      - ai-cluster-net
     ports:
-      - "8000:8000"
-    environment:
-      - PYTHONUNBUFFERED=1
+      - "8000:8000"   # HTTP API
+      - "9090:9090"   # Metrics
     depends_on:
-      - worker1
-      - worker2
-    volumes:
-      - ./models:/app/models:ro
+      - prometheus
+      - grafana
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
 
-  worker1:
+  # AMD GPU Worker
+  worker-amd-0:
     build:
       context: .
-      dockerfile: Dockerfile.worker
+      dockerfile: docker/Dockerfile.worker
+      args:
+        GPU_BACKEND: hip
+    image: ai-worker:amd
+    container_name: ai-worker-amd-0
+    runtime: runc
+    privileged: true
     environment:
-      - WORKER_PORT=50051
+      - WORKER_ID=amd-gpu-0
+      - GRPC_PORT=50051
+      - METRICS_PORT=9091
+      - GPU_IDS=0
+      - RUST_LOG=info
+      - ROCM_VISIBLE_DEVICES=0
+    volumes:
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+      - ./data:/app/data
+      - /opt/rocm:/opt/rocm:ro
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    devices:
+      - /dev/kfd
+      - /dev/dri/renderD128
+    group_add:
+      - video
+      - render
+    networks:
+      - ai-cluster-net
+    ports:
+      - "50051:50051"
+      - "9091:9091"
+    logging: *default-logging
+    depends_on:
+      - coordinator
+    restart: unless-stopped
     deploy:
       resources:
         reservations:
           devices:
-            - driver: "rocm"
+            - driver: amd
               count: 1
-              capabilities: [gpu]
-    volumes:
-      - ./models:/app/models:ro
+              capabilities: [gpu, compute]
 
-  worker2:
+  # NVIDIA GPU Worker
+  worker-nvidia-0:
     build:
       context: .
-      dockerfile: Dockerfile.worker
+      dockerfile: docker/Dockerfile.worker
+      args:
+        GPU_BACKEND: cuda
+    image: ai-worker:nvidia
+    container_name: ai-worker-nvidia-0
+    runtime: nvidia
     environment:
-      - WORKER_PORT=50052
+      - WORKER_ID=nvidia-gpu-0
+      - GRPC_PORT=50052
+      - METRICS_PORT=9092
+      - GPU_IDS=0
+      - RUST_LOG=info
+      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+      - ./data:/app/data
+    networks:
+      - ai-cluster-net
+    ports:
+      - "50052:50052"
+      - "9092:9092"
+    logging: *default-logging
+    depends_on:
+      - coordinator
+    restart: unless-stopped
     deploy:
       resources:
         reservations:
           devices:
-            - driver: "rocm"
+            - driver: nvidia
               count: 1
-              capabilities: [gpu]
+              capabilities: [gpu, utility]
+
+  # Monitoring Stack
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ai-prometheus
     volumes:
-      - ./models:/app/models:ro
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    networks:
+      - ai-cluster-net
+    ports:
+      - "9090:9090"
+    logging: *default-logging
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ai-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana-dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana-datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - ai-cluster-net
+    ports:
+      - "3000:3000"
+    logging: *default-logging
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+networks:
+  ai-cluster-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  prometheus-data:
+  grafana-data:

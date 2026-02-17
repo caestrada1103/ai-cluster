@@ -1,0 +1,128 @@
+# Prometheus Alert Rules
+# ======================
+
+groups:
+  - name: ai_cluster_alerts
+    interval: 30s
+    rules:
+      # Worker availability
+      - alert: WorkerDown
+        expr: up{job="workers"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Worker {{ $labels.instance }} is down"
+          description: "Worker has been down for more than 1 minute."
+
+      - alert: WorkerUnhealthy
+        expr: worker_health_status{job="workers"} == 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker {{ $labels.instance }} is unhealthy"
+          description: "Worker health check failed"
+
+      # GPU alerts
+      - alert: GPUHighTemperature
+        expr: gpu_temperature_celsius > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU {{ $labels.gpu }} on {{ $labels.instance }} temperature is high"
+          description: "GPU temperature is {{ $value }}°C (threshold 85°C)"
+
+      - alert: GPUOOM
+        expr: gpu_memory_free_bytes < 1e9  # Less than 1GB free
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "GPU {{ $labels.gpu }} on {{ $labels.instance }} is running out of memory"
+          description: "Only {{ $value | humanize1024 }} free memory"
+
+      - alert: GPUUtilizationLow
+        expr: gpu_utilization_percent < 10
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "GPU {{ $labels.gpu }} on {{ $labels.instance }} utilization is low"
+          description: "GPU utilization is {{ $value }}% for 30 minutes"
+
+      - alert: GPUPowerLimit
+        expr: gpu_power_usage_watts > gpu_power_limit_watts * 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU {{ $labels.gpu }} on {{ $labels.instance }} approaching power limit"
+          description: "Power usage: {{ $value }}W, limit: {{ $labels.limit }}W"
+
+      # Inference alerts
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, sum(rate(inference_duration_seconds_bucket[5m])) by (le, model)) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High latency for model {{ $labels.model }}"
+          description: "P95 latency is {{ $value }}s (threshold 5s)"
+
+      - alert: HighErrorRate
+        expr: sum(rate(inference_errors_total[5m])) / sum(rate(inference_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate"
+          description: "Error rate is {{ $value | percentage }} for last 5 minutes"
+
+      - alert: QueueBacklog
+        expr: worker_queued_requests > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Request queue backlog on {{ $labels.instance }}"
+          description: "{{ $value }} requests queued"
+
+      # Model alerts
+      - alert: ModelLoadFailed
+        expr: increase(model_load_failures_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Model load failures detected"
+          description: "{{ $value }} model loads failed in last 5 minutes"
+
+      - alert: ModelMemoryHigh
+        expr: model_memory_used_bytes > model_memory_limit_bytes * 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Model {{ $labels.model }} using high memory"
+          description: "Using {{ $value | humanize1024 }} of {{ $labels.limit | humanize1024 }}"
+
+      # System alerts
+      - alert: HighCPUUsage
+        expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 90
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: "CPU usage is {{ $value }}%"
+
+      - alert: DiskSpaceLow
+        expr: node_filesystem_free_bytes{mountpoint="/data"} < node_filesystem_size_bytes{mountpoint="/data"} * 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Low disk space on {{ $labels.instance }}"
+          description: "Only {{ $value | humanize1024 }} free"
