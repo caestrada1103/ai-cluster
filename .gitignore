@@ -26,6 +26,7 @@ htmlcov/
 # Models
 /models/*
 !models/.gitkeep
+/worker/data/
 
 # Config
 /config/local.yaml
