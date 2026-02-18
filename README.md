@@ -83,6 +83,18 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
 
 ---
 
+---
+
+## Tech Stack
+
+- **Coordinator**: Python (FastAPI, gRPC)
+- **Worker**: Rust (Burn Framework, Tokio, Tonic)
+- **Communication**: gRPC (Inter-service), REST API (Client-facing)
+- **GPU Acceleration**:
+    - **AMD**: ROCm (HIP)
+    - **NVIDIA**: CUDA
+- **Infrastructure**: Docker, Prometheus, Grafana, Jaeger
+
 ## Architecture
 
 ```
@@ -172,20 +184,20 @@ cp .env.example .env
 # You will need to build separate worker binaries for each GPU type.
 # See docs/deployment.md for detailed instructions.
 
-# 3. Build and start with Docker Compose
+# 6. Build and start with Docker Compose
 docker-compose up -d
 
-# 4. Check that everything is running
+# 7. Check that everything is running
 curl http://localhost:8000/health
 
-# 5. Download and load a model
+# 8. Download and load a model
 python scripts/convert_model.py deepseek-ai/deepseek-llm-7b-base --output ./models/
 
 curl -X POST http://localhost:8000/v1/models/load \
   -H "Content-Type: application/json" \
   -d '{"model_name": "deepseek-7b"}'
 
-# 6. Run your first inference
+# 9. Run your first inference
 curl -X POST http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
