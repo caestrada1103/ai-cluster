@@ -3,64 +3,32 @@
 //! Implements Meta's Llama architecture with grouped-query attention,
 //! RMS normalization, and SwiGLU activation.
 
-use std::sync::Arc;
-
 use burn::{
-    module::Module,
-    nn::{
-        Linear, LinearConfig,
-        Embedding, EmbeddingConfig,
-        RmsNorm, RmsNormConfig,
-        Dropout, DropoutConfig,
-        cache::Cache,
-    },
-    tensor::{Tensor, backend::Backend},
-    tensor::activation::silu,
-    nn::transformer::{RotaryEncoding, RotaryEncodingConfig},
-    config::Config,
+    module::{Module, Ignored},
+    nn::{Linear, LinearConfig, Embedding, EmbeddingConfig},
+    tensor::{backend::Backend, Tensor},
 };
-use tracing::{info, debug, instrument};
-use async_trait::async_trait;
-
-use super::{
-    Model, ModelConfig, ModelOutput, ModelInput, TokenStream,
-    common::SwiGLU,
-};
-use crate::cluster::Quantization;
+use super::{Model, ModelConfig, ModelOutput, ModelInput, TokenStream};
+use super::common::{RMSNorm, RotaryEmbedding, swiglu, repeat_kv};
 use crate::error::WorkerError;
 
-/// Llama attention mechanism with Grouped-Query Attention (GQA)
+// ---------------------------------------------------------------------------
+// Attention
+// ---------------------------------------------------------------------------
+
+/// Llama attention mechanism with Grouped-Query Attention (GQA).
 #[derive(Module, Debug)]
 pub struct LlamaAttention<B: Backend> {
-    /// Query projection
     q_proj: Linear<B>,
-    
-    /// Key projection
     k_proj: Linear<B>,
-    
-    /// Value projection
     v_proj: Linear<B>,
-    
-    /// Output projection
     o_proj: Linear<B>,
-    
-    /// Number of query heads
+    #[module(skip)]
     num_heads: usize,
-    
-    /// Number of key/value heads (for GQA)
+    #[module(skip)]
     num_kv_heads: usize,
-    
-    /// Head dimension
+    #[module(skip)]
     head_dim: usize,
-    
-    /// Rotary positional embeddings
-    rotary: RotaryEncoding<B>,
-    
-    /// Attention dropout
-    dropout: Dropout,
-    
-    /// Scale factor for attention scores
-    scale: f64,
 }
 
 impl<B: Backend> LlamaAttention<B> {
@@ -70,301 +38,170 @@ impl<B: Backend> LlamaAttention<B> {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
-        max_seq_len: usize,
-        rope_theta: f32,
-        dropout_prob: f64,
         device: &B::Device,
     ) -> Self {
-        assert_eq!(hidden_size, num_heads * head_dim);
-        
+        let q_out = num_heads * head_dim;
+        let kv_out = num_kv_heads * head_dim;
+
         Self {
-            q_proj: LinearConfig::new(hidden_size, num_heads * head_dim)
-                .with_bias(false)
-                .init(device),
-            k_proj: LinearConfig::new(hidden_size, num_kv_heads * head_dim)
-                .with_bias(false)
-                .init(device),
-            v_proj: LinearConfig::new(hidden_size, num_kv_heads * head_dim)
-                .with_bias(false)
-                .init(device),
-            o_proj: LinearConfig::new(num_heads * head_dim, hidden_size)
-                .with_bias(false)
-                .init(device),
+            q_proj: LinearConfig::new(hidden_size, q_out).with_bias(false).init(device),
+            k_proj: LinearConfig::new(hidden_size, kv_out).with_bias(false).init(device),
+            v_proj: LinearConfig::new(hidden_size, kv_out).with_bias(false).init(device),
+            o_proj: LinearConfig::new(q_out, hidden_size).with_bias(false).init(device),
             num_heads,
             num_kv_heads,
             head_dim,
-            rotary: RotaryEncodingConfig::new(head_dim)
-                .with_max_seq_len(max_seq_len)
-                .with_theta(rope_theta)
-                .init(device),
-            dropout: DropoutConfig::new(dropout_prob).init(),
-            scale: 1.0 / (head_dim as f64).sqrt(),
         }
     }
-    
-    /// Forward pass with optional cache
+
+    /// Forward pass
     pub fn forward(
         &self,
         hidden: Tensor<B, 3>,
-        mask: Option<Tensor<B, 2>>,
-        cache: Option<&mut Cache<B>>,
+        rope: &RotaryEmbedding<B>,
+        start_pos: usize,
     ) -> Tensor<B, 3> {
-        let (batch_size, seq_len, _) = hidden.dims();
-        
-        // Project to queries, keys, values
-        let q = self.q_proj.forward(hidden.clone()); // [batch, seq, num_heads * head_dim]
-        let k = self.k_proj.forward(hidden.clone()); // [batch, seq, num_kv_heads * head_dim]
-        let v = self.v_proj.forward(hidden); // [batch, seq, num_kv_heads * head_dim]
-        
-        // Reshape for multi-head attention
-        let q = q.reshape([batch_size, seq_len, self.num_heads, self.head_dim]);
-        let k = k.reshape([batch_size, seq_len, self.num_kv_heads, self.head_dim]);
-        let v = v.reshape([batch_size, seq_len, self.num_kv_heads, self.head_dim]);
-        
-        // Apply rotary embeddings
-        let q = self.rotary.forward(q);
-        let k = self.rotary.forward(k);
-        
-        // Handle cache for incremental decoding
-        let (k, v) = if let Some(cache) = cache {
-            cache.update(k, v)
-        } else {
-            (k, v)
-        };
-        
-        // Repeat k/v heads to match query heads (GQA)
-        let k = self.repeat_kv(k);
-        let v = self.repeat_kv(v);
-        
-        // Transpose for attention computation
-        let q = q.transpose(1, 2); // [batch, num_heads, seq, head_dim]
-        let k = k.transpose(1, 2); // [batch, num_heads, seq, head_dim]
-        let v = v.transpose(1, 2); // [batch, num_heads, seq, head_dim]
-        
-        // Compute attention scores
-        let scores = q.matmul(&k.transpose(2, 3)) * self.scale; // [batch, num_heads, seq, seq]
-        
-        // Apply causal mask
-        let scores = match mask {
-            Some(m) => scores.mask_fill(m, f32::NEG_INFINITY),
-            None => scores,
-        };
-        
-        // Softmax and dropout
-        let probs = scores.softmax(-1);
-        let probs = self.dropout.forward(probs);
-        
-        // Apply attention to values
-        let output = probs.matmul(v); // [batch, num_heads, seq, head_dim]
-        
-        // Transpose and reshape
-        let output = output.transpose(1, 2); // [batch, seq, num_heads, head_dim]
-        let output = output.reshape([batch_size, seq_len, self.num_heads * self.head_dim]);
-        
-        // Final projection
+        let [batch, seq_len, _] = hidden.dims();
+
+        let q = self.q_proj.forward(hidden.clone())
+            .reshape([batch, seq_len, self.num_heads, self.head_dim])
+            .swap_dims(1, 2);
+        let k = self.k_proj.forward(hidden.clone())
+            .reshape([batch, seq_len, self.num_kv_heads, self.head_dim])
+            .swap_dims(1, 2);
+        let v = self.v_proj.forward(hidden)
+            .reshape([batch, seq_len, self.num_kv_heads, self.head_dim])
+            .swap_dims(1, 2);
+
+        // Apply RoPE
+        let (q, k) = rope.apply(q, k, start_pos);
+
+        // Repeat KV heads for GQA
+        let n_rep = self.num_heads / self.num_kv_heads;
+        let k = repeat_kv(k, n_rep);
+        let v = repeat_kv(v, n_rep);
+
+        // Attention
+        let scale = (self.head_dim as f64).sqrt();
+        let attn = q.matmul(k.swap_dims(2, 3)).div_scalar(scale);
+        let attn = burn::tensor::activation::softmax(attn, 3);
+        let output = attn.matmul(v)
+            .swap_dims(1, 2)
+            .reshape([batch, seq_len, self.num_heads * self.head_dim]);
+
         self.o_proj.forward(output)
     }
-    
-    /// Repeat key/value heads to match number of query heads (GQA)
-    fn repeat_kv(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let (batch_size, seq_len, num_kv_heads, head_dim) = x.dims();
-        
-        if self.num_heads == num_kv_heads {
-            x
-        } else {
-            let num_reps = self.num_heads / num_kv_heads;
-            
-            // Repeat each head num_reps times
-            let expanded = x.unsqueeze::<5>(); // [batch, seq, 1, num_kv_heads, head_dim]
-            let repeated = expanded.repeat(2, num_reps); // [batch, seq, num_reps, num_kv_heads, head_dim]
-            
-            // Reshape to combine the repetition dimension with num_kv_heads
-            repeated.reshape([batch_size, seq_len, self.num_heads, head_dim])
-        }
-    }
 }
+
+// ---------------------------------------------------------------------------
+// MLP
+// ---------------------------------------------------------------------------
 
 /// Llama MLP with SwiGLU activation
 #[derive(Module, Debug)]
 pub struct LlamaMLP<B: Backend> {
-    /// Gate projection (for SwiGLU)
     gate_proj: Linear<B>,
-    
-    /// Up projection
     up_proj: Linear<B>,
-    
-    /// Down projection
     down_proj: Linear<B>,
 }
 
 impl<B: Backend> LlamaMLP<B> {
-    /// Create new Llama MLP
     pub fn new(
         hidden_size: usize,
         intermediate_size: usize,
         device: &B::Device,
     ) -> Self {
         Self {
-            gate_proj: LinearConfig::new(hidden_size, intermediate_size)
-                .with_bias(false)
-                .init(device),
-            up_proj: LinearConfig::new(hidden_size, intermediate_size)
-                .with_bias(false)
-                .init(device),
-            down_proj: LinearConfig::new(intermediate_size, hidden_size)
-                .with_bias(false)
-                .init(device),
+            gate_proj: LinearConfig::new(hidden_size, intermediate_size).with_bias(false).init(device),
+            up_proj: LinearConfig::new(hidden_size, intermediate_size).with_bias(false).init(device),
+            down_proj: LinearConfig::new(intermediate_size, hidden_size).with_bias(false).init(device),
         }
     }
-    
-    /// Forward pass with SwiGLU
+
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
-        let gate = silu(self.gate_proj.forward(input.clone()));
+        let gate = self.gate_proj.forward(input.clone());
         let up = self.up_proj.forward(input);
-        let hidden = gate * up;
-        self.down_proj.forward(hidden)
+        self.down_proj.forward(swiglu(gate, up))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Transformer Layer
+// ---------------------------------------------------------------------------
 
 /// Llama transformer layer
 #[derive(Module, Debug)]
 pub struct LlamaLayer<B: Backend> {
-    /// Self-attention
     attention: LlamaAttention<B>,
-    
-    /// MLP
     mlp: LlamaMLP<B>,
-    
-    /// Pre-attention layer norm
-    input_layernorm: RmsNorm<B>,
-    
-    /// Pre-MLP layer norm
-    post_attention_layernorm: RmsNorm<B>,
+    input_layernorm: RMSNorm<B>,
+    post_attention_layernorm: RMSNorm<B>,
 }
 
 impl<B: Backend> LlamaLayer<B> {
-    /// Create new Llama layer
     pub fn new(
         hidden_size: usize,
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
         intermediate_size: usize,
-        max_seq_len: usize,
-        rope_theta: f32,
         rms_norm_eps: f32,
         device: &B::Device,
     ) -> Self {
         Self {
-            attention: LlamaAttention::new(
-                hidden_size,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                max_seq_len,
-                rope_theta,
-                0.0, // Llama doesn't use attention dropout
-                device,
-            ),
+            attention: LlamaAttention::new(hidden_size, num_heads, num_kv_heads, head_dim, device),
             mlp: LlamaMLP::new(hidden_size, intermediate_size, device),
-            input_layernorm: RmsNormConfig::new(hidden_size)
-                .with_eps(rms_norm_eps)
-                .init(device),
-            post_attention_layernorm: RmsNormConfig::new(hidden_size)
-                .with_eps(rms_norm_eps)
-                .init(device),
+            input_layernorm: RMSNorm::new(hidden_size, rms_norm_eps as f64, device),
+            post_attention_layernorm: RMSNorm::new(hidden_size, rms_norm_eps as f64, device),
         }
     }
-    
-    /// Forward pass through layer
+
     pub fn forward(
         &self,
         input: Tensor<B, 3>,
-        mask: Option<Tensor<B, 2>>,
-        cache: Option<&mut Cache<B>>,
+        rope: &RotaryEmbedding<B>,
+        start_pos: usize,
     ) -> Tensor<B, 3> {
-        // Pre-norm attention
-        let normed = self.input_layernorm.forward(input.clone());
-        let attn_out = self.attention.forward(normed, mask, cache);
-        
-        // First residual
-        let after_attn = attn_out + input.clone();
-        
-        // Pre-norm MLP
-        let normed_mlp = self.post_attention_layernorm.forward(after_attn.clone());
-        let mlp_out = self.mlp.forward(normed_mlp);
-        
-        // Second residual
-        mlp_out + after_attn
+        let residual = input.clone();
+        let x = self.input_layernorm.forward(input);
+        let x = self.attention.forward(x, rope, start_pos);
+        let x = x + residual;
+
+        let residual = x.clone();
+        let x = self.post_attention_layernorm.forward(x);
+        let x = self.mlp.forward(x);
+        x + residual
     }
 }
+
+// ---------------------------------------------------------------------------
+// Full Model
+// ---------------------------------------------------------------------------
 
 /// Complete Llama model
 #[derive(Module, Debug)]
 pub struct Llama<B: Backend> {
-    /// Token embeddings
     embed_tokens: Embedding<B>,
-    
-    /// Transformer layers
     layers: Vec<LlamaLayer<B>>,
-    
-    /// Final layer norm
-    norm: RmsNorm<B>,
-    
-    /// Output projection (sometimes tied with embeddings)
+    norm: RMSNorm<B>,
     lm_head: Linear<B>,
-    
-    /// Whether to tie weights
-    tie_word_embeddings: bool,
-    
-    /// Model configuration
-    config: Arc<ModelConfig>,
-    
-    /// Load timestamp
-    loaded_at: std::time::SystemTime,
-    
-    /// Inference count
-    inference_count: std::sync::atomic::AtomicU64,
-    
-    /// GPU IDs this model is loaded on
-    gpu_ids: Vec<usize>,
-    
-    /// Quantization type
-    quantization: Quantization,
+    config: Ignored<LlamaConfig>,
+    rope: RotaryEmbedding<B>,
 }
 
 /// Llama configuration
-#[derive(Debug, Clone, Config)]
+#[derive(Debug, Clone)]
 pub struct LlamaConfig {
-    /// Hidden size
     pub hidden_size: usize,
-    
-    /// Number of layers
     pub num_layers: usize,
-    
-    /// Number of attention heads
     pub num_attention_heads: usize,
-    
-    /// Number of KV heads (for GQA)
     pub num_kv_heads: usize,
-    
-    /// Vocabulary size
-    pub vocab_size: usize,
-    
-    /// Maximum sequence length
-    pub max_seq_len: usize,
-    
-    /// Intermediate size (FFN dimension)
+    pub head_dim: usize,
     pub intermediate_size: usize,
-    
-    /// RMS norm epsilon
+    pub vocab_size: usize,
+    pub max_seq_len: usize,
     pub rms_norm_eps: f32,
-    
-    /// Rotary embedding theta
     pub rope_theta: f32,
-    
-    /// Whether to tie word embeddings
-    pub tie_word_embeddings: bool,
 }
 
 impl LlamaConfig {
@@ -374,48 +211,48 @@ impl LlamaConfig {
             hidden_size: 4096,
             num_layers: 32,
             num_attention_heads: 32,
-            num_kv_heads: 8,  // GQA with 8 KV heads
+            num_kv_heads: 8,
+            head_dim: 128,
+            intermediate_size: 14336,
             vocab_size: 128256,
             max_seq_len: 8192,
-            intermediate_size: 14336,
             rms_norm_eps: 1e-5,
             rope_theta: 500000.0,
-            tie_word_embeddings: false,
         }
     }
-    
+
     /// Create configuration for Llama 3 70B
     pub fn llama3_70b() -> Self {
         Self {
             hidden_size: 8192,
             num_layers: 80,
             num_attention_heads: 64,
-            num_kv_heads: 8,  // GQA with 8 KV heads
+            num_kv_heads: 8,
+            head_dim: 128,
+            intermediate_size: 28672,
             vocab_size: 128256,
             max_seq_len: 8192,
-            intermediate_size: 28672,
             rms_norm_eps: 1e-5,
             rope_theta: 500000.0,
-            tie_word_embeddings: false,
         }
     }
-    
+
     /// Create configuration for Llama 2 7B
     pub fn llama2_7b() -> Self {
         Self {
             hidden_size: 4096,
             num_layers: 32,
             num_attention_heads: 32,
-            num_kv_heads: 32,  // MHA (no GQA)
+            num_kv_heads: 32,
+            head_dim: 128,
+            intermediate_size: 11008,
             vocab_size: 32000,
             max_seq_len: 4096,
-            intermediate_size: 11008,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
-            tie_word_embeddings: false,
         }
     }
-    
+
     /// Convert to generic ModelConfig
     pub fn to_model_config(&self) -> ModelConfig {
         ModelConfig {
@@ -438,164 +275,91 @@ impl LlamaConfig {
 
 impl<B: Backend> Llama<B> {
     /// Create a new Llama model
-    pub fn new(
-        config: &LlamaConfig,
-        device: &B::Device,
-    ) -> Self {
-        let head_dim = config.hidden_size / config.num_attention_heads;
-        
-        let mut layers = Vec::with_capacity(config.num_layers);
-        for _ in 0..config.num_layers {
-            layers.push(LlamaLayer::new(
+    pub fn new(config: &LlamaConfig, device: &B::Device) -> Self {
+        let layers = (0..config.num_layers)
+            .map(|_| LlamaLayer::new(
                 config.hidden_size,
                 config.num_attention_heads,
                 config.num_kv_heads,
-                head_dim,
+                config.head_dim,
                 config.intermediate_size,
-                config.max_seq_len,
-                config.rope_theta,
                 config.rms_norm_eps,
                 device,
-            ));
-        }
-        
-        let embed_tokens = EmbeddingConfig::new(config.vocab_size, config.hidden_size)
-            .init(device);
-        
-        let lm_head = if config.tie_word_embeddings {
-            // In tied embeddings, we'll share the weight matrix
-            LinearConfig::new(config.hidden_size, config.vocab_size)
-                .with_bias(false)
-                .init(device)
-                .with_weights(embed_tokens.weight().clone().transpose())
-        } else {
-            LinearConfig::new(config.hidden_size, config.vocab_size)
-                .with_bias(false)
-                .init(device)
-        };
-        
+            ))
+            .collect();
+
+        let rope = RotaryEmbedding::new(
+            config.head_dim,
+            config.max_seq_len,
+            config.rope_theta,
+            device,
+        );
+
         Self {
-            embed_tokens,
-            layers,
-            norm: RmsNormConfig::new(config.hidden_size)
-                .with_eps(config.rms_norm_eps)
+            embed_tokens: EmbeddingConfig::new(config.vocab_size, config.hidden_size)
                 .init(device),
-            lm_head,
-            tie_word_embeddings: config.tie_word_embeddings,
-            config: Arc::new(config.to_model_config()),
-            loaded_at: std::time::SystemTime::now(),
-            inference_count: std::sync::atomic::AtomicU64::new(0),
-            gpu_ids: vec![0],
-            quantization: Quantization::Fp16,
+            layers,
+            norm: RMSNorm::new(config.hidden_size, config.rms_norm_eps as f64, device),
+            lm_head: LinearConfig::new(config.hidden_size, config.vocab_size)
+                .with_bias(false)
+                .init(device),
+            config: Ignored(config.clone()),
+            rope,
         }
     }
-    
+
     /// Forward pass through the model
-    pub fn forward(
+    pub fn forward_pass(
         &self,
-        input_ids: Tensor<B, 2, i64>,
-        mask: Option<Tensor<B, 2>>,
-        cache: Option<&mut Cache<B>>,
+        input_ids: Tensor<B, 2>,
+        start_pos: usize,
     ) -> Tensor<B, 3> {
-        // Token embeddings
-        let mut hidden = self.embed_tokens.forward(input_ids);
-        
-        // Apply transformer layers
+        let mut x = self.embed_tokens.forward(input_ids.int());
+
         for layer in &self.layers {
-            hidden = layer.forward(hidden, mask.clone(), cache.as_deref_mut());
+            x = layer.forward(x, &self.rope, start_pos);
         }
-        
-        // Final normalization
-        hidden = self.norm.forward(hidden);
-        
-        // Output projection
-        self.lm_head.forward(hidden)
+
+        let x = self.norm.forward(x);
+        self.lm_head.forward(x)
     }
-    
-    /// Generate logits for the next token (with caching)
-    pub fn forward_next(
-        &self,
-        input_ids: Tensor<B, 2, i64>,
-        cache: &mut Cache<B>,
-    ) -> Tensor<B, 2> {
-        let logits = self.forward(input_ids, None, Some(cache));
-        
-        // Take last token's logits
-        let last_logits = logits.slice([0..1, -1.., 0..self.config.vocab_size]);
-        last_logits.squeeze(1)
+
+    /// Estimate memory usage in bytes (FP16)
+    pub fn memory_usage(&self) -> usize {
+        let c = &self.config;
+        let embed = c.vocab_size * c.hidden_size;
+        let attn = c.num_layers * 4 * c.hidden_size * c.hidden_size;
+        let ffn = c.num_layers * 3 * c.hidden_size * c.intermediate_size;
+        let norm = (c.num_layers * 2 + 1) * c.hidden_size;
+        (embed + attn + ffn + norm) * 2
     }
 }
 
-#[async_trait]
 impl<B: Backend> Model<B> for Llama<B> {
     fn name(&self) -> &str {
         "llama"
     }
-    
-    fn config(&self) -> &ModelConfig {
-        &self.config
+
+    fn config(&self) -> ModelConfig {
+        self.config.to_model_config()
     }
-    
-    async fn forward(&self, input: ModelInput<B>) -> Result<ModelOutput<B>, WorkerError> {
-        let input_ids = input.clone().int();
-        let output = self.forward(input_ids, None, None);
-        Ok(output)
+
+    fn forward(&self, input: ModelInput<B>) -> Result<ModelOutput<B>, WorkerError> {
+        Ok(self.forward_pass(input, 0))
     }
-    
-    async fn generate(
+
+    fn generate(
         &self,
-        prompt: &str,
+        _prompt: &str,
         max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        top_k: usize,
-    ) -> Result<TokenStream<B>, WorkerError> {
-        self.inference_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        
-        Ok(TokenStream::new(
-            Arc::new(self.clone()),
-            prompt,
-            max_tokens,
-            temperature,
-            top_p,
-            top_k,
-        ))
+        _temperature: f32,
+        _top_p: f32,
+        _top_k: usize,
+    ) -> Result<TokenStream, WorkerError> {
+        Ok(TokenStream::new(max_tokens))
     }
-    
+
     fn memory_used(&self) -> usize {
-        // Estimate based on config
-        let num_params = self.config.vocab_size * self.config.hidden_size
-            + self.layers.len() * (
-                self.config.hidden_size * self.config.hidden_size * 3  // Q,K,V projections
-                + self.config.hidden_size * self.config.hidden_size    // O projection
-                + self.config.hidden_size * self.config.intermediate_size * 3  // MLP
-            );
-        
-        // FP16 = 2 bytes per param
-        num_params * 2
-    }
-    
-    fn gpu_ids(&self) -> &[usize] {
-        &self.gpu_ids
-    }
-    
-    fn quantization(&self) -> Quantization {
-        self.quantization
-    }
-    
-    fn parallelism(&self) -> crate::cluster::ParallelismStrategy {
-        if self.layers.len() > 1 {
-            crate::cluster::ParallelismStrategy::Pipeline
-        } else {
-            crate::cluster::ParallelismStrategy::SingleDevice
-        }
-    }
-    
-    fn loaded_at(&self) -> std::time::SystemTime {
-        self.loaded_at
-    }
-    
-    fn inference_count(&self) -> u64 {
-        self.inference_count.load(std::sync::atomic::Ordering::Relaxed)
+        self.memory_usage()
     }
 }

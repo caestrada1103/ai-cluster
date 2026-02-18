@@ -18,9 +18,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=../proto/cluster.proto");
     
     // Detect GPU backend
-    #[cfg(feature = "hip")]
+    #[cfg(feature = "rocm")]
     {
-        println!("cargo:rustc-cfg=feature=\"hip\"");
         println!("cargo:rerun-if-env-changed=ROCM_PATH");
         println!("cargo:rerun-if-env-changed=HIP_PATH");
         

@@ -8,29 +8,18 @@ license = "MIT"
 repository = "https://github.com/caestrada1103/ai-cluster"
 
 [features]
-default = ["hip"]  # Default to AMD ROCm
-cuda = ["burn/cuda", "burn-tensor/cuda", "dep:burn-cuda"]
-hip = ["burn/hip", "burn-tensor/hip", "dep:burn-hip"]
-wgpu = ["burn/wgpu", "burn-tensor/wgpu"]
-metal = ["burn/metal", "burn-tensor/metal"]  # For macOS
-python = ["dep:pyo3"]  # Optional Python bindings
+default = ["wgpu"]  # Auto-detects GPU (NVIDIA, AMD, Intel) via Vulkan/DX12
+cuda = ["burn/cuda"]      # Opt-in: native CUDA for best NVIDIA perf
+rocm = ["burn/rocm"]      # Opt-in: native ROCm for best AMD perf
+wgpu = ["burn/wgpu"]      # Cross-platform GPU via Vulkan/DX12/Metal
+metal = ["wgpu", "burn/metal"]  # macOS Metal via wgpu
+ndarray = ["burn/ndarray"]      # CPU-only fallback
+python = ["dep:pyo3"]
 
 [dependencies]
-# Burn core
-burn = { version = "0.19", default-features = false, features = ["train", "std"] }
-burn-tensor = { version = "0.19", default-features = false }
-burn-core = { version = "0.19", default-features = false }
-burn-dataset = { version = "0.19", default-features = false }
-burn-autodiff = { version = "0.19", default-features = false, optional = true }
-
-# GPU backends (selected via features)
-burn-cuda = { version = "0.19", optional = true }
-burn-hip = { version = "0.19", optional = true }
-burn-wgpu = { version = "0.19", optional = true }
-
-# CubeCL for custom kernels
-burn-cubecl = "0.19"
-cubecl = "0.9"
+# Burn deep learning framework
+# Backends are activated via features above; wgpu auto-detects GPU vendor
+burn = { version = "0.19", default-features = false, features = ["std", "train", "autodiff"] }
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
@@ -40,10 +29,13 @@ async-trait = "0.1"
 # gRPC
 tonic = "0.10"
 prost = "0.12"
+tonic-reflection = "0.10"
+tonic-health = "0.10"
+async-stream = "0.3"
 
 # Logging and tracing
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 
 # Error handling
@@ -63,7 +55,7 @@ prometheus = { version = "0.13", features = ["process"] }
 metrics = "0.21"
 metrics-exporter-prometheus = "0.12"
 
-# HTTP for metrics
+# HTTP for metrics server
 axum = "0.7"
 hyper = { version = "1.0", features = ["full"] }
 
@@ -78,8 +70,11 @@ num_cpus = "1.16"
 
 # Model loading
 safetensors = "0.4"
-tokenizers = "0.15"  # HuggingFace tokenizers
-hf-hub = "0.3"  # HuggingFace hub client
+tokenizers = "0.15"
+hf-hub = { version = "0.4.3", features = ["tokio"] }
+
+# Optional Python bindings
+pyo3 = { version = "0.20", optional = true }
 
 [build-dependencies]
 tonic-build = "0.10"
@@ -87,12 +82,10 @@ tonic-build = "0.10"
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3.8"
+tracing-test = "0.2"
+proptest = "1.4"
+async-trait = "0.1"
 
 [[bench]]
 name = "inference"
 harness = false
-
-[profile.release]
-lto = true
-codegen-units = 1
-opt-level = 3

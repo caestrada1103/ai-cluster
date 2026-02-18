@@ -1,0 +1,24 @@
+# AI Worker Configuration
+
+# Network
+grpc_port = 50051
+metrics_port = 9091
+
+# Hardware resources
+gpu_ids = [0]
+max_concurrent_loads = 2
+max_concurrent_requests = 32
+pin_memory = false
+
+# Storage
+model_cache_dir = "./data/models"
+download_dir = "./data/downloads"
+
+# Loading behavior
+load_timeout_secs = 600
+request_timeout_secs = 60
+verify_checksums = true
+enable_mmap = true
+
+# Optional: HuggingFace Token (can also be set via HF_TOKEN env var)
+# hf_token = "hf_..."

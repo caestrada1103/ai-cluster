@@ -33,7 +33,7 @@ services:
       - ai-cluster-net
     ports:
       - "8000:8000"   # HTTP API
-      - "9090:9090"   # Metrics
+      - "9092:9090"   # Metrics (host 9092 to avoid Prometheus conflict)
     depends_on:
       - prometheus
       - grafana
