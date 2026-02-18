@@ -52,7 +52,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile.worker
       args:
-        GPU_BACKEND: hip
+        GPU_BACKEND: rocm
     image: ai-worker:amd
     container_name: ai-worker-amd-0
     runtime: runc

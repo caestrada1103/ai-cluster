@@ -15,21 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Poetry
-RUN pip install --no-cache-dir "poetry==${POETRY_VERSION}"
-
-# Set working directory
-WORKDIR /build
-
-# Copy dependency files
-COPY coordinator/pyproject.toml coordinator/poetry.lock* ./
-
-# Configure Poetry
-RUN poetry config virtualenvs.create false \
-    && poetry config installer.max-workers 10
-
 # Install dependencies
-RUN poetry install --no-interaction --no-ansi --no-root --only main
+COPY coordinator/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source code
 COPY coordinator/ ./coordinator/
@@ -96,8 +84,8 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Expose ports
-EXPOSE 8000  # HTTP API
-EXPOSE 9090  # Metrics
+EXPOSE 8000
+EXPOSE 9090
 
 # Set entrypoint
 ENTRYPOINT ["python", "-m", "uvicorn"]

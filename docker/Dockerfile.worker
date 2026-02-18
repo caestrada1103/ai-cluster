@@ -2,26 +2,42 @@
 # ===================================================
 
 # Stage 1: Build stage
-FROM rust:1.70-slim AS builder
-
-# Set build arguments
-ARG DEBIAN_FRONTEND=noninteractive
-ARG GPU_BACKEND=hip  # Options: hip, cuda, wgpu
+# Set build arguments (Global)
+ARG GPU_BACKEND=rocm  # Options: rocm, cuda, wgpu
 ARG TARGETPLATFORM
 
-# Install build dependencies
+# Stage 1: Build stage
+FROM ubuntu:22.04 AS builder
+
+# Redeclare ARGs for this stage
+ARG DEBIAN_FRONTEND=noninteractive
+ARG GPU_BACKEND
+ARG TARGETPLATFORM
+
+# Install build dependencies and Rust
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     pkg-config \
     libssl-dev \
     curl \
+    gnupg \
     git \
     protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/*
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.89 \
+    && . "$HOME/.cargo/env"
+
+# Add cargo to PATH
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Install ROCm dependencies if building for AMD
-RUN if [ "$GPU_BACKEND" = "hip" ]; then \
+RUN if [ "$GPU_BACKEND" = "rocm" ]; then \
+    mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /etc/apt/keyrings/rocm.gpg && \
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.0.2 jammy main" > /etc/apt/sources.list.d/rocm.list && \
+    echo "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600" > /etc/apt/preferences.d/rocm-pin-600 && \
     apt-get update && apt-get install -y --no-install-recommends \
         rocm-dev \
         rocm-libs \
@@ -32,12 +48,13 @@ RUN if [ "$GPU_BACKEND" = "hip" ]; then \
 
 # Install CUDA dependencies if building for NVIDIA
 RUN if [ "$GPU_BACKEND" = "cuda" ]; then \
+    curl -O https://developer.download.nvidia.com/compute/cuda/repos/debian11/x86_64/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && \
+    rm cuda-keyring_1.1-1_all.deb && \
     apt-get update && apt-get install -y --no-install-recommends \
         cuda-compiler-12-1 \
         cuda-libraries-12-1 \
         cuda-cudart-12-1 \
-        libnccl2 \
-        libnccl-dev \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
@@ -51,20 +68,24 @@ COPY worker/build.rs ./
 # Create dummy source for dependency caching
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
-    echo "fn main() {}" > src/lib.rs
+    echo "fn main() {}" > src/lib.rs && \
+    mkdir -p benches && \
+    echo "fn main() {}" > benches/inference.rs
 
 # Build dependencies (cached)
 RUN cargo build --release --features="${GPU_BACKEND}" || true
 
 # Copy actual source code
 COPY worker/src ./src/
+COPY worker/models ./models/
+COPY worker/benches ./benches/
 COPY proto ../proto/
 
 # Build the worker
 RUN cargo build --release --features="${GPU_BACKEND}"
 
 # Stage 2: Runtime for AMD GPU (ROCm)
-FROM rocm/dev-ubuntu-22.04:latest AS runtime-hip
+FROM rocm/dev-ubuntu-22.04:latest AS runtime-rocm
 
 # Set labels
 LABEL maintainer="Carlos Estrada <caestrada1103@gmail.com>"
@@ -94,7 +115,7 @@ RUN groupadd -r -g 1000 worker && \
 RUN usermod -a -G render,video worker
 
 # Stage 2: Runtime for NVIDIA GPU (CUDA)
-FROM nvidia/cuda:12.1-runtime-ubuntu22.04 AS runtime-cuda
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04 AS runtime-cuda
 
 # Set labels
 LABEL maintainer="Carlos Estrada <caestrada1103@gmail.com>"
@@ -109,10 +130,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install CUDA runtime
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libcudart12 \
-    libnccl2 \
-    && rm -rf /var/lib/apt/lists/*
+
 
 # Create non-root user
 RUN groupadd -r -g 1000 worker && \
@@ -170,8 +188,8 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:${METRICS_PORT}/health || exit 1
 
 # Expose ports
-EXPOSE ${GRPC_PORT}  # gRPC
-EXPOSE ${METRICS_PORT}  # Metrics
+EXPOSE ${GRPC_PORT}
+EXPOSE ${METRICS_PORT}
 
 # Set entrypoint
 ENTRYPOINT ["/usr/local/bin/ai-worker"]
