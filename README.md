@@ -379,6 +379,49 @@ response = client.complete(
 
 ---
 
+## Advanced Use Cases
+
+### 1. **Multi-Agent Systems (Agent per GPU)**
+
+You can assign specific models to specific workers to create specialized agents.
+- **Worker 1 (AMD)**: Loads `llama-3-8b` for Coding tasks.
+- **Worker 2 (NVIDIA)**: Loads `mistral-7b` for Reasoning/Review tasks.
+
+**Configuration**:
+No special config needed. Just route your load requests:
+```bash
+# Load Coding Agent on AMD Worker
+curl -X POST http://localhost:8000/v1/models/load \
+  -H "Content-Type: application/json" \
+  -d '{"model_name": "llama3-8b", "worker_id": "amd-gpu-0"}'
+
+# Load Reasoning Agent on NVIDIA Worker
+curl -X POST http://localhost:8000/v1/models/load \
+  -H "Content-Type: application/json" \
+  -d '{"model_name": "mistral-7b", "worker_id": "nvidia-gpu-0"}'
+```
+
+### 2. **Running Large Models (Model Parallelism)**
+
+To run models larger than a single GPU's memory (e.g., Llama 3 70B, Mixtral 8x7B), the cluster automatically splits the model across multiple GPUs.
+
+**Example**: Running Llama 3 70B on 4 GPUs:
+1.  **Configure**: Ensure `config/models.toml` allows sufficient GPUs.
+    ```toml
+    [models.llama3-70b]
+    max_gpus = 8
+    parallelism.default = "auto"
+    ```
+2.  **Load**:
+    ```bash
+    curl -X POST http://localhost:8000/v1/models/load \
+      -H "Content-Type: application/json" \
+      -d '{"model_name": "llama3-70b", "worker_id": "nvidia-gpu-0"}'
+    ```
+The system will automatically allocate 4 GPUs and use **Tensor Parallelism** (faster) or **Pipeline Parallelism** (inter-node) based on topology.
+
+---
+
 ## Installation
 
 ### Prerequisites
