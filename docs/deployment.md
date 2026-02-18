@@ -71,6 +71,7 @@ The AI Cluster can be deployed in various configurations, from a single machine 
 | RAM | 8 GB | 32 GB | 32 GB |
 | Storage | 50 GB | 100 GB | 100 GB |
 | GPU | N/A | N/A | 1x GPU (8GB+) |
+| Mixed-GPU | N/A | N/A | Supported (e.g., AMD + NVIDIA) |
 | Network | 1 Gbps | 1 Gbps | 10 Gbps |
 
 #### Recommended Production Setup
@@ -256,7 +257,19 @@ cd ..
 mkdir -p models
 ```
 
-#### 4. **Configure for Single Machine**
+#### 4. **Build for Mixed-GPU (Optional)**
+If you have both AMD and NVIDIA GPUs on the same machine:
+```bash
+# Build AMD worker
+cargo build --release --features=hip --bin ai-worker
+mv target/release/ai-worker target/release/ai-worker-amd
+
+# Build NVIDIA worker
+cargo build --release --features=cuda --bin ai-worker
+mv target/release/ai-worker target/release/ai-worker-nvidia
+```
+
+#### 5. **Configure for Single Machine**
 
 Edit `config/coordinator.yaml`:
 ```yaml

@@ -3,18 +3,16 @@
 //! This module contains the implementations of different model architectures
 //! supported by the AI cluster, including DeepSeek, Llama, and Mistral.
 
-mod deepseek;
-mod llama;
-mod mistral;
-mod common;
+pub mod deepseek;
+pub mod llama;
+pub mod mistral;
+pub mod common;
 
-pub use deepseek::{DeepSeek, DeepSeekConfig};
-pub use llama::{Llama, LlamaConfig};
-pub use mistral::{Mistral, MistralConfig};
-pub use common::*;
+
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use burn::tensor::{Tensor, backend::Backend};
 use crate::error::WorkerError;
 
@@ -101,6 +99,23 @@ pub struct ModelConfig {
 /// (which is parameterized by `B: Backend`) lives behind an `Arc<dyn Model<B>>`
 /// inside worker internals. `ModelInstance` is used for observation and
 /// lifecycle tracking without needing to know the concrete backend.
+use futures::Stream;
+use std::pin::Pin;
+
+/// Trait for type-erased text generation
+pub trait TextGeneration: Send {
+    /// Generate text stream
+    fn generate(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String, WorkerError>> + Send>>, WorkerError>;
+}
+
+/// A loaded model instance with metadata for lifecycle management.
 #[derive(Clone)]
 pub struct ModelInstance {
     /// Model name
@@ -123,6 +138,9 @@ pub struct ModelInstance {
 
     /// Inference count
     inference_count: Arc<AtomicU64>,
+
+    /// The actual model (type-erased, behind Mutex for Sync)
+    model: Option<Arc<Mutex<dyn TextGeneration + Send>>>,
 }
 
 impl ModelInstance {
@@ -133,6 +151,7 @@ impl ModelInstance {
         gpu_ids: Vec<u32>,
         quantization: i32,
         parallelism: i32,
+        model: Option<Arc<Mutex<dyn TextGeneration + Send>>>,
     ) -> Self {
         Self {
             name,
@@ -142,6 +161,7 @@ impl ModelInstance {
             parallelism,
             loaded_at: chrono::Utc::now(),
             inference_count: Arc::new(AtomicU64::new(0)),
+            model,
         }
     }
 
@@ -180,18 +200,26 @@ impl ModelInstance {
         self.inference_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Generate text (placeholder — delegates to underlying model)
+    /// Generate text (delegates to underlying model)
     pub async fn generate(
         &self,
-        _prompt: &str,
-        _max_tokens: usize,
-        _temperature: f32,
-        _top_p: f32,
-        _top_k: usize,
-    ) -> Result<TokenStream, WorkerError> {
-        // In a real implementation, this would dispatch to the loaded model.
-        // For now, return a placeholder stream.
-        Ok(TokenStream::new(_max_tokens))
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String, WorkerError>> + Send>>, WorkerError> {
+        if let Some(model) = &self.model {
+            let stream = {
+                let guard = model.lock()
+                    .map_err(|e| WorkerError::Internal(format!("Lock error: {}", e)))?;
+                guard.generate(prompt, max_tokens, temperature, top_p, top_k)?
+            }; // guard dropped here, stream is 'static
+            Ok(stream)
+        } else {
+             // Placeholder for now (should be error or dummy stream)
+             Ok(Box::pin(TokenStream::new(max_tokens)))
+        }
     }
 }
 
@@ -216,15 +244,7 @@ impl TokenStream {
         }
     }
 
-    /// Get next token in the stream
-    pub async fn next(&mut self) -> Option<Result<String, WorkerError>> {
-        if self.position >= self.max_tokens {
-            return None;
-        }
 
-        self.position += 1;
-        Some(Ok(" generated".to_string()))
-    }
 }
 
 impl futures::Stream for TokenStream {

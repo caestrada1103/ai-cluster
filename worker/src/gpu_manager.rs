@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use burn::tensor::backend::Backend;
+
 use dashmap::DashMap;
 use tokio::sync::Semaphore;
 use tracing::{info, warn, debug};

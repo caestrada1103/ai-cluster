@@ -18,6 +18,7 @@ use tonic::transport::Server;
 use tracing::{info, warn, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+pub mod backend;
 mod config;
 mod error;
 mod gpu_manager;

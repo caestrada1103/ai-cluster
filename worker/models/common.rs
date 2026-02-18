@@ -2,7 +2,7 @@
 //!
 //! Re-exported via `pub use common::*` in `mod.rs`.
 
-use burn::module::Module;
+use burn::module::{Module, Param, ParamId};
 use burn::nn;
 use burn::tensor::{backend::Backend, Tensor};
 
@@ -14,7 +14,7 @@ use burn::tensor::{backend::Backend, Tensor};
 #[derive(Module, Debug)]
 pub struct RMSNorm<B: Backend> {
     /// Learned scale parameter.
-    pub weight: Tensor<B, 1>,
+    pub weight: Param<Tensor<B, 1>>,
     /// Small epsilon for numerical stability.
     #[module(skip)]
     pub eps: f64,
@@ -24,7 +24,7 @@ impl<B: Backend> RMSNorm<B> {
     /// Create a new RMSNorm layer.
     pub fn new(hidden_size: usize, eps: f64, device: &B::Device) -> Self {
         Self {
-            weight: Tensor::ones([hidden_size], device),
+            weight: Param::initialized(ParamId::new(), Tensor::ones([hidden_size], device)),
             eps,
         }
     }
@@ -34,7 +34,8 @@ impl<B: Backend> RMSNorm<B> {
         // variance = mean(x^2, dim=-1, keepdim=True)
         let variance = x.clone().powf_scalar(2.0).mean_dim(2);
         let x_normed = x * (variance + self.eps).sqrt().recip();
-        x_normed * self.weight.clone().unsqueeze()
+        let w: Tensor<B, 1> = (*self.weight).clone();
+        x_normed * w.unsqueeze()
     }
 }
 

@@ -19,7 +19,7 @@ use metrics::{
     counter, gauge, histogram,
 };
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use tracing::{info, error};
+use tracing::info;
 
 use crate::gpu_manager::GPUManager;
 use crate::worker::WorkerService;

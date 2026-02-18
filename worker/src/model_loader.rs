@@ -5,44 +5,40 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::Mutex;
+use std::collections::HashMap;
 
 use dashmap::DashMap;
 use tokio::sync::Semaphore;
-use tracing::{info, warn, error};
+use tracing::info;
 use hf_hub::{api::tokio::Api, Repo, RepoType};
-
+use safetensors::SafeTensors;
+use burn::{
+    tensor::Tensor,
+    module::{Module, Param, ConstantRecord, ParamId},
+    nn::{LinearRecord, EmbeddingRecord},
+};
+use half::f16;
 use crate::error::WorkerError;
 use crate::gpu_manager::GPUManager;
 use crate::models::{
-    ModelConfig, ModelInstance,
+    ModelConfig, ModelInstance, TextGeneration,
+    llama::{Llama, LlamaConfig, LlamaRecord, LlamaLayerRecord, LlamaAttentionRecord, LlamaMLPRecord},
+    common::{RMSNormRecord, RotaryEmbeddingRecord, RotaryEmbedding},
 };
+use crate::backend::WorkerBackend;
+use burn::backend::wgpu::WgpuDevice;
 
 /// Model loader configuration
 #[derive(Debug, Clone)]
 pub struct ModelLoaderConfig {
-    /// Directory to cache models
     pub cache_dir: PathBuf,
-
-    /// Directory to download models
     pub download_dir: PathBuf,
-
-    /// Maximum number of concurrent model loads
     pub max_concurrent_loads: usize,
-
-    /// Load timeout in seconds
     pub load_timeout_secs: u64,
-
-    /// Whether to verify checksums
     pub verify_checksums: bool,
-
-    /// Whether to use memory mapping
     pub enable_mmap: bool,
-
-    /// Whether to pin memory
     pub pin_memory: bool,
-
-    /// Prefetch size in GB
     pub prefetch_size_gb: f32,
 }
 
@@ -63,19 +59,10 @@ impl Default for ModelLoaderConfig {
 
 /// Model loader
 pub struct ModelLoader {
-    /// Configuration
     config: ModelLoaderConfig,
-
-    /// GPU manager
     gpu_manager: Arc<GPUManager>,
-
-    /// Loaded models (model_name -> ModelInstance)
     loaded_models: Arc<DashMap<String, ModelInstance>>,
-
-    /// Load semaphore for limiting concurrent loads
     load_semaphore: Arc<Semaphore>,
-
-    /// HuggingFace API client
     hf_api: Option<Api>,
 }
 
@@ -85,12 +72,6 @@ impl ModelLoader {
         config: ModelLoaderConfig,
         gpu_manager: Arc<GPUManager>,
     ) -> Result<Self, WorkerError> {
-        // Initialize HuggingFace API
-        // We need to know if a token is available. 
-        // But ModelLoader doesn't take WorkerConfig, only ModelLoaderConfig.
-        // We should probably add token to ModelLoaderConfig or accept it here.
-        // For now, let's try to get it from env or default.
-        
         let mut builder = hf_hub::api::tokio::ApiBuilder::new()
             .with_endpoint("https://huggingface.co".to_string())
             .with_cache_dir(config.cache_dir.clone());
@@ -101,20 +82,18 @@ impl ModelLoader {
 
         let hf_api = builder.build().ok();
 
-        // Create directories if they don't exist
         std::fs::create_dir_all(&config.cache_dir)?;
         std::fs::create_dir_all(&config.download_dir)?;
 
-        let max_concurrent = config.max_concurrent_loads;
-
         Ok(Self {
-            config,
+            config: config.clone(),
             gpu_manager,
             loaded_models: Arc::new(DashMap::new()),
-            load_semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            load_semaphore: Arc::new(Semaphore::new(config.max_concurrent_loads)),
             hf_api,
         })
     }
+
     /// Load a model
     pub async fn load_model(
         &self,
@@ -124,26 +103,19 @@ impl ModelLoader {
         quantization: crate::cluster::Quantization,
         parallelism: crate::cluster::ParallelismStrategy,
     ) -> Result<ModelInstance, WorkerError> {
-        // Acquire load permit
-        let _permit = self.load_semaphore.acquire().await.map_err(|e| {
-            WorkerError::Resource(format!("Failed to acquire load permit: {}", e))
-        })?;
-
-        info!("Loading model {} with quantization {:?}", model_name, quantization);
-
-        // Check if already loaded
         if let Some(entry) = self.loaded_models.get(model_name) {
             info!("Model {} already loaded", model_name);
             return Ok(entry.value().clone());
         }
 
-        // Determine model path
+        let _permit = self.load_semaphore.acquire().await.map_err(|e| {
+            WorkerError::Resource(format!("Failed to acquire load permit: {}", e))
+        })?;
+
+        info!("Loading model {}...", model_name);
         let model_path = self.get_model_path(model_name).await?;
-
-        // Load model configuration
         let config = self.load_model_config(model_name, model_config, &model_path).await?;
-
-        // Allocate GPU memory
+        
         let memory_used = self.calculate_memory_usage(&config, quantization);
         for &gpu_id in gpu_ids {
             self.gpu_manager.allocate_memory(
@@ -153,271 +125,167 @@ impl ModelLoader {
             ).await?;
         }
 
-        // Create model instance
+        let device = WgpuDevice::BestAvailable;
+
+        // Load weights
+        let mut weights = self.load_safetensors(&model_name, &device).await?;
+
+        // Get model directory (tokenizer.json lives here)
+        let model_path = self.get_model_path(&model_name).await?;
+        // Ensure tokenizer.json is downloaded
+        if let Some(api) = &self.hf_api {
+            let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
+            let _ = repo.get("tokenizer.json").await
+                .map_err(|e| WorkerError::ModelLoad(format!("Failed to download tokenizer.json: {}", e)))?;
+            info!("Tokenizer downloaded to: {:?}", model_path);
+        }
+
+        // Instantiate model
+        let model: Arc<Mutex<dyn TextGeneration + Send>> = match config.architecture.as_str() {
+            "llama" => {
+                let llama_config = LlamaConfig {
+                    hidden_size: config.hidden_size,
+                    num_layers: config.num_layers,
+                    num_attention_heads: config.num_attention_heads,
+                    num_kv_heads: config.num_kv_heads,
+                    head_dim: config.hidden_size / config.num_attention_heads,
+                    intermediate_size: config.intermediate_size,
+                    vocab_size: config.vocab_size,
+                    max_seq_len: config.max_seq_len,
+                    rms_norm_eps: config.rms_norm_eps,
+                    rope_theta: config.rope_theta,
+                };
+                
+                info!("Mapping weights to LlamaRecord...");
+                let record = create_llama_record(&mut weights, &llama_config, &device)?;
+                info!("Record created. Initializing Llama...");
+                
+                let model = Llama::new(&llama_config, &device, &model_path).load_record(record);
+                Arc::new(Mutex::new(model))
+            }
+            _ => return Err(WorkerError::ModelLoad(format!("Unsupported architecture: {}", config.architecture))),
+        };
+
         let instance = ModelInstance::new(
             model_name.to_string(),
             memory_used,
             gpu_ids.to_vec(),
             quantization as i32,
             parallelism as i32,
+            Some(model),
         );
 
-        // Store in cache
         self.loaded_models.insert(model_name.to_string(), instance.clone());
-
-        info!(
-            "Model {} loaded successfully, using {}MB VRAM",
-            model_name,
-            memory_used / 1024 / 1024
-        );
+        info!("Model {} loaded successfully", model_name);
 
         Ok(instance)
     }
-    /// Get model path (download if necessary)
-    async fn get_model_path(&self, model_name: &str) -> Result<PathBuf, WorkerError> {
-        // Check if model exists in cache -> NO, hf_hub handles caching!
-        // But we want to check if we can skip download checks?
-        // hf_hub checks cache first.
 
-        // Download from HuggingFace
-        if let Some(api) = &self.hf_api {
-            info!("Checking/Downloading model {} from HuggingFace", model_name);
+    async fn load_safetensors(&self, model_name: &str, device: &WgpuDevice) -> Result<HashMap<String, Tensor<WorkerBackend, 1>>, WorkerError> {
+        let api = self.hf_api.as_ref().ok_or(WorkerError::ModelLoad("HF API not initialized".to_string()))?;
+        let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
+        
+        let mut weights = HashMap::new();
+        let mut files = Vec::new();
 
-            let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
-
-            // Download config
-            let _config_path = repo.get("config.json").await.map_err(|e| {
-                WorkerError::ModelLoad(format!("Failed to download config: {}", e))
-            })?;
-
-            // Download model weights (safetensors)
-            let mut model_paths = Vec::new();
-
-            // Try to find safetensors index
-            if let Ok(index_path) = repo.get("model.safetensors.index.json").await {
-                // Sharded model
-                let index: serde_json::Value = serde_json::from_str(
-                    &std::fs::read_to_string(index_path)?
-                )?;
-
-                if let Some(weight_map) = index.get("weight_map").and_then(|v| v.as_object()) {
-                    for (_, filename) in weight_map {
-                        if let Some(fname) = filename.as_str() {
-                            let path = repo.get(fname).await.map_err(|e| {
-                                WorkerError::ModelLoad(format!("Failed to download shard: {}", e))
-                            })?;
-                            model_paths.push(path);
-                        }
-                    }
-                }
-            } else {
-                // Single file model
-                if let Ok(path) = repo.get("model.safetensors").await {
-                    model_paths.push(path);
-                } else if let Ok(path) = repo.get("pytorch_model.bin").await {
-                    model_paths.push(path);
+        // Check for index (sharded) or single file
+        if let Ok(index_path) = repo.get("model.safetensors.index.json").await {
+            let index_content = std::fs::read_to_string(index_path)?;
+            let json: serde_json::Value = serde_json::from_str(&index_content)
+                .map_err(|e| WorkerError::ModelLoad(format!("Json error: {}", e)))?;
+            
+            if let Some(map) = json["weight_map"].as_object() {
+                let mut filenames: Vec<String> = map.values().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                filenames.sort();
+                filenames.dedup();
+                for fname in filenames {
+                    files.push(repo.get(&fname).await.map_err(|e| WorkerError::ModelLoad(e.to_string()))?);
                 }
             }
+        } else if let Ok(path) = repo.get("model.safetensors").await {
+            files.push(path);
+        } else {
+             return Err(WorkerError::ModelLoad("No safetensors found".to_string()));
+        }
 
-            if model_paths.is_empty() {
-                 // return Err(WorkerError::ModelLoad("No model weights found".to_string()));
-                 // Actually, maybe we only grabbed config? 
-                 // If we have config, we proceed? 
-                 // But we need weights.
-                 return Err(WorkerError::ModelLoad("No safetensors or bin weights found".to_string()));
+        info!("Loading {} safetensors files...", files.len());
+
+        for file in files {
+            let data = std::fs::read(file).map_err(|e| WorkerError::ModelLoad(e.to_string()))?;
+            let safetensors = SafeTensors::deserialize(&data).map_err(|e| WorkerError::ModelLoad(e.to_string()))?;
+            
+            for (name, view) in safetensors.tensors() {
+                // Convert to f32
+                let floats: Vec<f32> = match view.dtype() {
+                    safetensors::Dtype::F16 => {
+                        view.data().chunks(2)
+                            .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32())
+                            .collect()
+                    },
+                    safetensors::Dtype::BF16 => {
+                        view.data().chunks(2)
+                            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+                            .collect()
+                    },
+                     safetensors::Dtype::F32 => {
+                        view.data().chunks(4)
+                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .collect()
+                    },
+                    _ => continue, // Skip unused types
+                };
+                
+                let tensor = Tensor::<WorkerBackend, 1>::from_floats(
+                    floats.as_slice(),
+                    device,
+                );
+                weights.insert(name.to_string(), tensor);
             }
-            
-            // hf_hub stores files in its own cache structure.
-            // But ModelLoader expects files in `self.config.cache_dir/model_name`.
-            // hf_hub manages `cache_dir` internally (blobs/refs).
-            // If we initialized Api with `with_cache_dir(config.cache_dir)`, then 
-            // `repo.get()` returns path inside that cache.
-            // But `ModelLoader` config loading assumes a specific structure:
-            // `self.config.cache_dir.join(model_name).join("config.json")`.
-            
-            // This is mismatched assumption.
-            // If we use hf_hub, we should rely on hf_hub to Give us paths.
-            // And `get_model_path` should return the directory where config.json resides?
-            // Actually, `repo.get()` returns absolute path to the file.
-            // We can return the parent directory of config.json.
-            
-            return Ok(_config_path.parent().unwrap().to_path_buf());
         }
         
-        // Fallback or error
-        Err(WorkerError::ModelLoad("HF API not initialized".to_string()))
+        Ok(weights)
     }
 
-    /// Load model configuration
-    async fn load_model_config(
-        &self,
-        model_name: &str,
-        provided_config: Option<&crate::cluster::ModelConfig>,
-        model_path: &Path,
-    ) -> Result<ModelConfig, WorkerError> {
-        if let Some(config) = provided_config {
-            // Use provided configuration
-            return Ok(ModelConfig {
-                architecture: config.architecture.clone(),
-                num_layers: config.num_layers as usize,
-                hidden_size: config.hidden_size as usize,
-                num_attention_heads: config.num_attention_heads as usize,
-                num_kv_heads: config.num_kv_heads as usize,
-                vocab_size: config.vocab_size as usize,
-                max_seq_len: config.max_position_embeddings as usize,
-                intermediate_size: config.intermediate_size as usize,
-                rms_norm_eps: config.rms_norm_eps,
-                rope_theta: 10000.0, // Default theta
-                is_moe: false,
-                num_experts: None,
-                num_experts_per_tok: None,
-            });
+    async fn get_model_path(&self, model_name: &str) -> Result<PathBuf, WorkerError> {
+        if let Some(api) = &self.hf_api {
+             let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
+             let config = repo.get("config.json").await.map_err(|e| WorkerError::ModelLoad(e.to_string()))?;
+             return Ok(config.parent().unwrap().to_path_buf());
         }
+        Err(WorkerError::ModelLoad("No HF API".to_string()))
+    }
 
-        // Load from config file
-        let config_path = model_path.join("config.json");
-
-        if !config_path.exists() {
-            return Err(WorkerError::ModelLoad(format!(
-                "Config file not found at {:?}",
-                config_path
-            )));
-        }
-
-        let config_str = std::fs::read_to_string(config_path)?;
-        let config_json: serde_json::Value = serde_json::from_str(&config_str)?;
-
-        // Extract common fields
-        let architecture = config_json
-            .get("architectures")
-            .and_then(|a| a.get(0))
-            .and_then(|a| a.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        let num_layers = config_json
-            .get("num_hidden_layers")
-            .or_else(|| config_json.get("num_layers"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-
-        let hidden_size = config_json
-            .get("hidden_size")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-
-        let num_attention_heads = config_json
-            .get("num_attention_heads")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-
-        let num_kv_heads = config_json
-            .get("num_key_value_heads")
-            .or_else(|| config_json.get("num_attention_heads"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(num_attention_heads as u64) as usize;
-
-        let vocab_size = config_json
-            .get("vocab_size")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-
-        let max_seq_len = config_json
-            .get("max_position_embeddings")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(2048) as usize;
-
-        let intermediate_size = config_json
-            .get("intermediate_size")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-
-        let rms_norm_eps = config_json
-            .get("rms_norm_eps")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1e-6) as f32;
-
-        let rope_theta = config_json
-            .get("rope_theta")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(10000.0) as f32;
-
-        // Detect MoE
-        let is_moe = config_json.get("num_local_experts").is_some();
-        let num_experts = config_json
-            .get("num_local_experts")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-        let num_experts_per_tok = config_json
-            .get("num_experts_per_tok")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-
+    async fn load_model_config(&self, _name: &str, _provided: Option<&crate::cluster::ModelConfig>, path: &Path) -> Result<ModelConfig, WorkerError> {
+        let config_path = path.join("config.json");
+        let s = std::fs::read_to_string(config_path)?;
+        let json: serde_json::Value = serde_json::from_str(&s)?;
+        let arch = json["architectures"][0].as_str().unwrap_or("llama").to_lowercase();
         Ok(ModelConfig {
-            architecture,
-            num_layers,
-            hidden_size,
-            num_attention_heads,
-            num_kv_heads,
-            vocab_size,
-            max_seq_len,
-            intermediate_size,
-            rms_norm_eps,
-            rope_theta,
-            is_moe,
-            num_experts,
-            num_experts_per_tok,
+            architecture: if arch.contains("llama") { "llama".to_string() } else { arch },
+            num_layers: json["num_hidden_layers"].as_u64().unwrap_or(0) as usize,
+            hidden_size: json["hidden_size"].as_u64().unwrap_or(0) as usize,
+            num_attention_heads: json["num_attention_heads"].as_u64().unwrap_or(0) as usize,
+            num_kv_heads: json["num_key_value_heads"].as_u64().unwrap_or(0) as usize,
+            vocab_size: json["vocab_size"].as_u64().unwrap_or(32000) as usize,
+            max_seq_len: json["max_position_embeddings"].as_u64().unwrap_or(2048) as usize,
+            intermediate_size: json["intermediate_size"].as_u64().unwrap_or(0) as usize,
+            rms_norm_eps: json["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
+            rope_theta: json["rope_theta"].as_f64().unwrap_or(10000.0) as f32,
+            is_moe: false, num_experts: None, num_experts_per_tok: None,
         })
     }
 
-    /// Calculate memory usage for a model
-    fn calculate_memory_usage(&self, config: &ModelConfig, quantization: crate::cluster::Quantization) -> usize {
-        let num_params = config.vocab_size * config.hidden_size
-            + config.num_layers * (
-                config.hidden_size * config.hidden_size * 4 +  // Attention
-                config.hidden_size * config.intermediate_size * 3  // MLP
-            );
-
-        // Add MoE parameters if applicable
-        let num_params = if config.is_moe {
-            if let Some(num_experts) = config.num_experts {
-                num_params + config.num_layers * num_experts * config.intermediate_size * config.hidden_size * 2
-            } else {
-                num_params
-            }
-        } else {
-            num_params
-        };
-
-        // Rough estimate: 2 bytes per param (FP16 default)
-        // In production, vary by actual quantization from proto enum
-        num_params * 2
+    fn calculate_memory_usage(&self, config: &ModelConfig, _q: crate::cluster::Quantization) -> usize {
+        config.num_layers * config.hidden_size * config.hidden_size * 4 * 2 // simplified
     }
-
-    /// Unload a model
+    
     pub async fn unload_model(&self, model_name: &str) -> Result<(), WorkerError> {
-        if let Some((_, _instance)) = self.loaded_models.remove(model_name) {
-            // Free GPU memory
-            self.gpu_manager.free_memory(&format!("model:{}", model_name)).await;
-            info!("Model {} unloaded", model_name);
-        }
-
+        self.loaded_models.remove(model_name);
         Ok(())
     }
-
-    /// Get loaded model
-    pub fn get_model(&self, model_name: &str) -> Option<ModelInstance> {
-        self.loaded_models.get(model_name).map(|entry| entry.value().clone())
-    }
-
-    /// List loaded models
-    pub fn list_models(&self) -> Vec<String> {
-        self.loaded_models.iter().map(|entry| entry.key().clone()).collect()
-    }
-
-    /// Get model info
+    
     pub fn get_model_info(&self, model_name: &str) -> Option<serde_json::Value> {
-        self.loaded_models.get(model_name).map(|entry| {
+         self.loaded_models.get(model_name).map(|entry| {
             let instance = entry.value();
             serde_json::json!({
                 "name": model_name,
@@ -427,4 +295,129 @@ impl ModelLoader {
             })
         })
     }
+    
+    pub fn list_models(&self) -> Vec<String> {
+        self.loaded_models.iter().map(|entry| entry.key().clone()).collect()
+    }
+    pub fn get_model(&self, model_name: &str) -> Option<ModelInstance> {
+        self.loaded_models.get(model_name).map(|entry| entry.value().clone())
+    }
+}
+
+/// Helper to transpose Linear weights (HF [out, in] -> Burn [in, out])
+fn load_linear(
+    weights: &mut HashMap<String, Tensor<WorkerBackend, 1>>,
+    name: &str,
+    in_features: usize,
+    out_features: usize,
+    bias: bool
+) -> Result<LinearRecord<WorkerBackend>, WorkerError> {
+    let w_name = format!("{}.weight", name);
+    let w_flat = weights.remove(&w_name).ok_or(WorkerError::ModelLoad(format!("Missing {}", w_name)))?;
+    
+    // HF: [out, in]
+    // Burn expects: [in, out]
+    // So we reshape to HF shape, transpose, then into Burn shape.
+    // Actually, simply reshaping to [out, in] and transposing gives [in, out].
+    let w = w_flat.reshape([out_features, in_features]).transpose();
+    
+    let b = if bias {
+        let b_name = format!("{}.bias", name);
+        if let Some(b_flat) = weights.remove(&b_name) {
+            Some(b_flat) // Bias is [out], Burn expects [out]
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    
+    Ok(LinearRecord { weight: Param::initialized(ParamId::new(), w), bias: b.map(|t| Param::initialized(ParamId::new(), t)) })
+}
+
+fn load_embedding(
+    weights: &mut HashMap<String, Tensor<WorkerBackend, 1>>,
+    name: &str,
+    num_embeddings: usize,
+    embedding_dim: usize,
+) -> Result<EmbeddingRecord<WorkerBackend>, WorkerError> {
+    let w_name = format!("{}.weight", name);
+    let w_flat = weights.remove(&w_name).ok_or(WorkerError::ModelLoad(format!("Missing {}", w_name)))?;
+    let w = w_flat.reshape([num_embeddings, embedding_dim]);
+    Ok(EmbeddingRecord { weight: Param::initialized(ParamId::new(), w) })
+}
+
+fn load_norm(
+    weights: &mut HashMap<String, Tensor<WorkerBackend, 1>>,
+    name: &str,
+    _dim: usize,
+) -> Result<RMSNormRecord<WorkerBackend>, WorkerError> {
+    let w_name = format!("{}.weight", name);
+    let w_flat = weights.remove(&w_name).ok_or(WorkerError::ModelLoad(format!("Missing {}", w_name)))?;
+    let w = w_flat; // 1D
+    Ok(RMSNormRecord { weight: Param::initialized(ParamId::new(), w), eps: ConstantRecord })
+    // Check common.rs: RMSNorm has `eps: f64`. `#[module(skip)]`.
+    // So record does NOT have eps.
+    // Wait, check `RMSNorm` struct again.
+    // Step 1439: `pub eps: f64`. `#[module(skip)]`.
+    // So `RMSNormRecord` only has `weight`.
+}
+
+fn create_llama_record(
+    weights: &mut HashMap<String, Tensor<WorkerBackend, 1>>, 
+    config: &LlamaConfig, 
+    device: &WgpuDevice
+) -> Result<LlamaRecord<WorkerBackend>, WorkerError> {
+    let embed = load_embedding(weights, "model.embed_tokens", config.vocab_size, config.hidden_size)?;
+    let norm = load_norm(weights, "model.norm", config.hidden_size)?;
+    let lm_head = load_linear(weights, "lm_head", config.hidden_size, config.vocab_size, false)?;
+    
+    let mut layers = Vec::new();
+    for i in 0..config.num_layers {
+        let prefix = format!("model.layers.{}", i);
+        
+        let q = load_linear(weights, &format!("{}.self_attn.q_proj", prefix), config.hidden_size, config.num_attention_heads * config.head_dim, false)?;
+        let k = load_linear(weights, &format!("{}.self_attn.k_proj", prefix), config.hidden_size, config.num_kv_heads * config.head_dim, false)?;
+        let v = load_linear(weights, &format!("{}.self_attn.v_proj", prefix), config.hidden_size, config.num_kv_heads * config.head_dim, false)?;
+        let o = load_linear(weights, &format!("{}.self_attn.o_proj", prefix), config.num_attention_heads * config.head_dim, config.hidden_size, false)?;
+        
+        // LlamaAttentionRecord
+        // Attention has q,k,v,o
+        let attention = LlamaAttentionRecord {
+            q_proj: q, k_proj: k, v_proj: v, o_proj: o,
+            num_heads: ConstantRecord, num_kv_heads: ConstantRecord, head_dim: ConstantRecord,
+        };
+        
+        let gate = load_linear(weights, &format!("{}.mlp.gate_proj", prefix), config.hidden_size, config.intermediate_size, false)?;
+        let up = load_linear(weights, &format!("{}.mlp.up_proj", prefix), config.hidden_size, config.intermediate_size, false)?;
+        let down = load_linear(weights, &format!("{}.mlp.down_proj", prefix), config.intermediate_size, config.hidden_size, false)?;
+        
+        let mlp = LlamaMLPRecord {
+            gate_proj: gate, up_proj: up, down_proj: down,
+        };
+        
+        let in_norm = load_norm(weights, &format!("{}.input_layernorm", prefix), config.hidden_size)?;
+        let post_norm = load_norm(weights, &format!("{}.post_attention_layernorm", prefix), config.hidden_size)?;
+        
+        layers.push(LlamaLayerRecord {
+            attention, mlp, input_layernorm: in_norm, post_attention_layernorm: post_norm,
+        });
+    }
+
+    // Generate RoPE
+    let _rope_mod: RotaryEmbedding<WorkerBackend> = RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_theta, device);
+    let rope = RotaryEmbeddingRecord {
+        cos: ConstantRecord, sin: ConstantRecord,
+    };
+
+    Ok(LlamaRecord {
+        embed_tokens: embed,
+        layers,
+        norm,
+        lm_head,
+        config: ConstantRecord,
+        rope,
+        tokenizer: ConstantRecord,
+        device: ConstantRecord,
+    })
 }

@@ -270,7 +270,7 @@ Generate text completions.
 **Request Body**:
 ```json
 {
-  "model": "deepseek-7b",
+  "model": "llama-3-8b-instruct",
   "prompt": "Explain quantum computing in simple terms",
   "max_tokens": 200,
   "temperature": 0.7,

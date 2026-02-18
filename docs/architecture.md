@@ -132,7 +132,7 @@ The coordinator is the brain of the cluster, written in Python using FastAPI.
 Workers perform the actual inference, written in Rust using the Burn framework.
 
 #### Responsibilities:
-- **GPU Management**: Detect and manage GPU resources
+- **GPU Management**: Detect and manage GPU resources. Supports mixed-GPU environments (e.g., mixing NVIDIA and AMD cards).
 - **Model Loading**: Load models into GPU memory
 - **Inference Execution**: Run forward passes and generate text
 - **Parallelism**: Implement various parallelism strategies

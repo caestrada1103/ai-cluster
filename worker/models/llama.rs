@@ -8,9 +8,14 @@ use burn::{
     nn::{Linear, LinearConfig, Embedding, EmbeddingConfig},
     tensor::{backend::Backend, Tensor},
 };
-use super::{Model, ModelConfig, ModelOutput, ModelInput, TokenStream};
+use super::{Model, ModelConfig, ModelOutput, ModelInput, TokenStream, TextGeneration};
 use super::common::{RMSNorm, RotaryEmbedding, swiglu, repeat_kv};
 use crate::error::WorkerError;
+use tokenizers::Tokenizer;
+use async_stream::stream;
+use futures::Stream;
+use std::pin::Pin;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Attention
@@ -19,10 +24,10 @@ use crate::error::WorkerError;
 /// Llama attention mechanism with Grouped-Query Attention (GQA).
 #[derive(Module, Debug)]
 pub struct LlamaAttention<B: Backend> {
-    q_proj: Linear<B>,
-    k_proj: Linear<B>,
-    v_proj: Linear<B>,
-    o_proj: Linear<B>,
+    pub q_proj: Linear<B>,
+    pub k_proj: Linear<B>,
+    pub v_proj: Linear<B>,
+    pub o_proj: Linear<B>,
     #[module(skip)]
     num_heads: usize,
     #[module(skip)]
@@ -81,10 +86,34 @@ impl<B: Backend> LlamaAttention<B> {
         let k = repeat_kv(k, n_rep);
         let v = repeat_kv(v, n_rep);
 
-        // Attention
+        // Attention with causal mask
         let scale = (self.head_dim as f64).sqrt();
-        let attn = q.matmul(k.swap_dims(2, 3)).div_scalar(scale);
-        let attn = burn::tensor::activation::softmax(attn, 3);
+        let attn_scores = q.matmul(k.swap_dims(2, 3)).div_scalar(scale);
+        
+        // Apply causal mask: positions can only attend to <= their own position
+        let attn_scores = if seq_len > 1 {
+            // Build lower-triangular mask [seq_len, seq_len]
+            // 1.0 for allowed positions, 0.0 for masked (future) positions
+            let mut mask_data = vec![0.0f32; seq_len * seq_len];
+            for i in 0..seq_len {
+                for j in 0..=i {
+                    mask_data[i * seq_len + j] = 1.0;
+                }
+            }
+            let mask = Tensor::<B, 1>::from_floats(mask_data.as_slice(), &attn_scores.device())
+                .reshape([1, 1, seq_len, seq_len]);
+            
+            // Where mask == 0, set attention score to -inf
+            let neg_inf = Tensor::<B, 4>::full([1, 1, seq_len, seq_len], -1e9, &attn_scores.device());
+            let ones = Tensor::<B, 4>::full([1, 1, seq_len, seq_len], 1.0, &attn_scores.device());
+            // masked_fill: attn = attn * mask + neg_inf * (1 - mask)
+            attn_scores * mask.clone() + neg_inf * (ones - mask)
+        } else {
+            // Single token: no masking needed
+            attn_scores
+        };
+        
+        let attn = burn::tensor::activation::softmax(attn_scores, 3);
         let output = attn.matmul(v)
             .swap_dims(1, 2)
             .reshape([batch, seq_len, self.num_heads * self.head_dim]);
@@ -100,9 +129,9 @@ impl<B: Backend> LlamaAttention<B> {
 /// Llama MLP with SwiGLU activation
 #[derive(Module, Debug)]
 pub struct LlamaMLP<B: Backend> {
-    gate_proj: Linear<B>,
-    up_proj: Linear<B>,
-    down_proj: Linear<B>,
+    pub gate_proj: Linear<B>,
+    pub up_proj: Linear<B>,
+    pub down_proj: Linear<B>,
 }
 
 impl<B: Backend> LlamaMLP<B> {
@@ -132,10 +161,10 @@ impl<B: Backend> LlamaMLP<B> {
 /// Llama transformer layer
 #[derive(Module, Debug)]
 pub struct LlamaLayer<B: Backend> {
-    attention: LlamaAttention<B>,
-    mlp: LlamaMLP<B>,
-    input_layernorm: RMSNorm<B>,
-    post_attention_layernorm: RMSNorm<B>,
+    pub attention: LlamaAttention<B>,
+    pub mlp: LlamaMLP<B>,
+    pub input_layernorm: RMSNorm<B>,
+    pub post_attention_layernorm: RMSNorm<B>,
 }
 
 impl<B: Backend> LlamaLayer<B> {
@@ -181,12 +210,16 @@ impl<B: Backend> LlamaLayer<B> {
 /// Complete Llama model
 #[derive(Module, Debug)]
 pub struct Llama<B: Backend> {
-    embed_tokens: Embedding<B>,
-    layers: Vec<LlamaLayer<B>>,
-    norm: RMSNorm<B>,
-    lm_head: Linear<B>,
-    config: Ignored<LlamaConfig>,
-    rope: RotaryEmbedding<B>,
+    pub embed_tokens: Embedding<B>,
+    pub layers: Vec<LlamaLayer<B>>,
+    pub norm: RMSNorm<B>,
+    pub lm_head: Linear<B>,
+    pub config: Ignored<LlamaConfig>,
+    pub rope: RotaryEmbedding<B>,
+    
+    #[module(ignore)]
+    pub tokenizer: Ignored<Tokenizer>,
+    pub device: Ignored<B::Device>,
 }
 
 /// Llama configuration
@@ -275,7 +308,7 @@ impl LlamaConfig {
 
 impl<B: Backend> Llama<B> {
     /// Create a new Llama model
-    pub fn new(config: &LlamaConfig, device: &B::Device) -> Self {
+    pub fn new(config: &LlamaConfig, device: &B::Device, tokenizer_path: &Path) -> Self {
         let layers = (0..config.num_layers)
             .map(|_| LlamaLayer::new(
                 config.hidden_size,
@@ -295,6 +328,17 @@ impl<B: Backend> Llama<B> {
             device,
         );
 
+        // Load tokenizer from the model directory
+        let tok_file = tokenizer_path.join("tokenizer.json");
+        eprintln!("[INFO] Loading tokenizer from: {:?}", tok_file);
+        let tokenizer = Tokenizer::from_file(&tok_file)
+            .unwrap_or_else(|e| {
+                eprintln!("[WARN] Failed to load tokenizer from {:?}: {}. Trying HF pretrained...", tok_file, e);
+                // Try from_pretrained with the model name as last resort
+                Tokenizer::from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0", None)
+                    .expect("Failed to load tokenizer")
+            });
+
         Self {
             embed_tokens: EmbeddingConfig::new(config.vocab_size, config.hidden_size)
                 .init(device),
@@ -305,6 +349,8 @@ impl<B: Backend> Llama<B> {
                 .init(device),
             config: Ignored(config.clone()),
             rope,
+            tokenizer: Ignored(tokenizer),
+            device: Ignored(device.clone()),
         }
     }
 
@@ -315,7 +361,7 @@ impl<B: Backend> Llama<B> {
         start_pos: usize,
     ) -> Tensor<B, 3> {
         let mut x = self.embed_tokens.forward(input_ids.int());
-
+        
         for layer in &self.layers {
             x = layer.forward(x, &self.rope, start_pos);
         }
@@ -361,5 +407,130 @@ impl<B: Backend> Model<B> for Llama<B> {
 
     fn memory_used(&self) -> usize {
         self.memory_usage()
+    }
+}
+impl<B: Backend> TextGeneration for Llama<B> {
+    fn generate(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String, WorkerError>> + Send>>, WorkerError> {
+        let device = self.device.clone();
+        
+        // Encode prompt
+        // Helper to check for known special tokens and parsed prompts
+        // We manually handle these to ensure they are encoded as single tokens (if in vocab)
+        // rather than being split into constituent characters.
+        let special_tokens = ["</s>", "<s>", "<|user|>", "<|assistant|>"];
+
+        let mut tokens = Vec::new();
+        let mut current_pos = 0;
+
+        while current_pos < prompt.len() {
+            // Find the nearest special token
+            let mut best_match = None;
+            let mut min_idx = prompt.len();
+
+            for st in &special_tokens {
+                if let Some(idx) = prompt[current_pos..].find(st) {
+                    let abs_idx = current_pos + idx;
+                    if abs_idx < min_idx {
+                        min_idx = abs_idx;
+                        best_match = Some(st);
+                    }
+                }
+            }
+
+            // Encode text before the match (or the rest of the string if no match)
+            if min_idx > current_pos {
+                let text_segment = &prompt[current_pos..min_idx];
+                // Only add special tokens (BOS) for the very first segment if it's at the start
+                let add_special = current_pos == 0; 
+                let encoding = self.tokenizer.encode(text_segment, add_special)
+                    .map_err(|e| WorkerError::Internal(format!("Tokenizer error: {}", e)))?;
+                tokens.extend_from_slice(encoding.get_ids());
+            }
+
+            // Handle the matched special token
+            if let Some(st) = best_match {
+                if let Some(id) = self.tokenizer.token_to_id(st) {
+                    tokens.push(id);
+                } else {
+                    // Fallback: special token not in vocab, encode as text
+                    let encoding = self.tokenizer.encode(*st, false)
+                        .map_err(|e| WorkerError::Internal(format!("Tokenizer error (special): {}", e)))?;
+                    tokens.extend_from_slice(encoding.get_ids());
+                }
+                current_pos = min_idx + st.len();
+            } else {
+                // No more special tokens found, remainder processed above
+                break;
+            }
+        }
+
+        let prompt_len = tokens.len();
+        
+        // Clone model so stream doesn't borrow &self
+        let model = self.clone();
+        
+        // Stream
+        let stream = stream! {
+            let mut prev_text_len = 0usize;
+            for _ in 0..max_tokens {
+                // Create input tensor
+                let token_floats: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
+                let len = token_floats.len();
+                let input = Tensor::<B, 1>::from_floats(token_floats.as_slice(), &device).reshape([1, len]);
+                
+                // Forward pass
+                let output = model.forward_pass(input, 0); 
+                
+                // Get last token logits
+                let [_batch, seq, vocab] = output.dims();
+                let last_logits = output.slice([0..1, seq-1..seq, 0..vocab]).reshape([vocab]);
+                
+                // Sample next token
+                let logit_data: Vec<f32> = last_logits.into_data().to_vec().unwrap_or_default();
+                
+                let token_id = if temperature < 0.01 {
+                    // Greedy (argmax)
+                    logit_data.iter().enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(i, _)| i).unwrap_or(0)
+                } else {
+                    // Temperature + top-k/top-p sampling
+                    super::common::top_k_top_p_sample(&logit_data, temperature, top_p, top_k)
+                };
+                let token_id_u32 = token_id as u32;
+                
+                tokens.push(token_id_u32);
+                
+                // Decode full generated sequence and emit delta (preserves spaces)
+                let generated_ids = &tokens[prompt_len..];
+                let full_text = model.tokenizer.decode(generated_ids, true)
+                    .map_err(|e| WorkerError::Internal(format!("Decode error: {}", e)));
+                    
+                match full_text {
+                    Ok(t) => {
+                        let delta = t[prev_text_len..].to_string();
+                        prev_text_len = t.len();
+                        yield Ok(delta);
+                    },
+                    Err(e) => { yield Err(e); break; }
+                }
+
+                // Stop if EOS using tokenizer vocab
+                if let Some(eos_id) = model.tokenizer.get_vocab(true).get("</s>") {
+                     if token_id_u32 == *eos_id {
+                         break;
+                     }
+                }
+            }
+        };
+
+        Ok(Box::pin(stream))
     }
 }

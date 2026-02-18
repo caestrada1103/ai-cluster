@@ -9,12 +9,20 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'coordinator', 'pr
 import cluster_pb2
 import cluster_pb2_grpc
 
+import argparse
+
 def chat():
+    parser = argparse.ArgumentParser(description='Interactive chat with AI Worker')
+    parser.add_argument('--max-tokens', type=int, default=512, help='Maximum tokens to generate (default: 512)')
+    parser.add_argument('--temp', type=float, default=0.7, help='Temperature (default: 0.7)')
+    parser.add_argument('--host', type=str, default='localhost:50051', help='Worker gRPC host')
+    args = parser.parse_args()
+
     # Connect to worker
-    channel = grpc.insecure_channel('localhost:50051')
+    channel = grpc.insecure_channel(args.host)
     stub = cluster_pb2_grpc.WorkerStub(channel)
 
-    print("Connecting to worker...")
+    print(f"Connecting to worker at {args.host}...")
     try:
         # Check health
         response = stub.HealthCheck(cluster_pb2.Empty())
@@ -30,7 +38,6 @@ def chat():
     model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     
     # Ensure model is loaded (optional if already loaded, but good practice)
-    # simple check or just try load (it's idempotentish in our logic? No, load_model checks cache)
     print(f"Ensuring model {model_name} is loaded...")
     try:
         stub.LoadModel(cluster_pb2.LoadModelRequest(
@@ -39,12 +46,10 @@ def chat():
         ))
     except grpc.RpcError as e:
         print(f"Load failed: {e}")
-        # convert to string to check if it says "already loaded" or similar?
-        # Our worker logs "Model ... already loaded" and returns OK. 
-        # So grpc call should succeed even if loaded.
 
     print("\n" + "="*50)
     print(f"Chatting with {model_name}")
+    print(f"Params: max_tokens={args.max_tokens}, temp={args.temp}")
     print("Type 'quit' or 'exit' to stop.")
     print("="*50 + "\n")
 
@@ -59,34 +64,17 @@ def chat():
 
             print("Model: ", end="", flush=True)
             
-            # Simple inference
-            # To make it chat-like, we might want to format prompt? 
-            # TinyLlama Chat format: <|system|>\n...<|user|>\n...<|assistant|>\n
-            # For now, raw prompt is fine for testing.
-            
             full_prompt = f"<|user|>\n{prompt}</s>\n<|assistant|>\n"
             
             request = cluster_pb2.InferenceRequest(
                 model_name=model_name,
                 prompt=full_prompt,
-                max_tokens=100,
-                temperature=0.7,
-                stream=False 
+                max_tokens=args.max_tokens,
+                temperature=args.temp,
+                stream=True 
             )
             
             response_stream = stub.Infer(request)
-            
-            # If stream=False, we get one response? 
-            # The proto definition says `rpc Infer(...) returns (stream InferenceResponse);`
-            # Even if stream=False, it returns a stream of 1 item? 
-            # Or worker implementation streams tokens?
-            # Worker implementation respects `stream` flag.
-            # If stream=True, it yields tokens.
-            # If stream=False, it yields one response with full text? 
-            # Let's check worker.rs.
-            
-            # It seems our worker implementation ALWAYS returns a stream.
-            # `type ResponseStream = Pin<Box<dyn Stream<Item = Result<InferenceResponse, Status>> + Send>>;`
             
             full_text = ""
             for response in response_stream:

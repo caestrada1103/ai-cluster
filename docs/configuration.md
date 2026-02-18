@@ -883,7 +883,8 @@ component = "inference"
 # ============================================================================
 
 [gpu]
-# GPU device IDs to use (empty = use all available)
+# GPU device IDs to use. Useful for mixed-GPU setups (e.g., selecting only specific cards)
+# If empty, uses all available GPUs.
 device_ids = [0, 1]
 
 # Minimum free memory to keep (GB)

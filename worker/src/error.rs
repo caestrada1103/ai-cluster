@@ -4,7 +4,7 @@
 //! modules.  Variants are derived from every `WorkerError::*` usage site
 //! found in the codebase.
 
-use std::fmt;
+
 use thiserror::Error;
 
 /// Central error type for the AI worker.

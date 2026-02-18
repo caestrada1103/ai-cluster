@@ -251,7 +251,18 @@ sudo modprobe amdgpu  # AMD
 # Ensure Above 4G Decoding and Resizable BAR are enabled
 ```
 
-### 2. **GPU Out of Memory (OOM)**
+### 2. **Mixed-GPU Issues**
+
+**Symptoms:**
+- Inference fails on specific nodes.
+- Performance is bottlenecked by the slowest card.
+
+**Solutions:**
+- **Driver Version**: Ensure all machines use compatible driver versions.
+- **Binary Check**: Ensure you are running the correct binary for the GPU. You must build separate binaries for AMD (`--features hip`) and NVIDIA (`--features cuda`) and run them as separate processes.
+- **Load Balancing**: The system currently splits layers evenly. If one card is much slower, it will bottleneck the pipeline. Consider manually assigning fewer layers to the slower card (future feature).
+
+### 3. **GPU Out of Memory (OOM)**
 
 **Symptoms:**
 - Worker logs: "Out of memory"
@@ -587,6 +598,20 @@ download_timeout_seconds = 600  # Increase from 300
 [model_loader]
 offline_mode = true
 # Place models manually in /data/models
+
+### 2. **Llama 3 Loading Failure**
+
+**Symptoms:**
+- Error: "Shape mismatch" or "Key not found"
+- "RuntimeError: Tensor shape mismatch"
+
+**Solutions:**
+- **Check Weights**: Ensure you have the `safetensors` version of the model, not just `.bin` or `.pth`.
+- **HuggingFace Access**: Llama 3 is a gated model. Ensure you have accepted the license on HuggingFace and provided your HF Token.
+```bash
+export HF_TOKEN=your_token_here
+```
+- **Update Codebase**: Ensure you are running the latest version of AI Cluster which includes Llama 3 support.
 ```
 
 ### 2. **Model Conversion Fails**

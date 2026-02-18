@@ -37,6 +37,8 @@
 
 **AI Cluster** is a production-ready distributed system for running large language models (LLMs) across multiple GPUs and machines. It provides a unified API for model inference while automatically handling the complexities of distribution, parallelism, and resource management.
 
+[**Why use AI Cluster? Read our Non-Technical Introduction.**](docs/problem_solution.md)
+
 Whether you have a single workstation with multiple GPUs or a rack of servers, AI Cluster scales to meet your needs while maintaining low latency and high throughput.
 
 ### Why AI Cluster?
@@ -145,11 +147,30 @@ For detailed architecture information, see the [Architecture Guide](docs/archite
 git clone https://github.com/caestrada1103/ai-cluster.git
 cd ai-cluster
 
-# 2. Run the setup script (for AMD GPUs)
+# 2. Set up Python environment
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# or
+# .\venv\Scripts\activate  # Windows
+
+# 3. Install dependencies
+pip install -r coordinator/requirements.txt
+
+# 4. Configure Environment (Optional but Recommended)
+# Create a .env file to store secrets like your Hugging Face Token (required for Llama 3)
+cp .env.example .env
+# Edit .env and set HF_TOKEN=hf_...
+
+# 5. Run the setup script
+# For AMD GPUs
 ./scripts/setup_rocm.sh
 
 # Or for NVIDIA GPUs
 ./scripts/setup_cuda.sh
+
+# Note for Mixed-GPU Clusters:
+# You will need to build separate worker binaries for each GPU type.
+# See docs/deployment.md for detailed instructions.
 
 # 3. Build and start with Docker Compose
 docker-compose up -d

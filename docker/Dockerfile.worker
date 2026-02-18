@@ -176,5 +176,5 @@ EXPOSE ${METRICS_PORT}  # Metrics
 # Set entrypoint
 ENTRYPOINT ["/usr/local/bin/ai-worker"]
 
-# Default command
-CMD ["--port", "50051", "--metrics-port", "9091"]
+# Default command (uses environment variables)
+CMD []

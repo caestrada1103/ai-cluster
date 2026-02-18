@@ -17,6 +17,7 @@ use crate::error::WorkerError;
 // ---------------------------------------------------------------------------
 
 /// Expert activation functions
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum ExpertActivation {
     /// GELU activation
