@@ -54,10 +54,10 @@ class ModelConfig:
     num_layers: int
     hidden_size: int
     num_attention_heads: int
-    num_kv_heads: Optional[int] = None  # For GQA/MQA
     vocab_size: int
     max_seq_len: int
     intermediate_size: int
+    num_kv_heads: Optional[int] = None  # For GQA/MQA
     
     # Features
     supports_quantization: List[Quantization] = field(default_factory=list)

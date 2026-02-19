@@ -3,9 +3,6 @@ import os
 import time
 import grpc
 
-# Add coordinator/proto to Python path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'coordinator', 'proto'))
-
 import cluster_pb2
 import cluster_pb2_grpc
 

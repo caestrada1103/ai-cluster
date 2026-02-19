@@ -26,17 +26,17 @@ docker build -f docker/Dockerfile.worker --build-arg GPU_BACKEND=cuda -t ai-work
 
 ```bash
 # Start full stack with monitoring
-docker-compose -f docker/docker-compose.full.yml up -d
+docker compose -f docker/docker-compose.full.yml up -d
 
 # Or start specific workers
-docker-compose -f docker/docker-compose.gpu.yml up -d
+docker compose -f docker/docker-compose.gpu.yml up -d
 ```
 
 ### 3. Check status
 
 ```bash
 # View logs
-docker-compose -f docker/docker-compose.full.yml logs -f
+docker compose -f docker/docker-compose.full.yml logs -f
 
 # Check health
 curl http://localhost:8000/health
@@ -239,7 +239,7 @@ docker buildx build \
 
 ```bash
 # Stop all containers
-docker-compose -f docker/docker-compose.full.yml down -v
+docker compose -f docker/docker-compose.full.yml down -v
 
 # Remove images
 docker rmi ai-coordinator:latest ai-worker:amd ai-worker:nvidia
@@ -251,7 +251,7 @@ docker volume prune -f
 ## Support
 
 For issues:
-1. Check logs: `docker-compose logs -f`
+1. Check logs: `docker compose logs -f`
 2. Verify GPU access
 3. Check configuration files
 4. Ensure network connectivity

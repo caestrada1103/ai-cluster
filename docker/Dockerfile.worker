@@ -1,20 +1,14 @@
-# Multi-stage build for Rust worker with GPU support
-# ===================================================
-
-# Stage 1: Build stage
-# Set build arguments (Global)
-ARG GPU_BACKEND=rocm  # Options: rocm, cuda, wgpu
-ARG TARGETPLATFORM
+# Multi-stage build for Rust worker with GPU support (wgpu/Vulkan)
+# =================================================================
+# Universal worker image — auto-detects any GPU via Vulkan at runtime.
+# No vendor-specific SDKs required.
 
 # Stage 1: Build stage
 FROM ubuntu:22.04 AS builder
 
-# Redeclare ARGs for this stage
 ARG DEBIAN_FRONTEND=noninteractive
-ARG GPU_BACKEND
-ARG TARGETPLATFORM
 
-# Install build dependencies and Rust
+# Install build dependencies, Vulkan SDK, and Rust
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
@@ -25,38 +19,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     protobuf-compiler \
     ca-certificates \
+    libvulkan-dev \
+    mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/* \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.89 \
     && . "$HOME/.cargo/env"
 
 # Add cargo to PATH
 ENV PATH="/root/.cargo/bin:${PATH}"
-
-# Install ROCm dependencies if building for AMD
-RUN if [ "$GPU_BACKEND" = "rocm" ]; then \
-    mkdir -p /etc/apt/keyrings && \
-    curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /etc/apt/keyrings/rocm.gpg && \
-    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.0.2 jammy main" > /etc/apt/sources.list.d/rocm.list && \
-    echo "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600" > /etc/apt/preferences.d/rocm-pin-600 && \
-    apt-get update && apt-get install -y --no-install-recommends \
-        rocm-dev \
-        rocm-libs \
-        hip-dev \
-        rccl \
-        && rm -rf /var/lib/apt/lists/*; \
-    fi
-
-# Install CUDA dependencies if building for NVIDIA
-RUN if [ "$GPU_BACKEND" = "cuda" ]; then \
-    curl -O https://developer.download.nvidia.com/compute/cuda/repos/debian11/x86_64/cuda-keyring_1.1-1_all.deb && \
-    dpkg -i cuda-keyring_1.1-1_all.deb && \
-    rm cuda-keyring_1.1-1_all.deb && \
-    apt-get update && apt-get install -y --no-install-recommends \
-        cuda-compiler-12-1 \
-        cuda-libraries-12-1 \
-        cuda-cudart-12-1 \
-        && rm -rf /var/lib/apt/lists/*; \
-    fi
 
 # Set working directory
 WORKDIR /build
@@ -65,6 +35,9 @@ WORKDIR /build
 COPY worker/Cargo.toml worker/Cargo.lock* ./
 COPY worker/build.rs ./
 
+# Copy proto files (needed by build.rs for tonic code generation)
+COPY proto ../proto/
+
 # Create dummy source for dependency caching
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
@@ -72,24 +45,23 @@ RUN mkdir src && \
     mkdir -p benches && \
     echo "fn main() {}" > benches/inference.rs
 
-# Build dependencies (cached)
-RUN cargo build --release --features="${GPU_BACKEND}" || true
-
+# Build dependencies (cached layer)
+RUN cargo build --release --features="wgpu"
 # Copy actual source code
 COPY worker/src ./src/
 COPY worker/models ./models/
 COPY worker/benches ./benches/
-COPY proto ../proto/
 
-# Build the worker
-RUN cargo build --release --features="${GPU_BACKEND}"
+# Build actual source code
+RUN touch src/main.rs src/lib.rs benches/inference.rs && \
+    cargo build --release --features="wgpu"
 
-# Stage 2: Runtime for AMD GPU (ROCm)
-FROM rocm/dev-ubuntu-22.04:latest AS runtime-rocm
+# Stage 2: Runtime
+FROM ubuntu:22.04 AS runtime
 
 # Set labels
 LABEL maintainer="Carlos Estrada <caestrada1103@gmail.com>"
-LABEL description="AI Cluster Worker (AMD ROCm)"
+LABEL description="AI Cluster Worker (Universal GPU via Vulkan/wgpu)"
 LABEL version="0.1.0"
 
 # Install runtime dependencies
@@ -97,74 +69,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     libssl3 \
-    libnuma1 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install ROCm runtime
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    rocm-device-libs \
-    rocm-smi-lib \
-    rccl \
+    libvulkan1 \
+    mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
 RUN groupadd -r -g 1000 worker && \
     useradd -r -g worker -u 1000 -m -d /app worker
-
-# Add user to render and video groups for GPU access
-RUN usermod -a -G render,video worker
-
-# Stage 2: Runtime for NVIDIA GPU (CUDA)
-FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04 AS runtime-cuda
-
-# Set labels
-LABEL maintainer="Carlos Estrada <caestrada1103@gmail.com>"
-LABEL description="AI Cluster Worker (NVIDIA CUDA)"
-LABEL version="0.1.0"
-
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    ca-certificates \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install CUDA runtime
-
-
-# Create non-root user
-RUN groupadd -r -g 1000 worker && \
-    useradd -r -g worker -u 1000 -m -d /app worker
-
-# Stage 2: Runtime for CPU/WGPU fallback
-FROM ubuntu:22.04 AS runtime-wgpu
-
-# Set labels
-LABEL maintainer="Carlos Estrada <caestrada1103@gmail.com>"
-LABEL description="AI Cluster Worker (CPU/WGPU)"
-LABEL version="0.1.0"
-
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    ca-certificates \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create non-root user
-RUN groupadd -r -g 1000 worker && \
-    useradd -r -g worker -u 1000 -m -d /app worker
-
-# Stage 3: Final stage (select based on GPU_BACKEND)
-FROM runtime-${GPU_BACKEND} AS final
 
 # Set environment variables
 ENV RUST_LOG=info \
     RUST_BACKTRACE=1 \
     WORKER_ID= \
-    GRPC_PORT=50051 \
-    METRICS_PORT=9091 \
-    GPU_IDS=0
+    GPU_INDEX=0 \
+    GRPC_BASE_PORT=50051 \
+    METRICS_BASE_PORT=9091
 
 # Create necessary directories
 RUN mkdir -p /app/config /app/models /app/data /app/logs /tmp/worker && \
@@ -180,19 +99,20 @@ COPY --from=builder --chown=worker:worker /build/target/release/ai-worker /usr/l
 COPY --chown=worker:worker config/worker.toml /app/config/
 COPY --chown=worker:worker config/models.toml /app/config/
 
+# Copy entrypoint script
+COPY --chown=worker:worker docker/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
 # Switch to non-root user
 USER worker
 
-# Health check
+# Health check (port computed by entrypoint)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:${METRICS_PORT}/health || exit 1
+    CMD curl -f http://localhost:${METRICS_PORT:-9091}/health || exit 1
 
-# Expose ports
-EXPOSE ${GRPC_PORT}
-EXPOSE ${METRICS_PORT}
+# Expose port range (base ports + up to 8 GPU offsets)
+EXPOSE 50051-50058
+EXPOSE 9091-9098
 
 # Set entrypoint
-ENTRYPOINT ["/usr/local/bin/ai-worker"]
-
-# Default command (uses environment variables)
-CMD []
+ENTRYPOINT ["/app/entrypoint.sh"]

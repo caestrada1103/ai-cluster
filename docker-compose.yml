@@ -1,14 +1,7 @@
 # Root docker-compose.yml
 # =======================
-# Primary Docker Compose configuration for the AI Cluster
-
-version: '3.8'
-
-x-logging: &default-logging
-  driver: json-file
-  options:
-    max-size: "10m"
-    max-file: "3"
+# Docker Compose configuration for the AI Cluster
+# Uses a single universal worker image (wgpu/Vulkan) for any GPU.
 
 services:
   # Coordinator
@@ -33,11 +26,15 @@ services:
       - ai-cluster-net
     ports:
       - "8000:8000"   # HTTP API
-      - "9092:9090"   # Metrics (host 9092 to avoid Prometheus conflict)
+      - "9090:9090"   # Metrics
     depends_on:
       - prometheus
       - grafana
-    logging: *default-logging
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -46,94 +43,57 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # AMD GPU Worker
-  worker-amd-0:
+  # Universal GPU Worker
+  # Scale with: docker compose up -d --scale worker=N
+  # Each replica should have a unique GPU_INDEX via environment override
+  # or by using separate profiles/overrides for multi-GPU setups.
+  worker:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
-      args:
-        GPU_BACKEND: rocm
-    image: ai-worker:amd
-    container_name: ai-worker-amd-0
-    runtime: runc
-    privileged: true
+    image: ai-worker:latest
     environment:
-      - WORKER_ID=amd-gpu-0
-      - GRPC_PORT=50051
-      - METRICS_PORT=9091
-      - GPU_IDS=0
-      - RUST_LOG=info
-      - ROCM_VISIBLE_DEVICES=0
+      - GPU_INDEX=${GPU_INDEX:-0}
+      - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
+      - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
+      - RUST_LOG=trace
+      - RUST_BACKTRACE=1
       - HF_TOKEN=${HF_TOKEN}
     volumes:
       - ./config:/app/config:ro
-      - ./models:/app/models:ro
+      - ./models:/app/models
       - ./data:/app/data
-      - /opt/rocm:/opt/rocm:ro
-      - /dev/kfd:/dev/kfd
-      - /dev/dri:/dev/dri
-    devices:
-      - /dev/kfd
-      - /dev/dri/renderD128
-    group_add:
-      - video
-      - render
     networks:
       - ai-cluster-net
     ports:
-      - "50051:50051"
-      - "9091:9091"
+      - "${GRPC_PORT:-50051}:${GRPC_PORT:-50051}"
+      - "${METRICS_PORT:-9091}:${METRICS_PORT:-9091}"
     logging: *default-logging
     depends_on:
       - coordinator
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: amd
-              count: 1
-              capabilities: [gpu, compute]
 
-  # NVIDIA GPU Worker
-  worker-nvidia-0:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.worker
-      args:
-        GPU_BACKEND: cuda
-    image: ai-worker:nvidia
-    container_name: ai-worker-nvidia-0
-    runtime: nvidia
-    environment:
-      - WORKER_ID=nvidia-gpu-0
-      - GRPC_PORT=50052
-      - METRICS_PORT=9092
-      - GPU_IDS=0
-      - RUST_LOG=info
-      - NVIDIA_VISIBLE_DEVICES=0
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - HF_TOKEN=${HF_TOKEN}
-    volumes:
-      - ./config:/app/config:ro
-      - ./models:/app/models:ro
-      - ./data:/app/data
-    networks:
-      - ai-cluster-net
-    ports:
-      - "50052:50052"
-      - "9092:9092"
-    logging: *default-logging
-    depends_on:
-      - coordinator
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu, utility]
+  # ==========================================================================
+  # Multi-GPU example: uncomment and adjust for machines with multiple GPUs.
+  # Each worker gets a unique GPU_INDEX and port pair.
+  # ==========================================================================
+  # worker-gpu-1:
+  #   extends:
+  #     service: worker
+  #   environment:
+  #     - GPU_INDEX=1
+  #   ports:
+  #     - "50052:50052"
+  #     - "9092:9092"
+  #
+  # worker-gpu-2:
+  #   extends:
+  #     service: worker
+  #   environment:
+  #     - GPU_INDEX=2
+  #   ports:
+  #     - "50053:50053"
+  #     - "9093:9093"
 
   # Monitoring Stack
   prometheus:
@@ -150,7 +110,7 @@ services:
     networks:
       - ai-cluster-net
     ports:
-      - "9090:9090"
+      - "9099:9090"
     logging: *default-logging
     restart: unless-stopped
 

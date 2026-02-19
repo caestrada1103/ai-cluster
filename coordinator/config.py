@@ -33,7 +33,17 @@ class Settings(BaseSettings):
         env_prefix="COORDINATOR_",
         env_file=".env",
         env_file_encoding="utf-8",
-        case_sensitive=False,
+        env_priority="core",  # Prefer env vars over file
+        json_schema_extra = {
+            "example": {
+                "host": "0.0.0.0",
+                "port": 8000,
+                "discovery_method": "mdns",
+                "static_workers": ["192.168.1.10:50051"],
+                "health_check_interval": 30,
+                "default_model": "deepseek-7b",
+            }
+        }
     )
     
     # Server settings
@@ -138,15 +148,3 @@ class Settings(BaseSettings):
         else:
             raise ValueError(f"Unsupported config format: {self.models_config.suffix}")
     
-    class Config:
-        """Pydantic config."""
-        json_schema_extra = {
-            "example": {
-                "host": "0.0.0.0",
-                "port": 8000,
-                "discovery_method": "mdns",
-                "static_workers": ["192.168.1.10:50051"],
-                "health_check_interval": 30,
-                "default_model": "deepseek-7b",
-            }
-        }

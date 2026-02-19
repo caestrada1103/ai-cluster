@@ -78,14 +78,14 @@ max_queued_requests = 1000
 request_timeout_seconds = 60
 
 # KV Cache
-kv_cache:
-  enabled = true
-  max_cache_size_gb = 8.0
-  cache_block_size = 16  # Tokens per block
-  enable_prefix_caching = true
-  eviction_policy = "lru"  # lru, lfu, fifo
-  enable_compression = false
-  compression_algorithm = "zstd"
+[kv_cache]
+enabled = true
+max_cache_size_gb = 8.0
+cache_block_size = 16  # Tokens per block
+enable_prefix_caching = true
+eviction_policy = "lru"  # lru, lfu, fifo
+enable_compression = false
+compression_algorithm = "zstd"
 
 # Quantization
 supported_quantizations = ["fp16", "int8", "int4"]
@@ -126,28 +126,28 @@ load_balance_threshold = 0.2
 
 [communication]
 # NCCL/RCCL settings
-nccl:
-  timeout_seconds = 30
-  min_ctas = 1
-  max_ctas = 32
-  cga_cluster_size = 2
-  enable_nvlink = true
-  enable_infiniband = true
+[nccl]
+timeout_seconds = 30
+min_ctas = 1
+max_ctas = 32
+cga_cluster_size = 2
+enable_nvlink = true
+enable_infiniband = true
 
 # RCCL settings (AMD)
-rccl:
-  timeout_seconds = 30
-  enable_xgmi = true
-  enable_pcie = true
-  max_parallel_transfers = 4
+[rccl]
+timeout_seconds = 30
+enable_xgmi = true
+enable_pcie = true
+max_parallel_transfers = 4
 
 # Custom communication
-custom:
-  enable_gdr = false  # GPUDirect RDMA
-  enable_roce = false  # RDMA over Converged Ethernet
-  mpi_path = "/usr/lib/x86_64-linux-gnu/openmpi"
-  use_tcp = false
-  tcp_interface = "eth0"
+[custom]
+enable_gdr = false  # GPUDirect RDMA
+enable_roce = false  # RDMA over Converged Ethernet
+mpi_path = "/usr/lib/x86_64-linux-gnu/openmpi"
+use_tcp = false
+tcp_interface = "eth0"
 
 [tensor]
 # Tensor operations

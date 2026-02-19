@@ -6,7 +6,9 @@ FROM python:3.10-slim AS builder
 
 # Set build arguments
 ARG DEBIAN_FRONTEND=noninteractive
-ARG POETRY_VERSION=1.7.0
+
+# Set working directory
+WORKDIR /build
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -23,19 +25,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY coordinator/ ./coordinator/
 COPY proto/ ./proto/
 
-# Generate gRPC code
-RUN python -m grpc_tools.protoc \
+# Generate gRPC code (clean existing files first to avoid version mismatch)
+RUN rm -f coordinator/proto/*_pb2*.py && \
+    python -m grpc_tools.protoc \
     -I./proto \
-    --python_out=./coordinator \
-    --grpc_python_out=./coordinator \
+    --python_out=./coordinator/proto \
+    --grpc_python_out=./coordinator/proto \
     ./proto/cluster.proto
 
 # Fix imports in generated files
-RUN sed -i 's/import cluster_pb2 as cluster__pb2/import coordinator.cluster_pb2 as cluster__pb2/' \
-    ./coordinator/cluster_pb2_grpc.py
+RUN sed -i 's/import cluster_pb2 as cluster__pb2/import coordinator.proto.cluster_pb2 as cluster__pb2/' \
+    ./coordinator/proto/cluster_pb2_grpc.py
 
-# Install the package
-RUN poetry install --no-interaction --no-ansi --only main
+
 
 # Stage 2: Runtime stage
 FROM python:3.10-slim

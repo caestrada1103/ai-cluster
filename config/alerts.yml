@@ -78,7 +78,7 @@ groups:
           severity: critical
         annotations:
           summary: "High error rate"
-          description: "Error rate is {{ $value | percentage }} for last 5 minutes"
+          description: "Error rate is {{ $value | printf \"%.2f\" }}% for last 5 minutes"
 
       - alert: QueueBacklog
         expr: worker_queued_requests > 100
