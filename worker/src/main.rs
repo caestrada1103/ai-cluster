@@ -109,8 +109,14 @@ fn main() -> Result<(), WorkerError> {
 }
 
 fn init_logging(args: &Args) {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+    let base_filter = std::env::var("RUST_LOG")
+        .unwrap_or_else(|_| args.log_level.clone());
+
+    // Aggressively silence driver-level noise from internal dependencies.
+    // Use 'off' for crates that continue to leak INFO logs despite 'error' filters.
+    let filter_str = format!("{},wgpu=warn,wgpu_hal=off,naga=off,vulkan=off,vulkan_layer=off", base_filter);
+
+    let env_filter = EnvFilter::new(filter_str);
 
     if args.log_json {
         // JSON logging for production
@@ -151,7 +157,18 @@ fn create_runtime() -> Result<Runtime, WorkerError> {
 
 async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Result<(), WorkerError> {
     // Initialize GPU manager
-    let gpu_manager = Arc::new(gpu_manager::GPUManager::new(&gpu_ids).await?);
+    info!("Initializing GPU Manager...");
+    let gpu_manager = Arc::new(gpu_manager::GPUManager::new(&config.gpu_ids).await?);
+    
+    #[cfg(feature = "wgpu")]
+    {
+        use burn::backend::wgpu::WgpuDevice;
+        // This will trigger wgpu initialization if not already done
+        let device = WgpuDevice::BestAvailable;
+        info!("Selected WGPU Device: {:?}", device);
+    }
+    
+    info!("GPU Manager initialized successfully");
     info!("Initialized GPU manager with {} devices", gpu_manager.device_count());
 
     // Initialize model loader

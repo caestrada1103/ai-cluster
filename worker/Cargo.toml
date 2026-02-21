@@ -25,6 +25,7 @@ burn = { version = "0.19", default-features = false, features = ["std", "train",
 tokio = { version = "1.35", features = ["full"] }
 futures = "0.3"
 async-trait = "0.1"
+wgpu = "26.0.1"
 
 # gRPC
 tonic = "0.10"

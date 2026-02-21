@@ -11,6 +11,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::sync::Semaphore;
 use tracing::{info, warn, debug};
+use std::process::Command;
 
 use crate::cluster::GpuInfo;
 use crate::error::WorkerError;
@@ -104,7 +105,7 @@ impl GPUManager {
         let mut memory_locks = Vec::new();
 
         // Detect available devices
-        let available_devices = Self::detect_devices();
+        let available_devices = Self::detect_devices().await;
 
         if available_devices.is_empty() {
             return Err(WorkerError::NoGpusFound);
@@ -154,27 +155,96 @@ impl GPUManager {
         })
     }
 
-    /// Detect available GPU devices.
-    ///
-    /// Uses the Burn wgpu backend for cross-vendor detection, or returns
-    /// a single default device for native CUDA/ROCm backends.
-    fn detect_devices() -> Vec<GPUDevice> {
-        // For wgpu, we create a default device; burn handles GPU selection
-        // internally via Vulkan/DX12/Metal adapter enumeration.
-        //
-        // In the future, we can use wgpu's adapter enumeration for detailed
-        // multi-GPU info. For now, we report one logical device per GPU ID.
-        vec![GPUDevice {
-            id: 0,
-            name: Self::detect_gpu_name(),
-            total_memory: Self::estimate_total_memory(),
-            available_memory: Self::estimate_total_memory(),
-            utilization: 0.0,
-            temperature: 0.0,
-            power_usage: 0,
-            capabilities: vec!["fp32".to_string(), "fp16".to_string()],
-            supports_p2p: false,
-        }]
+    /// Detect available GPU devices using wgpu adapter enumeration.
+    /// Deduplicates multiple backends (Vulkan/DX12/GL) for the same physical card.
+    async fn detect_devices() -> Vec<GPUDevice> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            flags: wgpu::InstanceFlags::default() & !wgpu::InstanceFlags::VALIDATION & !wgpu::InstanceFlags::DEBUG,
+            ..Default::default()
+        });
+        
+        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+        let mut devices = Vec::new();
+        let mut seen_hardware = std::collections::HashSet::new();
+
+        for adapter in adapters {
+            let info = adapter.get_info();
+            
+            // Skip software/CPU renderers if we have hardware options, but keep as fallback
+            if info.device_type == wgpu::DeviceType::Cpu && !devices.is_empty() {
+                continue;
+            }
+
+            // Create a unique key for the physical hardware to avoid double-counting 
+            // (e.g. same card via Vulkan and DX12)
+            let hardware_id = format!("{}-{}-{:?}", info.name, info.vendor, info.device_type);
+            if seen_hardware.contains(&hardware_id) {
+                continue;
+            }
+            seen_hardware.insert(hardware_id);
+
+            let idx = devices.len();
+            let name = info.name.clone();
+            let mut total_memory = Self::estimate_total_memory(); 
+            
+            // Try to get precise VRAM for NVIDIA via nvidia-smi
+            if info.name.to_lowercase().contains("nvidia") {
+                if let Some(vram) = Self::try_detect_nvidia_memory() {
+                    total_memory = vram;
+                }
+            }
+
+            debug!(
+                "Detected {} adapter {}: {} ({:?}) - VRAM: {}MB",
+                info.backend, idx, name, info.device_type, total_memory / 1024 / 1024
+            );
+
+            devices.push(GPUDevice {
+                id: idx,
+                name: format!("{} ({})", name, info.backend),
+                total_memory,
+                available_memory: total_memory,
+                utilization: 0.0,
+                temperature: 0.0,
+                power_usage: 0,
+                capabilities: vec!["fp32".to_string()],
+                supports_p2p: false,
+            });
+        }
+
+        if devices.is_empty() {
+             devices.push(GPUDevice {
+                id: 0,
+                name: "CPU Fallback".to_string(),
+                total_memory: 0,
+                available_memory: 0,
+                utilization: 0.0,
+                temperature: 0.0,
+                power_usage: 0,
+                capabilities: vec!["fp32".to_string()],
+                supports_p2p: false,
+            });
+        }
+
+        devices
+    }
+
+    /// Try to run nvidia-smi to get total VRAM
+    fn try_detect_nvidia_memory() -> Option<u64> {
+        let output = Command::new("nvidia-smi")
+            .arg("--query-gpu=memory.total")
+            .arg("--format=csv,noheader,nounits")
+            .output()
+            .ok()?;
+            
+        if output.status.success() {
+            let val_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if let Ok(mb) = val_str.parse::<u64>() {
+                return Some(mb * 1024 * 1024);
+            }
+        }
+        None
     }
 
     /// Try to detect the GPU name from the environment
@@ -197,12 +267,16 @@ impl GPUManager {
         "Unknown GPU".to_string()
     }
 
-    /// Estimate total GPU memory (placeholder — will be filled by actual
-    /// device queries once model loading begins)
+    /// Estimate total GPU memory
+    /// Since wgpu cannot query VRAM size across all vendors easily yet,
+    /// we allow overriding it via environment variable, defaulting to 8GB.
     fn estimate_total_memory() -> u64 {
-        // Default estimate: 8 GB. Actual memory will be tracked through
-        // our allocation system once models are loaded.
-        8 * 1024 * 1024 * 1024
+        let gb = std::env::var("GPU_VRAM_GB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(8);
+        
+        gb * 1024 * 1024 * 1024
     }
 
     /// Get number of GPU devices

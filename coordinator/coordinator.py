@@ -104,6 +104,7 @@ class RequestContext:
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     worker_id: Optional[str] = None
+    target_worker_id: Optional[str] = None
     error: Optional[str] = None
     tokens_generated: int = 0
 
@@ -282,8 +283,17 @@ class ClusterCoordinator:
                 
                 ctx = self.active_requests[request_id]
                 
-                # Find suitable worker
-                worker = await self._select_worker(ctx.model_name)
+                # Check for explicit worker targeting first
+                worker = None
+                if ctx.target_worker_id:
+                    worker = self.workers.get(ctx.target_worker_id)
+                    if not worker or not worker.is_available:
+                        ctx.error = f"Target worker '{ctx.target_worker_id}' is not available"
+                        self.request_counter.labels(model=ctx.model_name, status="failed").inc()
+                        continue
+                else:
+                    # Default load balancing logic if no explicit target
+                    worker = await self._select_worker(ctx.model_name)
                 
                 if not worker:
                     ctx.error = "No available workers"
@@ -316,6 +326,11 @@ class ClusterCoordinator:
                     if model_config:
                         required_memory = model_config.min_memory_gb * 1e9
                         if worker.available_memory >= required_memory:
+                            available_workers.append(worker)
+                    else:
+                        # For unknown HuggingFace models, assume 8GB requirement for now
+                        # We don't know the true size until the Rust worker downloads the safetensors metadata
+                        if worker.available_memory >= 6 * 1e9:
                             available_workers.append(worker)
         
         if not available_workers:
@@ -395,15 +410,10 @@ class ClusterCoordinator:
         """Load a model on a worker."""
         try:
             model_config = ModelRegistry.get_model(model_name)
-            if not model_config:
-                logger.error(f"Unknown model: {model_name}")
-                return False
             
-            # Prepare load request
-            request = pb.LoadModelRequest(
-                model_name=model_name,
-                model_path=str(self.settings.model_cache_dir / f"{model_name}.mpk"),
-                config=pb.ModelConfig(
+            if model_config:
+                # Use strict registry configuration if known
+                config_pb = pb.ModelConfig(
                     architecture=model_config.family.value,
                     num_layers=model_config.num_layers,
                     hidden_size=model_config.hidden_size,
@@ -412,8 +422,32 @@ class ClusterCoordinator:
                     vocab_size=model_config.vocab_size,
                     max_position_embeddings=model_config.max_seq_len,
                     intermediate_size=model_config.intermediate_size,
-                ),
-                gpu_ids=[g.id for g in worker.gpus[:model_config.recommended_gpus]],
+                )
+                gpu_ids = [g.id for g in worker.gpus[:model_config.recommended_gpus]]
+                if not gpu_ids and worker.gpus:
+                    gpu_ids = [worker.gpus[0].id]
+            else:
+                # If unknown, it's a HuggingFace pull. 
+                # The Rust worker model_loader.rs will download config.json from HF 
+                # and override these empty placeholder values anyway.
+                config_pb = pb.ModelConfig(
+                    architecture="llama", # default fallback
+                    num_layers=0,
+                    hidden_size=0,
+                    num_attention_heads=0,
+                    num_kv_heads=0,
+                    vocab_size=0,
+                    max_position_embeddings=0,
+                    intermediate_size=0,
+                )
+                gpu_ids = [g.id for g in worker.gpus] # default to all available GPUs
+            
+            # Prepare load request
+            request = pb.LoadModelRequest(
+                model_name=model_name,
+                model_path="", # Empty path signals the rust worker to download from HuggingFace
+                config=config_pb,
+                gpu_ids=gpu_ids,
                 quantization=getattr(pb, quantization.value.upper()),
                 parallelism=pb.ParallelismStrategy.AUTO,
             )
@@ -450,6 +484,7 @@ class ClusterCoordinator:
             prompt=prompt,
             params=kwargs,
             created_at=time.time(),
+            target_worker_id=kwargs.get("worker_id"),
         )
         
         self.active_requests[request_id] = ctx

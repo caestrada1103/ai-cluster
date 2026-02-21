@@ -471,9 +471,6 @@ cd worker
 # Build and start all services
 docker-compose up -d
 
-# Scale workers
-docker-compose up -d --scale worker-amd-0=4
-
 # View logs
 docker-compose logs -f
 
@@ -596,8 +593,8 @@ For complete API documentation, see the [API Reference](docs/api_reference.md).
 ### Prometheus Metrics
 
 ```bash
-# Scrape metrics
-curl http://localhost:9090/metrics
+# Scrape metrics (Prometheus is on 9099, Coordinator on 8000)
+curl http://localhost:8000/metrics
 
 # Example metrics
 # HELP coordinator_requests_total Total requests processed
@@ -606,7 +603,7 @@ coordinator_requests_total{model="deepseek-7b"} 1250
 
 # HELP worker_gpu_utilization_percent GPU utilization
 # TYPE worker_gpu_utilization_percent gauge
-worker_gpu_utilization_percent{worker="amd-gpu-0",gpu="0"} 75.2
+worker_gpu_utilization_percent{worker="worker-gpu-0",gpu="0"} 75.2
 ```
 
 ### Grafana Dashboards

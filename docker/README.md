@@ -25,18 +25,15 @@ docker build -f docker/Dockerfile.worker --build-arg GPU_BACKEND=cuda -t ai-work
 ### 2. Start the cluster
 
 ```bash
-# Start full stack with monitoring
-docker compose -f docker/docker-compose.full.yml up -d
-
-# Or start specific workers
-docker compose -f docker/docker-compose.gpu.yml up -d
+# Start the cluster with monitoring and workers
+docker compose up -d
 ```
 
 ### 3. Check status
 
 ```bash
 # View logs
-docker compose -f docker/docker-compose.full.yml logs -f
+docker compose logs -f
 
 # Check health
 curl http://localhost:8000/health
@@ -48,7 +45,7 @@ curl http://localhost:8000/v1/workers
 ### Coordinator Image (`ai-coordinator`)
 
 - Based on Python 3.10 slim
-- Exposes port 8000 (HTTP API) and 9090 (metrics)
+- Exposes port 8000 (HTTP API & metrics)
 - Includes health check endpoint
 - Runs as non-root user
 
@@ -120,9 +117,9 @@ sudo systemctl restart docker
 ## Networking
 
 Services communicate over the `ai-cluster-net` bridge network:
-- Coordinator: port 8000 (HTTP), 9090 (metrics)
+- Coordinator: port 8000 (HTTP API & metrics)
 - Workers: ports 50051-50054 (gRPC), 9091-9094 (metrics)
-- Monitoring: 9090 (Prometheus), 3000 (Grafana)
+- Monitoring: 9099 (Prometheus), 3000 (Grafana)
 
 ## Health Checks
 
@@ -213,13 +210,10 @@ docker exec ai-coordinator curl http://ai-worker-amd-0:9091/health
 
 ```bash
 # Deploy with Docker Swarm
-docker stack deploy -c docker/docker-compose.full.yml ai-cluster
-
-# Scale workers
-docker service scale ai-cluster_worker-amd=4
+docker stack deploy -c docker-compose.yml ai-cluster
 
 # Rolling updates
-docker service update --image ai-worker:new-version ai-cluster_worker-amd
+docker service update --image ai-worker:new-version ai-cluster_worker-gpu-0
 ```
 
 ## Building for Production
@@ -239,7 +233,7 @@ docker buildx build \
 
 ```bash
 # Stop all containers
-docker compose -f docker/docker-compose.full.yml down -v
+docker compose down -v
 
 # Remove images
 docker rmi ai-coordinator:latest ai-worker:amd ai-worker:nvidia
@@ -271,28 +265,15 @@ These Docker files provide:
    - Small final image
 
 2. **`Dockerfile.worker`** - Multi-stage Rust build with GPU support:
-   - AMD ROCm and NVIDIA CUDA variants
-   - GPU passthrough configuration
-   - Optimized caching layers
-   - Runtime selection based on GPU_BACKEND
+   - Built to target `wgpu`/Vulkan for universal compatibility
    - Non-root user with GPU group access
 
-3. **`docker-compose.gpu.yml`** - GPU-specific workers:
-   - AMD worker with device passthrough
-   - NVIDIA worker with runtime
-   - CPU fallback worker
-   - Resource reservations
-
-4. **`docker-compose.full.yml`** - Complete stack:
+3. **`docker-compose.yml`** (root) - Complete stack:
    - Coordinator
-   - Multiple GPU workers
+   - Multiple explicitly-defined GPU workers (`worker-gpu-0`, `worker-gpu-1`, etc.)
    - Prometheus + Grafana monitoring
-   - Node exporter
-   - MinIO for model storage
-   - Redis for caching
-   - Jaeger for tracing
 
-5. **Documentation** - Comprehensive README with:
+4. **Documentation** - Comprehensive README with:
    - Build instructions
    - GPU setup
    - Environment variables
