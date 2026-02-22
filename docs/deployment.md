@@ -141,30 +141,69 @@ echo "/dev/nvme0n1 /data ext4 defaults 0 0" | sudo tee -a /etc/fstab
 
 ## Quick Start
 
-### 5-Minute Test Deployment
+### Method 1: Docker Compose
+
+The easiest way to get started is using Docker Compose, which handles all dependencies automatically.
 
 ```bash
-# 1. Clone repository
+# 1. Clone the repository
 git clone https://github.com/caestrada1103/ai-cluster.git
 cd ai-cluster
 
-# 2. Run setup script
-./scripts/setup_rocm.sh  # For AMD
-# or
-./scripts/setup_cuda.sh  # For NVIDIA
+# 2. Configure Environment (Optional but Recommended)
+# Create a .env file to store secrets like your Hugging Face Token (required for Llama 3)
+cp .env.example .env
+# Edit .env and set HF_TOKEN=hf_...
 
 # 3. Build and start with Docker Compose
-docker-compose up -d
+docker-compose up -d --build
 
-# 4. Check status
+# 4. Check that everything is running
 curl http://localhost:8000/health
 
-# 5. Load a model
-curl -X POST http://localhost:8000/v1/models/load \
+# 5. Run your first inference (Model will auto-download and load)
+curl -X POST http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"model_name": "deepseek-7b"}'
+  -d '{
+    "model": "deepseek-7b",
+    "prompt": "Hello, how are you?",
+    "max_tokens": 50
+  }'
+```
 
-# 6. Run inference
+### Method 2: Local Execution (Native GPU)
+
+If you prefer to run the cluster natively on your host machine to manually manage the GPU environment:
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/caestrada1103/ai-cluster.git
+cd ai-cluster
+
+# 2. Run the setup script for your GPU architecture
+# For AMD GPUs
+./scripts/setup_rocm.sh
+# Or for NVIDIA GPUs
+./scripts/setup_cuda.sh
+
+# 3. Set up Python environment for Coordinator
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+pip install -r coordinator/requirements.txt
+
+# 4. Build and run the Rust Worker locally
+# In a new terminal:
+cd worker
+# For AMD: cargo run --release --features hip
+# For NVIDIA: cargo run --release --features cuda
+cargo run --release --features cuda
+
+# 5. Start the Coordinator locally
+# In the original python terminal:
+cd coordinator
+uvicorn main:app --host 0.0.0.0 --port 8000
+
+# 6. Run your first inference (Model will auto-download and load)
 curl -X POST http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{

@@ -62,16 +62,22 @@ The AI Cluster is a distributed system designed to run large language models (LL
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                       Infrastructure Layer                          │
+│                 Implementation Layer (Current)                      │
+│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐                   │
+│   │   Prometheus│ │    Grafana  │ │    Consul   │                   │
+│   │    (Docker) │ │   (Docker)  │ │   Discovery │                   │
+│   └─────────────┘ └─────────────┘ └─────────────┘                   │
+│                                                                     │
+│                 Infrastructure Layer (Roadmap)                      │
 │   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐   │
-│   │   Prometheus│ │    Grafana  │ │    Redis    │ │    MinIO    │   │
-│   │   Metrics   │ │  Dashboards │ │    Cache    │ │Model Storage│   │
+│   │    Redis    │ │    MinIO    │ │    Jaeger   │ │    Vault    │   │
+│   │    Cache    │ │Model Storage│ │   Tracing   │ │   Secrets   │   │
 │   └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘   │
 │                                                                     │
-│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐   │
-│   │    Jaeger   │ │    Consul   │ │    Vault    │ │   Elastic   │   │
-│   │   Tracing   │ │   Discovery │ │   Secrets   │ │    Logs     │   │
-│   └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘   │
+│   ┌─────────────┐                                                   │
+│   │   Elastic   │                                                   │
+│   │    Logs     │                                                   │
+│   └─────────────┘                                                   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -359,7 +365,9 @@ pub struct ModelConfig {
 
 ## Parallelism Strategies
 
-### 1. Pipeline Parallelism
+> **Note on Implementation Status**: The AI Cluster natively supports **Data Parallelism** (running independent models on multiple workers, either on the same machine or across the network). The implementations for **Pipeline, Tensor, and Expert Parallelism** within a single worker are active roadmap items utilizing the `burn` framework's multi-device capabilities.
+
+### 1. Pipeline Parallelism (Planned)
 
 Splits model layers across multiple GPUs.
 
@@ -389,7 +397,7 @@ Micro-batching for efficiency:
 └───────────────────────────────────────────────────────┘
 ```
 
-### 2. Tensor Parallelism
+### 2. Tensor Parallelism (Planned)
 
 Splits individual tensors across multiple GPUs.
 
@@ -443,7 +451,7 @@ Replicates model across GPUs, splits batch.
 └──────────────────────────────────────────────────────┘
 ```
 
-### 4. Expert Parallelism (MoE)
+### 4. Expert Parallelism (MoE) (Planned)
 
 Distributes experts across GPUs for Mixture of Experts models.
 
@@ -560,16 +568,16 @@ spec:
 
 ### 1. Memory Management
 
-- **Paged KV Cache**: Reduces memory usage by 50-70% for long sequences
-- **Memory Pooling**: Reuses GPU memory allocations
-- **Quantization**: INT8 reduces memory by 75%, INT4 by 87.5%
+- **Quantization (Implemented)**: INT8 reduces memory by 75%, INT4 by 87.5%
+- **Memory Pooling (Implemented)**: Reuses GPU memory allocations
+- **Paged KV Cache (Roadmap)**: Planned implementation to reduce memory usage by 50-70% for long sequences
 
 ### 2. Latency Optimization
 
-- **Continuous Batching**: 2-3x throughput improvement
-- **Speculative Decoding**: 2-3x speedup for generation
-- **Flash Attention**: 2-4x faster attention computation
-- **Tensor Core Utilization**: 2x speedup on supported hardware
+- **Tensor Core Utilization (Implemented)**: 2x speedup on supported hardware
+- **Continuous Batching (Roadmap)**: Planned to provide 2-3x throughput improvement
+- **Speculative Decoding (Roadmap)**: Planned logic for 2-3x speedup for generation
+- **Flash Attention (Roadmap)**: Planned integration for 2-4x faster attention computation
 
 ### 3. Throughput Scaling
 
@@ -617,10 +625,13 @@ spec:
 
 ### 3. Data Security
 
-- **Model Encryption**: Encrypted model weights at rest
 - **Memory Isolation**: Processes run in separate memory spaces
 - **Secure Erasure**: Memory zeroed after model unloading
 - **Audit Logging**: All access logged for compliance
+
+*(Roadmap)* 
+- **Model Encryption**: Encrypted model weights at rest
+- **Secrets Management**: Vault integration for securely managing API keys
 
 ---
 
@@ -660,11 +671,13 @@ spec:
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 3. Tracing with Jaeger
+### 3. Distributed Tracing (Roadmap)
+
+Jaeger integration is planned for providing end-to-end tracing functionality.
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│ Trace: inference-123456                             │
+│ Trace: inference-123456 (Planned View)              │
 ├─────────────────────────────────────────────────────┤
 │                                                     │
 │ Coordinator: route_request ──────────────────┐      │

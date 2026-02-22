@@ -45,7 +45,7 @@ pub struct ModelLoaderConfig {
 impl Default for ModelLoaderConfig {
     fn default() -> Self {
         Self {
-            cache_dir: PathBuf::from("./data/models"),
+            cache_dir: PathBuf::from("./models"),
             download_dir: PathBuf::from("./data/downloads"),
             max_concurrent_loads: 2,
             load_timeout_secs: 300,

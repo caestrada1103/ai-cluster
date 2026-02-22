@@ -281,7 +281,7 @@ models:
   config_file: "config/models.toml"
   
   # Model cache directory
-  cache_dir: "/data/models"
+  cache_dir: "./models"
   
   # Download directory for new models
   download_dir: "/data/downloads"
@@ -503,21 +503,11 @@ monitoring:
     datasource_name: "Prometheus"
     annotations: true
   
-  # Distributed tracing
+  # Distributed tracing (Roadmap)
   tracing:
     enabled: false
-    provider: "jaeger"  # jaeger, zipkin, otlp
-    jaeger:
-      host: "jaeger.service.consul"
-      port: 6831
-      service_name: "ai-coordinator"
-      sample_rate: 0.1
-      max_tag_value_length: 256
-    zipkin:
-      endpoint: "http://zipkin:9411/api/v2/spans"
-    otlp:
-      endpoint: "http://otel-collector:4317"
-      protocol: "grpc"
+    # provider: "jaeger"  # jaeger, zipkin, otlp
+    # Configuration will be supported in a future release
   
   # Health check metrics
   health_metrics:
@@ -557,7 +547,7 @@ database:
   # Enable request tracking and analytics
   enabled: false
   
-  # Database type: sqlite, postgres, mysql
+  # Database type: sqlite (postgres, mysql planned for future releases)
   type: "sqlite"
   
   # SQLite configuration
@@ -565,27 +555,6 @@ database:
     path: "/data/coordinator.db"
     journal_mode: "WAL"
     synchronous: "NORMAL"
-  
-  # PostgreSQL configuration
-  postgres:
-    host: "localhost"
-    port: 5432
-    database: "ai-cluster"
-    username: "coordinator"
-    password: ""  # Use environment variable
-    ssl_mode: "disable"
-    max_connections: 10
-    connection_timeout_seconds: 5
-  
-  # MySQL configuration
-  mysql:
-    host: "localhost"
-    port: 3306
-    database: "ai-cluster"
-    username: "coordinator"
-    password: ""  # Use environment variable
-    charset: "utf8mb4"
-    max_connections: 10
   
   # Connection pool
   pool:
@@ -602,7 +571,7 @@ cache:
   # Enable response caching
   enabled: true
   
-  # Cache type: memory, redis, memcached
+  # Cache type: memory (redis, memcached planned for future releases)
   type: "memory"
   
   # In-memory cache
@@ -610,23 +579,6 @@ cache:
     max_size_mb: 1024
     eviction_policy: "lru"  # lru, lfu, fifo, ttl
     ttl_seconds: 3600
-  
-  # Redis cache
-  redis:
-    host: "redis.service.consul"
-    port: 6379
-    password: ""  # Use environment variable
-    db: 0
-    max_connections: 10
-    ssl: false
-  
-  # Memcached cache
-  memcached:
-    hosts:
-      - "memcached1:11211"
-      - "memcached2:11211"
-    timeout_seconds: 1
-    pool_size: 5
   
   # Cache keys
   keys:
@@ -754,14 +706,9 @@ backup:
   compress: true
   compression_type: "gzip"
   
-  # S3 backup (optional)
-  s3:
-    enabled: false
-    bucket: "ai-cluster-backups"
-    region: "us-east-1"
-    access_key: ""  # Use environment variable
-    secret_key: ""  # Use environment variable
-    endpoint: ""  # Optional custom endpoint
+  # S3 backup (roadmap)
+  # s3:
+  #   Future settings will go here
 ```
 
 ---
@@ -975,7 +922,7 @@ nvml_monitoring = true
 
 [model_loader]
 # Cache directory for downloaded models
-cache_dir = "/data/models"
+cache_dir = "./models"
 
 # Download directory for temporary files
 download_dir = "/data/downloads"
@@ -1063,7 +1010,7 @@ max_prefix_cache_size = 1000
 # Speculative decoding
 [inference.speculative]
 enabled = false
-draft_model_path = "/data/models/tiny-model"
+draft_model_path = "./models/tiny-model"
 num_speculative_tokens = 5
 verify_probability = 0.8
 max_draft_tokens = 100
@@ -1609,11 +1556,11 @@ moe_capacity_factor = 1.2
 
 # File paths
 [models."deepseek-7b".paths]
-config = "/data/models/deepseek-7b/config.json"
-weights = "/data/models/deepseek-7b/model.safetensors"
-tokenizer = "/data/models/deepseek-7b/tokenizer.json"
-vocab = "/data/models/deepseek-7b/vocab.json"
-shard_index = "/data/models/deepseek-7b/model.safetensors.index.json"
+config = "./models/deepseek-7b/config.json"
+weights = "./models/deepseek-7b/model.safetensors"
+tokenizer = "./models/deepseek-7b/tokenizer.json"
+vocab = "./models/deepseek-7b/vocab.json"
+shard_index = "./models/deepseek-7b/model.safetensors.index.json"
 
 # Quantization support
 [models."deepseek-7b".quantization]
@@ -1681,9 +1628,9 @@ num_experts = 128
 num_experts_per_tok = 8
 
 [models."deepseek-67b".paths]
-config = "/data/models/deepseek-67b/config.json"
-weights = "/data/models/deepseek-67b/model.safetensors"
-tokenizer = "/data/models/deepseek-67b/tokenizer.json"
+config = "./models/deepseek-67b/config.json"
+weights = "./models/deepseek-67b/model.safetensors"
+tokenizer = "./models/deepseek-67b/tokenizer.json"
 
 [models."deepseek-67b".quantization]
 supported = ["int8", "int4", "fp8"]
@@ -1726,9 +1673,9 @@ rope_scaling = { type = "linear", factor = 8.0 }
 is_moe = false
 
 [models."llama3-8b".paths]
-config = "/data/models/llama3-8b/config.json"
-weights = "/data/models/llama3-8b/model.safetensors"
-tokenizer = "/data/models/llama3-8b/tokenizer.json"
+config = "./models/llama3-8b/config.json"
+weights = "./models/llama3-8b/model.safetensors"
+tokenizer = "./models/llama3-8b/tokenizer.json"
 
 [models."llama3-8b".quantization]
 supported = ["fp16", "int8", "int4"]
@@ -1807,9 +1754,9 @@ sliding_window = 4096
 is_moe = false
 
 [models."mistral-7b".paths]
-config = "/data/models/mistral-7b/config.json"
-weights = "/data/models/mistral-7b/model.safetensors"
-tokenizer = "/data/models/mistral-7b/tokenizer.json"
+config = "./models/mistral-7b/config.json"
+weights = "./models/mistral-7b/model.safetensors"
+tokenizer = "./models/mistral-7b/tokenizer.json"
 
 [models."mistral-7b".quantization]
 supported = ["fp16", "int8"]
@@ -2031,9 +1978,9 @@ rope_theta = 10000.0
 is_moe = false
 
 [models."my-custom-model".paths]
-config = "/data/models/my-custom-model/config.json"
-weights = "/data/models/my-custom-model/model.safetensors"
-tokenizer = "/data/models/my-custom-model/tokenizer.json"
+config = "./models/my-custom-model/config.json"
+weights = "./models/my-custom-model/model.safetensors"
+tokenizer = "./models/my-custom-model/tokenizer.json"
 
 [models."my-custom-model".quantization]
 supported = ["fp16", "int8"]
@@ -2080,7 +2027,7 @@ export LOG_LEVEL="info"
 export LOG_FORMAT="json"
 
 # Model paths
-export MODEL_CACHE_DIR="/data/models"
+export MODEL_CACHE_DIR="./models"
 export MODEL_DOWNLOAD_DIR="/data/downloads"
 
 # Performance
@@ -2124,7 +2071,7 @@ export RUST_LOG="info"
 export RUST_BACKTRACE="1"
 
 # Model paths
-export MODEL_CACHE_DIR="/data/models"
+export MODEL_CACHE_DIR="./models"
 export MODEL_DOWNLOAD_DIR="/data/downloads"
 
 # Performance

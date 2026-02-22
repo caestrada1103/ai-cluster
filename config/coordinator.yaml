@@ -62,8 +62,8 @@ routing:
 # Model management
 models:
   config_file: "config/models.toml"
-  cache_dir: "/data/models"
-  download_dir: "/data/downloads"
+  cache_dir: "./models"
+  download_dir: "./data/downloads"
   auto_load_on_startup: true
   auto_unload_after_idle_minutes: 60
   max_loaded_models_per_worker: 5

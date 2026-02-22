@@ -58,28 +58,36 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
 
 | Feature | Description |
 |---------|-------------|
-| **Multi-GPU Support** | Run models across multiple AMD (ROCm) or NVIDIA (CUDA) GPUs |
-| **Multiple Parallelism Strategies** | Pipeline, Tensor, Data, and Expert parallelism |
+| **Multi-GPU Support** | Run models across multiple AMD (ROCm) or NVIDIA (CUDA) GPUs via multiple workers |
 | **Dynamic Model Loading** | Load/unload models at runtime without restart |
-| **Continuous Batching** | High-throughput inference with dynamic batching |
-| **Paged KV Cache** | Memory-efficient attention cache for long contexts |
 | **REST API** | OpenAI-compatible API for easy integration |
 | **Streaming** | Stream tokens as they're generated |
 | **Quantization** | FP16, INT8, INT4, FP8 support |
-| **Speculative Decoding** | 2-3x speedup for generation |
 
 ### Advanced Features
 
 | Feature | Description |
 |---------|-------------|
-| **Auto Parallelism** | Automatically selects best parallelism strategy |
 | **Circuit Breakers** | Prevents cascading failures |
 | **Request Queuing** | Priority-based request handling |
 | **Affinity Routing** | Session persistence for chatbots |
-| **Distributed Tracing** | Jaeger integration for debugging |
 | **Prometheus Metrics** | Comprehensive monitoring |
 | **Grafana Dashboards** | Pre-built visualizations |
 | **Kubernetes Support** | Helm charts and operators |
+
+### Roadmap & Planned Optimizations
+
+The following features are under active development to improve performance, particularly for limited hardware environments or constrained networks:
+
+| Feature | Description |
+|---------|-------------|
+| **Advanced Parallelism** | Tensor and Pipeline parallelism within a single worker (currently supports Data Parallelism via multi-worker scaling) |
+| **Continuous Batching** | High-throughput inference with dynamic batching |
+| **Paged KV Cache** | Memory-efficient attention cache for long contexts |
+| **Speculative Decoding** | 2-3x speedup for generation |
+| **Flash Attention** | Fast and memory-efficient exact attention |
+| **Distributed Tracing** | Jaeger integration for debugging and tracing requests |
+| **Extended Infrastructure** | Redis (caching), MinIO (model storage), Vault (secrets), Elastic (logs) |
 
 ---
 
@@ -93,7 +101,8 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
 - **GPU Acceleration**:
     - **AMD**: ROCm (HIP)
     - **NVIDIA**: CUDA
-- **Infrastructure**: Docker, Prometheus, Grafana, Jaeger
+- **Infrastructure**: Docker, Prometheus, Grafana
+- **Planned Infrastructure**: Jaeger, Redis, MinIO, Vault, Elastic
 
 ## Architecture
 
@@ -152,52 +161,69 @@ For detailed architecture information, see the [Architecture Guide](docs/archite
 
 ## Quick Start
 
-### 5-Minute Test Deployment
+### Method 1: Docker Compose
+
+The easiest way to get started is using Docker Compose, which handles all dependencies automatically.
 
 ```bash
 # 1. Clone the repository
 git clone https://github.com/caestrada1103/ai-cluster.git
 cd ai-cluster
 
-# 2. Set up Python environment
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# or
-# .\venv\Scripts\activate  # Windows
-
-# 3. Install dependencies
-pip install -r coordinator/requirements.txt
-
-# 4. Configure Environment (Optional but Recommended)
+# 2. Configure Environment (Optional but Recommended)
 # Create a .env file to store secrets like your Hugging Face Token (required for Llama 3)
 cp .env.example .env
 # Edit .env and set HF_TOKEN=hf_...
 
-# 5. Run the setup script
+# 3. Build and start with Docker Compose
+docker-compose up -d --build
+
+# 4. Check that everything is running
+curl http://localhost:8000/health
+
+# 5. Run your first inference (Model will auto-download and load)
+curl -X POST http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-7b",
+    "prompt": "Hello, how are you?",
+    "max_tokens": 50
+  }'
+```
+
+### Method 2: Local Execution (Native GPU)
+
+If you prefer to run the cluster natively on your host machine to manually manage the GPU environment:
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/caestrada1103/ai-cluster.git
+cd ai-cluster
+
+# 2. Run the setup script for your GPU architecture
 # For AMD GPUs
 ./scripts/setup_rocm.sh
-
 # Or for NVIDIA GPUs
 ./scripts/setup_cuda.sh
 
-# Note for Mixed-GPU Clusters:
-# You will need to build separate worker binaries for each GPU type.
-# See docs/deployment.md for detailed instructions.
+# 3. Set up Python environment for Coordinator
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+pip install -r coordinator/requirements.txt
 
-# 6. Build and start with Docker Compose
-docker-compose up -d
+# 4. Build and run the Rust Worker locally
+# In a new terminal:
+cd worker
+# For AMD: cargo run --release --features hip
+# For NVIDIA: cargo run --release --features cuda
+cargo run --release --features cuda
 
-# 7. Check that everything is running
-curl http://localhost:8000/health
+# 5. Start the Coordinator locally
+# In the original python terminal:
+cd coordinator
+uvicorn main:app --host 0.0.0.0 --port 8000
 
-# 8. Download and load a model
-python scripts/convert_model.py deepseek-ai/deepseek-llm-7b-base --output ./models/
-
-curl -X POST http://localhost:8000/v1/models/load \
-  -H "Content-Type: application/json" \
-  -d '{"model_name": "deepseek-7b"}'
-
-# 9. Run your first inference
+# 6. Run your first inference (Model will auto-download and load)
 curl -X POST http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -206,8 +232,6 @@ curl -X POST http://localhost:8000/v1/completions \
     "max_tokens": 100
   }'
 ```
-
-That's it! You now have a working AI cluster.
 
 ---
 
@@ -235,15 +259,15 @@ That's it! You now have a working AI cluster.
 
 AI Cluster supports a wide range of popular models:
 
-| Model Family | Sizes | Parallelism | Quantization |
-|--------------|-------|-------------|--------------|
-| **DeepSeek** | 7B, 67B | Pipeline, Expert | FP16, INT8, INT4 |
-| **Llama 3** | 8B, 70B | Pipeline, Tensor | FP16, INT8, INT4 |
-| **Mistral** | 7B | Pipeline | FP16, INT8 |
-| **Mixtral** | 8x7B | Pipeline, Tensor, Expert | INT8, INT4 |
-| **Gemma** | 2B, 7B | Pipeline | FP16, INT8 |
-| **Phi** | 2, 3-mini | Single | FP16 |
-| **Qwen** | 7B, 14B | Pipeline, Tensor | FP16, INT8 |
+| Model Family | Sizes | Parallelism Support | Quantization |
+|--------------|-------|---------------------|--------------|
+| **DeepSeek** | 7B, 67B | Single Worker / Data Parallel | FP16, INT8, INT4 |
+| **Llama 3** | 8B, 70B | Single Worker / Data Parallel | FP16, INT8, INT4 |
+| **Mistral** | 7B | Single Worker / Data Parallel | FP16, INT8 |
+| **Mixtral** | 8x7B | Single Worker / Data Parallel | INT8, INT4 |
+| **Gemma** | 2B, 7B | Single Worker / Data Parallel | FP16, INT8 |
+| **Phi** | 2, 3-mini | Single Worker / Data Parallel | FP16 |
+| **Qwen** | 7B, 14B | Single Worker / Data Parallel | FP16, INT8 |
 
 ### Adding Custom Models
 
@@ -271,10 +295,12 @@ curl -X POST http://localhost:8000/v1/models/load \
 
 ## Performance
 
-### Benchmarks
+> **Disclaimer**: The benchmarks and metrics below represent **projected goals** leveraging our planned future optimizations (such as Continuous Batching, Paged KV Cache, and advanced Tensor Parallelism). Current single-worker baseline performance will vary depending on your hardware environment.
 
-| Model | GPUs | Batch Size | Tokens/sec | Latency (P95) |
-|-------|------|------------|------------|---------------|
+### Projected Benchmarks
+
+| Model | GPUs | Batch Size | Projected Tokens/sec | Projected Latency (P95) |
+|-------|------|------------|----------------------|-------------------------|
 | DeepSeek-7B | 1x AMD 9060 XT | 1 | 45 | 120ms |
 | DeepSeek-7B | 1x AMD 9060 XT | 8 | 210 | 380ms |
 | DeepSeek-7B | 2x AMD 9060 XT | 16 | 410 | 420ms |
@@ -284,7 +310,7 @@ curl -X POST http://localhost:8000/v1/models/load \
 | Llama-3-70B | 4x NVIDIA A100 | 1 | 28 | 210ms |
 | Mixtral-8x7B | 2x NVIDIA A100 | 1 | 18 | 320ms |
 
-### Scaling Efficiency
+### Scaling Efficiency (Data Parallel Multi-Worker)
 
 ```
 Throughput vs. Number of GPUs (DeepSeek-7B)
@@ -297,13 +323,14 @@ Throughput vs. Number of GPUs (DeepSeek-7B)
           Tokens per second
 ```
 
-### Optimizations
+### Roadmap Optimizations Impact
 
+Once fully implemented, these optimizations are projected to provide the following benefits for constrained hardware settings:
 - **Continuous Batching**: 2-3x throughput improvement
 - **Paged KV Cache**: 50-70% memory reduction
 - **Flash Attention**: 2-4x faster attention
 - **Speculative Decoding**: 2-3x faster generation
-- **Quantization**: 75% memory reduction with INT8
+- **Quantization**: 75% memory reduction with INT8 (Currently available)
 
 ---
 
@@ -401,16 +428,16 @@ curl -X POST http://localhost:8000/v1/models/load \
   -d '{"model_name": "mistral-7b", "worker_id": "nvidia-gpu-0"}'
 ```
 
-### 2. **Running Large Models (Model Parallelism)**
+### 2. **Running Large Models (Future Optimization)**
 
-To run models larger than a single GPU's memory (e.g., Llama 3 70B, Mixtral 8x7B), the cluster automatically splits the model across multiple GPUs.
+> **Note**: Tensor and Pipeline parallelism within a single worker are active roadmap items utilizing the `burn` framework's multi-device capabilities. Currently, models must fit within the memory of a single GPU, or you can leverage Data Parallelism by deploying multiple identical model workers on the same machine.
 
-**Example**: Running Llama 3 70B on 4 GPUs:
-1.  **Configure**: Ensure `config/models.toml` allows sufficient GPUs.
+When fully implemented, you will be able to configure model splitting like this:
+1.  **Configure**: Ensure `config/models.toml` allows sufficient GPUs (Planned feature).
     ```toml
     [models.llama3-70b]
     max_gpus = 8
-    parallelism.default = "auto"
+    parallelism.default = "tensor"
     ```
 2.  **Load**:
     ```bash
