@@ -4,7 +4,7 @@
 # No vendor-specific SDKs required.
 
 # Stage 1: Build stage
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:24.04 AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -57,28 +57,31 @@ RUN touch src/main.rs src/lib.rs benches/inference.rs && \
     cargo build --release --features="wgpu"
 
 # Stage 2: Runtime
-FROM ubuntu:22.04 AS runtime
+FROM rocm/dev-ubuntu-24.04:6.2.1-complete AS runtime
 
 # Set labels
 LABEL maintainer="Carlos Estrada <caestrada1103@gmail.com>"
 LABEL description="AI Cluster Worker (Universal GPU via Vulkan/wgpu)"
 LABEL version="0.1.0"
 
-# Install runtime dependencies
+# Install minimal runtime dependencies (ROCm is already included in base)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     libssl3 \
-    libvulkan1 \
+    mesa-utils \
+    vulkan-tools \
     mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN groupadd -r -g 1000 worker && \
+# Create non-root user (handle existing UID 1000 in Ubuntu 24.04 base)
+RUN if getent passwd 1000; then userdel -f $(getent passwd 1000 | cut -d: -f1); fi && \
+    if getent group 1000; then groupdel $(getent group 1000 | cut -d: -f1); fi && \
+    groupadd -r -g 1000 worker && \
     useradd -r -g worker -u 1000 -m -d /app worker
 
 # Set environment variables
-ENV RUST_LOG=info \
+ENV RUST_LOG=debug \
     RUST_BACKTRACE=1 \
     WORKER_ID= \
     GPU_INDEX=0 \

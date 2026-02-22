@@ -12,6 +12,7 @@ pub mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::{info, warn, error, debug, instrument};
 use std::sync::Mutex;
 use burn::tensor::{Tensor, backend::Backend};
 use crate::error::WorkerError;
@@ -211,9 +212,13 @@ impl ModelInstance {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String, WorkerError>> + Send>>, WorkerError> {
         if let Some(model) = &self.model {
             let stream = {
+                debug!("ModelInstance::generate starting for {} - waiting for Mutex", self.name);
                 let guard = model.lock()
                     .map_err(|e| WorkerError::Internal(format!("Lock error: {}", e)))?;
-                guard.generate(prompt, max_tokens, temperature, top_p, top_k)?
+                debug!("ModelInstance::generate acquired Mutex for {}", self.name);
+                let res = guard.generate(prompt, max_tokens, temperature, top_p, top_k);
+                debug!("ModelInstance::generate trait call finished for {}", self.name);
+                res?
             }; // guard dropped here, stream is 'static
             Ok(stream)
         } else {

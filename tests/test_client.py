@@ -35,6 +35,7 @@ def run():
 
     # Use a small model for testing
     model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    # model_name = "deepseek-7b"
     print(f"\nLoading model {model_name}...")
     print("(This may take a while to download weights on first run...)")
     

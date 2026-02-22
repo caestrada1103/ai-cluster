@@ -14,7 +14,8 @@ services:
     environment:
       - COORDINATOR_HOST=0.0.0.0
       - COORDINATOR_PORT=8000
-      - DISCOVERY_METHOD=mdns
+      - COORDINATOR_DISCOVERY_METHOD=static
+      - COORDINATOR_STATIC_WORKERS=["worker:50051"]
       - RUST_LOG=info
       - CONFIG_FILE=/app/config/coordinator.yaml
     volumes:
@@ -51,7 +52,6 @@ services:
     image: ai-worker:latest
     environment:
       - GPU_INDEX=${GPU_INDEX:-0}
-      - GPU_VRAM_GB=${GPU_VRAM_GB:-6}
       - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
       - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
       - RUST_LOG=info
@@ -69,13 +69,14 @@ services:
     logging: *default-logging
     depends_on:
       - coordinator
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [ gpu ]
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    security_opt:
+      - seccomp=unconfined
+    group_add:
+      - video
+      - render
     restart: unless-stopped
 
   # ==========================================================================
@@ -169,8 +170,9 @@ services:
     image: ghcr.io/open-webui/open-webui:main
     container_name: ai-open-webui
     environment:
-      - OPENAI_API_BASE_URL=http://coordinator:8000/v1
+      - OPENAI_API_BASE_URLS=http://coordinator:8000/v1
       - OPENAI_API_KEY=sk-1234567890abcdef # Default from coordinator.yaml
+      - ENABLE_OLLAMA_API=False
       - WEBUI_AUTH=False # Disable login screen for local network
     volumes:
       - open-webui-data:/app/backend/data

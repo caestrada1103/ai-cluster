@@ -61,6 +61,7 @@ We have end-to-end integration tests in the `tests/` directory.
 ```bash
 python tests/test_client.py
 python tests/cluster_chat.py
+python tests/interactive_chat.py
 ```
 
 ## Helper Scripts

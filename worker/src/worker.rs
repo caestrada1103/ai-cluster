@@ -193,18 +193,23 @@ impl Worker for WorkerService {
             request_id, req.model_name, req.prompt.len()
         );
 
+        debug!("Inference request {}: waiting for active_requests lock", request_id);
         // Track active request
         self.active_requests.lock().await.insert(request_id.clone(), Instant::now());
+        debug!("Inference request {}: acquired active_requests lock and inserted", request_id);
 
         // Get model
+        debug!("Inference request {}: waiting for loaded_models read lock", request_id);
         let model = {
             let models = self.loaded_models.read().await;
             models.get(&req.model_name).cloned()
         };
+        debug!("Inference request {}: released loaded_models read lock (found: {})", request_id, model.is_some());
 
         let model = match model {
             Some(m) => m,
             None => {
+                debug!("Inference request {}: removing from active_requests mapping", request_id);
                 self.active_requests.lock().await.remove(&request_id);
                 return Err(Status::not_found(format!("Model {} not loaded", req.model_name)));
             }
@@ -319,10 +324,11 @@ impl Worker for WorkerService {
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<WorkerStatus>, Status> {
-        debug!("Status request received");
+        debug!("Status request received - waiting for locks");
 
         // Get GPU info
         let gpu_infos = self.gpu_manager.get_all_gpu_info().await;
+        debug!("Status: acquired GPU info");
 
         // Get loaded models info
         let loaded_models = {
@@ -341,8 +347,11 @@ impl Worker for WorkerService {
         };
 
         // Get system info
+        debug!("Status: waiting for active_requests lock");
         let active_requests = self.active_requests.lock().await.len();
+        debug!("Status: waiting for system memory info");
         let (memory_available, memory_total) = self.gpu_manager.system_memory().await;
+        debug!("Status: all info collected");
 
         Ok(Response::new(WorkerStatus {
             worker_id: self.worker_id.clone(),

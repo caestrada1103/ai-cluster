@@ -276,7 +276,13 @@ impl ModelLoader {
     }
 
     fn calculate_memory_usage(&self, config: &ModelConfig, _q: crate::cluster::Quantization) -> usize {
-        config.num_layers * config.hidden_size * config.hidden_size * 4 * 2 // simplified
+        let embed = config.vocab_size * config.hidden_size;
+        let attn = config.num_layers * 4 * config.hidden_size * config.hidden_size;
+        let ffn = config.num_layers * 3 * config.hidden_size * config.intermediate_size;
+        let norm = (config.num_layers * 2 + 1) * config.hidden_size;
+        
+        // Return estimation in bytes (FP16 = 2 bytes per param)
+        (embed + attn + ffn + norm) * 2
     }
     
     pub async fn unload_model(&self, model_name: &str) -> Result<(), WorkerError> {

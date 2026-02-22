@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install dependencies
 COPY coordinator/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
 
 # Copy source code
 COPY coordinator/ ./coordinator/
@@ -70,7 +70,7 @@ RUN mkdir -p /app/config /app/models /app/data /app/logs && \
 WORKDIR /app
 
 # Copy from builder
-COPY --from=builder --chown=coordinator:coordinator /usr/local/lib/python3.10/site-packages/ /usr/local/lib/python3.10/site-packages/
+COPY --from=builder --chown=coordinator:coordinator /usr/local/lib/python3.14/site-packages/ /usr/local/lib/python3.14/site-packages/
 COPY --from=builder --chown=coordinator:coordinator /build/coordinator /app/coordinator
 COPY --chown=coordinator:coordinator config/coordinator.yaml /app/config/
 COPY --chown=coordinator:coordinator config/models.toml /app/config/

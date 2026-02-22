@@ -485,15 +485,24 @@ impl<B: Backend> TextGeneration for Llama<B> {
                 let len = token_floats.len();
                 let input = Tensor::<B, 1>::from_floats(token_floats.as_slice(), &device).reshape([1, len]);
                 
-                // Forward pass
-                let output = model.forward_pass(input, 0); 
+                // Offload heavy inference to a blocking thread to avoid starving the Tokio event loop
+                let model_clone = model.clone();
+                let input_clone = input.clone();
                 
-                // Get last token logits
-                let [_batch, seq, vocab] = output.dims();
-                let last_logits = output.slice([0..1, seq-1..seq, 0..vocab]).reshape([vocab]);
-                
-                // Sample next token
-                let logit_data: Vec<f32> = last_logits.into_data().to_vec().unwrap_or_default();
+                let logit_data_res = tokio::task::spawn_blocking(move || {
+                    let output = model_clone.forward_pass(input_clone, 0); 
+                    let [_batch, seq, vocab] = output.dims();
+                    let last_logits = output.slice([0..1, seq-1..seq, 0..vocab]).reshape([vocab]);
+                    last_logits.into_data().to_vec().unwrap_or_default()
+                }).await;
+
+                let logit_data: Vec<f32> = match logit_data_res {
+                    Ok(data) => data,
+                    Err(e) => {
+                        yield Err(WorkerError::Internal(format!("Inference task panicked: {}", e)));
+                        break;
+                    }
+                };
                 
                 let token_id = if temperature < 0.01 {
                     // Greedy (argmax)
@@ -515,7 +524,22 @@ impl<B: Backend> TextGeneration for Llama<B> {
                     
                 match full_text {
                     Ok(t) => {
-                        let delta = t[prev_text_len..].to_string();
+                        let delta = if t.len() > prev_text_len {
+                            // Find the nearest valid character boundary at or after prev_text_len
+                            let mut start = prev_text_len;
+                            while start < t.len() && !t.is_char_boundary(start) {
+                                start += 1;
+                            }
+                            
+                            if start < t.len() {
+                                t[start..].to_string()
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        };
+                        
                         prev_text_len = t.len();
                         yield Ok(delta);
                     },
@@ -528,6 +552,9 @@ impl<B: Backend> TextGeneration for Llama<B> {
                          break;
                      }
                 }
+
+                // Yield to allow other tasks (like gRPC pings) to run
+                tokio::task::yield_now().await;
             }
         };
 

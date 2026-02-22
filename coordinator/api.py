@@ -7,12 +7,14 @@ Endpoints:
     POST /models/load  - Load a model onto a worker
     GET  /workers      - List connected workers
 """
-
 import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+import json
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -166,9 +168,65 @@ async def create_completion(body: CompletionRequest, request: Request):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+def _build_flat_response(result: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """Build a standard OpenAI-compatible chat completion response."""
+    return {
+        "id": result["request_id"],
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": result["text"]
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": result["tokens_generated"],
+            "total_tokens": result["tokens_generated"]
+        }
+    }
+
+async def _stream_chat_completion(ctx: Any, model: str):
+    """Generator for OpenAI-compatible Server-Sent Events (SSE)."""
+    try:
+        while True:
+            # Wait for next token from the queue
+            response = await ctx.token_queue.get()
+            
+            # Build SSE chunk
+            chunk = {
+                "id": ctx.id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": response.text if not response.finished else ""
+                    },
+                    "finish_reason": "stop" if response.finished else None
+                }]
+            }
+            
+            yield f"data: {json.dumps(chunk)}\n\n"
+            
+            if response.finished:
+                yield "data: [DONE]\n\n"
+                break
+    except Exception as e:
+        logger.error(f"Streaming error: {e}")
+        error_chunk = {"error": {"message": str(e), "type": "internal_error"}}
+        yield f"data: {json.dumps(error_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
 @router.post("/chat/completions")
 async def create_chat_completion(body: ChatCompletionRequest, request: Request):
     """OpenAI-compatible chat completions endpoint used by Open-WebUI."""
+    logger.info(f"Received chat completion request for model: {body.model}")
     coordinator = _get_coordinator(request)
 
     model_name, worker_id = _parse_model_and_worker(body.model)
@@ -201,27 +259,18 @@ async def create_chat_completion(body: ChatCompletionRequest, request: Request):
             worker_id=worker_id,
         )
         
-        # Build OpenAI compatible response
-        response = {
-            "id": result["request_id"],
-            "object": "chat.completion",
-            "created": int(result["processing_time_ms"]),
-            "model": body.model,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": result["text"]
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": result["tokens_generated"],
-                "total_tokens": result["tokens_generated"]
-            }
-        }
-        return response
+        if body.stream:
+            request_context = coordinator.active_requests.get(result["request_id"])
+            if not request_context:
+                # Fallback to flat result if somehow lost from context
+                return _build_flat_response(result, body.model)
+            
+            return StreamingResponse(
+                _stream_chat_completion(request_context, body.model),
+                media_type="text/event-stream"
+            )
+
+        return _build_flat_response(result, body.model)
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc))
     except RuntimeError as exc:

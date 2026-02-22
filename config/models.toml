@@ -358,3 +358,33 @@ default = "auto"
 [models.mixtral-8x7b.hf]
 repo_id = "mistralai/Mixtral-8x7B-v0.1"
 filename = "model-00001-of-00019.safetensors"
+
+# TinyLlama Models
+# =================
+
+[models."TinyLlama/TinyLlama-1.1B-Chat-v1.0"]
+family = "llama"
+description = "TinyLlama 1.1B Chat v1.0"
+parameters = "1.1B"
+min_memory_gb = 2
+recommended_gpus = 1
+max_gpus = 1
+
+[models."TinyLlama/TinyLlama-1.1B-Chat-v1.0".architecture]
+num_layers = 22
+hidden_size = 2048
+num_attention_heads = 32
+num_kv_heads = 4
+vocab_size = 32003
+max_seq_len = 2048
+intermediate_size = 5632
+rms_norm_eps = 1e-5
+is_moe = false
+
+[models."TinyLlama/TinyLlama-1.1B-Chat-v1.0".quantization]
+supported = ["fp16", "int8", "int4"]
+default = "fp16"
+
+[models."TinyLlama/TinyLlama-1.1B-Chat-v1.0".hf]
+repo_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+filename = "model.safetensors"

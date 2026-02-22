@@ -78,7 +78,7 @@ class Settings(BaseSettings):
         "deepseek-7b", description="Default model for inference"
     )
     request_timeout: int = Field(
-        60, description="Request timeout (seconds)", ge=1
+        300, description="Request timeout (seconds)", ge=1
     )
     max_queue_size: int = Field(
         1000, description="Maximum queued requests", ge=1
