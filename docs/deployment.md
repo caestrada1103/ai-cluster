@@ -156,7 +156,7 @@ cp .env.example .env
 # Edit .env and set HF_TOKEN=hf_...
 
 # 3. Build and start with Docker Compose
-docker-compose up -d --build
+docker compose up -d --build
 
 # 4. Check that everything is running
 curl http://localhost:8000/health
