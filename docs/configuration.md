@@ -39,32 +39,32 @@ The AI Cluster uses a hierarchical configuration system that allows for flexible
 ## Configuration Hierarchy
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Global Configuration                       │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │                  coordinator.yaml                      │  │
-│  │  • Server settings    • Discovery method              │  │
-│  │  • API configuration  • Model registry                │  │
-│  │  • Security           • Monitoring                    │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                              │                                │
-│           ┌──────────────────┼──────────────────┐            │
-│           ▼                  ▼                  ▼            │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│  │  worker.toml    │  │  models.toml    │  │  logging.yaml   │
-│  │ • GPU settings  │  │ • Model configs │  │ • Log levels    │
-│  │ • Parallelism   │  │ • Quantization  │  │ • Outputs       │
-│  │ • Cache         │  │ • Paths         │  │ • Formats       │
-│  └─────────────────┘  └─────────────────┘  └─────────────────┘
-│                              │                                │
-│           ┌──────────────────┴──────────────────┐            │
-│           ▼                                     ▼            │
-│  ┌─────────────────┐                    ┌─────────────────┐  │
-│  │  prometheus.yml │                    │   alerts.yml    │  │
-│  │ • Scrape config │                    │ • Alert rules   │  │
-│  │ • Targets       │                    │ • Notifications │  │
-│  └─────────────────┘                    └─────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                   Global Configuration                       │
+│   ┌─────────────────────────────────────────────────────┐    │
+│   │                  coordinator.yaml                   │    │
+│   │  • Server settings    • Discovery method            │    │
+│   │  • API configuration  • Model registry              │    │
+│   │  • Security           • Monitoring                  │    │
+│   └─────────────────────────────────────────────────────┘    │
+│                             │                                │
+│          ┌──────────────────┼───────────────────┐            │
+│          ▼                  ▼                   ▼            │
+│ ┌─────────────────┐  ┌─────────────────┐  ┌────────────────┐ |
+│ │  worker.toml    │  │  models.toml    │  │  logging.yaml  │ |
+│ │ • GPU settings  │  │ • Model configs │  │ • Log levels   │ |
+│ │ • Parallelism   │  │ • Quantization  │  │ • Outputs      │ |
+│ │ • Cache         │  │ • Paths         │  │ • Formats      │ |
+│ └─────────────────┘  └─────────────────┘  └────────────────┘ |
+│                             │                                │
+│          ┌──────────────────┴──────────────────┐             │
+│          ▼                                     ▼             │
+│ ┌─────────────────┐                    ┌─────────────────┐   │
+│ │  prometheus.yml │                    │   alerts.yml    │   │
+│ │ • Scrape config │                    │ • Alert rules   │   │
+│ │ • Targets       │                    │ • Notifications │   │
+│ └─────────────────┘                    └─────────────────┘   │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---

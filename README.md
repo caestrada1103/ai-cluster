@@ -99,18 +99,18 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                            Client Applications                        │
-│                    (REST API, Web UI, CLI, SDKs)                     │
+│                           Client Applications                       │
+│                    (REST API, Web UI, CLI, SDKs)                    │
 └────────────────────────────────┬────────────────────────────────────┘
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         Coordinator Cluster                          │
+│                        Coordinator Cluster                          │
 │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐      │
 │  │   Coordinator   │  │   Coordinator   │  │   Coordinator   │      │
 │  │     Primary     │──│    Replica 1    │──│    Replica 2    │      │
 │  └─────────────────┘  └─────────────────┘  └─────────────────┘      │
-│                           (Leader Election)                           │
+│                         (Leader Election)                           │
 └────────────────────────────────┬────────────────────────────────────┘
                                  │
                     ┌────────────┴────────────┐
@@ -122,7 +122,7 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
 │  │ Worker AMD  │ │ Worker AMD  │  │  │  │Worker NVIDIA│ │Worker NVIDIA│  │
 │  │   GPU 0-3   │ │   GPU 4-7   │  │  │  │   GPU 0-3   │ │   GPU 4-7   │  │
 │  └─────────────┘ └─────────────┘  │  │  └─────────────┘ └─────────────┘  │
-│                                    │  │                                   │
+│                                   │  │                                   │
 │  ┌─────────────┐ ┌─────────────┐  │  │  ┌─────────────┐ ┌─────────────┐  │
 │  │ Worker AMD  │ │ Worker AMD  │  │  │  │Worker NVIDIA│ │Worker NVIDIA│  │
 │  │   CPU Only  │ │  Mixture    │  │  │  │   CPU Only  │ │  Mixture    │  │
@@ -133,16 +133,16 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         Infrastructure Layer                          │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐   │
-│  │   Prometheus│ │    Grafana  │ │    Redis    │ │    MinIO    │   │
-│  │   Metrics   │ │  Dashboards │ │    Cache    │ │Model Storage│   │
-│  └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘   │
+│                       Infrastructure Layer                          │
+│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐   │
+│   │   Prometheus│ │    Grafana  │ │    Redis    │ │    MinIO    │   │
+│   │   Metrics   │ │  Dashboards │ │    Cache    │ │Model Storage│   │
+│   └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘   │
 │                                                                     │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐   │
-│  │    Jaeger   │ │    Consul   │ │    Vault    │ │   Elastic   │   │
-│  │   Tracing   │ │   Discovery │ │   Secrets   │ │    Logs     │   │
-│  └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘   │
+│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐   │
+│   │    Jaeger   │ │    Consul   │ │    Vault    │ │   Elastic   │   │
+│   │   Tracing   │ │   Discovery │ │   Secrets   │ │    Logs     │   │
+│   └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
