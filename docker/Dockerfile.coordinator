@@ -2,7 +2,7 @@
 # ========================================
 
 # Stage 1: Build stage
-FROM python:3.10-slim AS builder
+FROM python:3.14-slim AS builder
 
 # Set build arguments
 ARG DEBIAN_FRONTEND=noninteractive
@@ -37,10 +37,8 @@ RUN rm -f coordinator/proto/*_pb2*.py && \
 RUN sed -i 's/import cluster_pb2 as cluster__pb2/import coordinator.proto.cluster_pb2 as cluster__pb2/' \
     ./coordinator/proto/cluster_pb2_grpc.py
 
-
-
 # Stage 2: Runtime stage
-FROM python:3.10-slim
+FROM python:3.14-slim
 
 # Set labels
 LABEL maintainer="Carlos Estrada <caestrada1103@gmail.com>"
