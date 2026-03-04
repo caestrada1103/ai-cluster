@@ -8,6 +8,15 @@
 #             (set NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics)
 #   Intel  → works out of the box via Mesa Intel ANV driver
 #
+# ⚠ Docker Desktop on Windows (WSL2) NVIDIA limitation:
+#   The NVIDIA WSL2 driver only exposes CUDA compute (libcuda, nvml).
+#   It does NOT inject a Vulkan ICD into Linux containers, so wgpu falls
+#   back to Mesa llvmpipe (CPU-only software renderer).
+#   On a bare-metal Linux host with native NVIDIA drivers, the Vulkan ICD
+#   IS injected by the NVIDIA Container Toolkit and the real GPU is used.
+#   If running on Windows + Docker Desktop with NVIDIA, use instead:
+#     docker/Dockerfile.worker.nvidia  (burn/cuda, bypasses Vulkan entirely)
+#
 # For maximum vendor-specific performance use:
 #   docker/Dockerfile.worker.amd    (burn/rocm)
 #   docker/Dockerfile.worker.nvidia (burn/cuda)
@@ -39,16 +48,19 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /build
 
 # Copy manifest files first so the dependency layer is cached independently
-COPY worker/Cargo.toml worker/Cargo.lock* ./
+# Cargo.lock lives at the workspace root, not inside worker/
+COPY worker/Cargo.toml ./Cargo.toml
+COPY Cargo.lock ./Cargo.lock
 COPY worker/build.rs ./
 
 # Proto files are needed by build.rs for tonic code generation
 COPY proto ../proto/
 
 # Dummy source so cargo can fetch and compile dependencies without real code
+# Note: do NOT create src/lib.rs — Cargo auto-detects it as a lib target and
+# the bench may import symbols from it, causing build failures with a dummy stub.
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
-    echo "fn main() {}" > src/lib.rs && \
     mkdir -p benches && \
     echo "fn main() {}" > benches/inference.rs
 

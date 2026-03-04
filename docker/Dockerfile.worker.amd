@@ -39,16 +39,19 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /build
 
 # Copy manifest files first so the dependency layer is cached independently
-COPY worker/Cargo.toml worker/Cargo.lock* ./
+# Cargo.lock lives at the workspace root, not inside worker/
+COPY worker/Cargo.toml ./Cargo.toml
+COPY Cargo.lock ./Cargo.lock
 COPY worker/build.rs ./
 
 # Proto files are needed by build.rs for tonic code generation
 COPY proto ../proto/
 
 # Dummy source so cargo can fetch and compile dependencies without real code
+# Note: do NOT create src/lib.rs — Cargo auto-detects it as a lib target and
+# the bench may import symbols from it, causing build failures with a dummy stub.
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
-    echo "fn main() {}" > src/lib.rs && \
     mkdir -p benches && \
     echo "fn main() {}" > benches/inference.rs
 
@@ -60,7 +63,7 @@ COPY worker/src ./src/
 COPY worker/models ./models/
 COPY worker/benches ./benches/
 
-RUN touch src/main.rs src/lib.rs benches/inference.rs && \
+RUN touch src/main.rs benches/inference.rs && \
     cargo build --release --features="rocm"
 
 

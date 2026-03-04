@@ -134,7 +134,9 @@ impl ModelLoader {
         let device = if let Some(&id) = gpu_ids.first() {
             WgpuDevice::DiscreteGpu(id as usize)
         } else {
-            WgpuDevice::BestAvailable
+            // WgpuDevice::default() is the modern replacement for the deprecated BestAvailable;
+            // it selects the best adapter the wgpu backend can find (DX12/Vulkan/Metal).
+            WgpuDevice::default()
         };
 
         // Load weights

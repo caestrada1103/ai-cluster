@@ -163,8 +163,15 @@ async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Re
     #[cfg(feature = "wgpu")]
     {
         use burn::backend::wgpu::WgpuDevice;
-        // This will trigger wgpu initialization if not already done
-        let device = WgpuDevice::BestAvailable;
+        // WgpuDevice::default() picks the best available adapter automatically:
+        //   Windows  → DX12 (prefers discrete GPU, e.g. RTX 3050)
+        //   Linux    → Vulkan (requires a hardware Vulkan ICD from the driver)
+        //   macOS    → Metal
+        // NOTE: in Docker Desktop on Windows (WSL2), NVIDIA's driver only exposes CUDA—
+        // no Vulkan ICD is injected—so wgpu falls back to Mesa llvmpipe (CPU).
+        // On a native Linux host with NVIDIA Container Toolkit + graphics capability,
+        // the NVIDIA Vulkan ICD is injected and the real GPU is selected.
+        let device = WgpuDevice::default();
         info!("Selected WGPU Device: {:?}", device);
     }
     
