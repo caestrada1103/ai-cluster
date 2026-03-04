@@ -39,6 +39,9 @@ pub struct WorkerService {
     /// Active inference requests
     active_requests: Arc<Mutex<HashMap<String, Instant>>>,
 
+    /// Service start time (for uptime reporting)
+    start_time: Instant,
+
     /// Configuration
     config: WorkerConfig,
 
@@ -60,6 +63,7 @@ impl WorkerService {
             model_loader,
             loaded_models: Arc::new(RwLock::new(HashMap::new())),
             active_requests: Arc::new(Mutex::new(HashMap::new())),
+            start_time: Instant::now(),
             config,
             metrics: Metrics::new(),
         }
@@ -356,10 +360,7 @@ impl Worker for WorkerService {
         Ok(Response::new(WorkerStatus {
             worker_id: self.worker_id.clone(),
             version: self.version().to_string(),
-            uptime_seconds: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            uptime_seconds: self.start_time.elapsed().as_secs(),
             gpus: gpu_infos,
             loaded_models,
             cpu_utilization: 0.0,

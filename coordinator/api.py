@@ -260,7 +260,7 @@ async def create_chat_completion(body: ChatCompletionRequest, request: Request):
         )
         
         if body.stream:
-            request_context = coordinator.active_requests.get(result["request_id"])
+            request_context = coordinator.active_requests.pop(result["request_id"], None)
             if not request_context:
                 # Fallback to flat result if somehow lost from context
                 return _build_flat_response(result, body.model)
@@ -322,9 +322,11 @@ async def load_model(body: LoadModelRequest, request: Request):
 
     try:
         # Delegate to coordinator's internal loading mechanism
-        worker_info = coordinator.workers.get(
-            body.worker_id or next(iter(coordinator.workers))
-        )
+        first_worker_id = next(iter(coordinator.workers), None)
+        target_id = body.worker_id or first_worker_id
+        if target_id is None:
+            raise HTTPException(status_code=503, detail="No workers available")
+        worker_info = coordinator.workers.get(target_id)
         if worker_info is None:
             raise HTTPException(status_code=503, detail="No workers available")
 

@@ -16,7 +16,7 @@ api:
   enable_auth: false
   rate_limit_per_minute: 60
   cors_origins:
-    - "*"
+    - "*"  # Restrict to specific origins in production, e.g. "http://your-domain.com"
 
 # Worker discovery
 discovery:
@@ -92,14 +92,10 @@ security:
   key_file: "/etc/ai-cluster/key.pem"
   enable_auth: false
   auth_method: "api_key"  # Options: none, api_key, jwt, oauth2
-  api_keys:
-    - "sk-1234567890abcdef"
-    - "sk-0987654321fedcba"
-  jwt_secret: "your-secret-key-here"
+  api_keys: []             # Set via COORDINATOR_API_KEYS env var (comma-separated)
+  jwt_secret: ""           # Set via COORDINATOR_JWT_SECRET env var — required when enable_auth: true
   jwt_algorithm: "HS256"
-  allowed_users:
-    - "admin"
-    - "user1"
+  allowed_users: []        # Set via COORDINATOR_ALLOWED_USERS env var
 
 # Logging
 logging:
@@ -140,8 +136,8 @@ database:
   enabled: false
   type: "sqlite"  # Options: sqlite, postgres, mysql
   sqlite_path: "/data/coordinator.db"
-  postgres_dsn: "postgresql://user:pass@localhost:5432/ai-cluster"
-  mysql_dsn: "mysql://user:pass@localhost:3306/ai-cluster"
+  postgres_dsn: ""  # Set via DATABASE_URL env var
+  mysql_dsn: ""     # Set via DATABASE_URL env var
   max_connections: 10
   connection_timeout_seconds: 5
 

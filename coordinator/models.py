@@ -280,9 +280,16 @@ class ModelRegistry:
                     supported_parallel = [default_p]
 
                 model_name = final_data.get("name", name)
+                raw_family = final_data.get("family", "llama")
+                try:
+                    model_family = ModelFamily(raw_family)
+                except ValueError:
+                    logger.warning(f"Unknown model family '{raw_family}' for model {name}, defaulting to llama")
+                    model_family = ModelFamily.LLAMA
+
                 model = ModelConfig(
                     name=model_name,
-                    family=ModelFamily(final_data.get("family", "llama")),
+                    family=model_family,
                     parameters=final_data.get("parameters", "Unknown"),
                     min_memory_gb=float(final_data.get("min_memory_gb", 8.0)),
                     recommended_gpus=int(final_data.get("recommended_gpus", 1)),

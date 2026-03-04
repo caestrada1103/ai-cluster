@@ -52,6 +52,7 @@ class WorkerInfo:
     active_requests: int = 0
     total_requests: int = 0
     avg_latency_ms: float = 0
+    max_requests: int = 10  # Configurable via coordinator settings
     
     async def get_status(self) -> Optional[pb.WorkerStatus]:
         """Get current worker status."""
@@ -88,7 +89,7 @@ class WorkerInfo:
         """Whether worker can accept new requests."""
         return (
             self.state == WorkerState.HEALTHY
-            and self.active_requests < 10  # Configurable limit
+            and self.active_requests < self.max_requests
         )
 
 
@@ -251,6 +252,7 @@ class ClusterCoordinator:
                     address=address,
                     channel=channel,
                     stub=stub,
+                    max_requests=self.settings.max_concurrent_requests_per_worker,
                 )
                 worker.state = WorkerState.HEALTHY
                 worker.gpus = list(status.gpus)
@@ -288,9 +290,13 @@ class ClusterCoordinator:
                     for worker in workers_to_check:
                         if worker.state == WorkerState.OFFLINE:
                             if worker.id in self.workers:
-                                del self.workers[worker.id]
-                                await worker.channel.close()
-                                logger.info(f"Removed offline worker {worker.id}")
+                                try:
+                                    await worker.channel.close()
+                                except Exception as e:
+                                    logger.warning(f"Error closing channel for {worker.id}: {e}")
+                                finally:
+                                    self.workers.pop(worker.id, None)
+                                    logger.info(f"Removed offline worker {worker.id}")
                             
             except Exception as e:
                 logger.error(f"Error in health check loop: {e}")
@@ -312,7 +318,8 @@ class ClusterCoordinator:
                 # Check for explicit worker targeting first
                 worker = None
                 if ctx.target_worker_id:
-                    worker = self.workers.get(ctx.target_worker_id)
+                    async with self._workers_lock:
+                        worker = self.workers.get(ctx.target_worker_id)
                     if not worker or not worker.is_available:
                         ctx.error = f"Target worker '{ctx.target_worker_id}' is not available"
                         self.request_counter.labels(model=ctx.model_name, status="failed").inc()
@@ -360,7 +367,7 @@ class ClusterCoordinator:
                     else:
                         # For unknown HuggingFace models, assume 8GB requirement for now
                         # We don't know the true size until the Rust worker downloads the safetensors metadata
-                        if worker.available_memory >= 6 * 1e9:
+                        if worker.available_memory >= 8 * 1e9:
                             available_workers.append(worker)
         
         if not available_workers:
@@ -496,7 +503,7 @@ class ClusterCoordinator:
                 return False
                 
         except Exception as e:
-            logger.error(f"Error loading model on worker {worker.id}: {e}")
+            logger.exception(f"Error loading model on worker {worker.id}: {e}")
             return False
     
     async def infer(
@@ -529,6 +536,7 @@ class ClusterCoordinator:
             )
         except asyncio.TimeoutError:
             self.active_requests.pop(request_id, None)
+            self.active_requests_gauge.set(len(self.active_requests))
             raise RuntimeError("Request queue full, try again later")
         
         # Wait for completion
@@ -538,15 +546,21 @@ class ClusterCoordinator:
         while time.time() - start_time < timeout:
             if ctx.completed_at is not None:
                 if ctx.error:
+                    self.active_requests.pop(request_id, None)
                     raise RuntimeError(ctx.error)
-                
-                return {
+
+                result = {
                     "request_id": ctx.id,
                     "text": getattr(ctx, 'accumulated_text', ''),
                     "tokens_generated": ctx.tokens_generated,
                     "processing_time_ms": (ctx.completed_at - ctx.created_at) * 1000,
                     "worker_id": ctx.worker_id,
                 }
+                # For non-streaming requests clean up immediately.
+                # Streaming requests are cleaned up in api.py via .pop() on the context.
+                if not kwargs.get("stream", False):
+                    self.active_requests.pop(request_id, None)
+                return result
             
             await asyncio.sleep(0.1)
         

@@ -160,7 +160,8 @@ impl GPUManager {
     async fn detect_devices() -> Vec<GPUDevice> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            flags: wgpu::InstanceFlags::default() & !wgpu::InstanceFlags::VALIDATION & !wgpu::InstanceFlags::DEBUG,
+            flags: wgpu::InstanceFlags::default()
+                .difference(wgpu::InstanceFlags::VALIDATION | wgpu::InstanceFlags::DEBUG),
             ..Default::default()
         });
         

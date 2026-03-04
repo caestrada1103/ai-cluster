@@ -46,7 +46,12 @@ class WorkerEndpoint:
     @property
     def port(self) -> int:
         parts = self.address.split(":")
-        return int(parts[1]) if len(parts) > 1 else 50051
+        if len(parts) > 1:
+            try:
+                return int(parts[1])
+            except ValueError:
+                logger.warning(f"Invalid port in address '{self.address}', using default 50051")
+        return 50051
 
 
 class DiscoveryProvider(ABC):
@@ -137,15 +142,15 @@ class StaticDiscoveryProvider(DiscoveryProvider):
         
         # Notify about new workers
         for addr in (new_addresses - old_addresses):
-            worker = next(w for w in new_workers if w.address == addr)
-            if self.on_worker_found:
+            worker = next((w for w in new_workers if w.address == addr), None)
+            if worker and self.on_worker_found:
                 asyncio.create_task(self.on_worker_found(worker))
                 logger.info(f"Discovered static worker: {addr}")
-        
+
         # Notify about removed workers
         for addr in (old_addresses - new_addresses):
-            worker = next(w for w in self.workers if w.address == addr)
-            if self.on_worker_lost:
+            worker = next((w for w in self.workers if w.address == addr), None)
+            if worker and self.on_worker_lost:
                 asyncio.create_task(self.on_worker_lost(worker))
                 logger.info(f"Lost static worker: {addr}")
                 
@@ -340,11 +345,14 @@ class BroadcastDiscoveryProvider(DiscoveryProvider):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
-        # Bind to interface if specified
-        if self.interface:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
-                           self.interface.encode())
-        
+        # Bind to interface if specified (SO_BINDTODEVICE is Linux-only)
+        if self.interface and hasattr(socket, 'SO_BINDTODEVICE'):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                               self.interface.encode())
+            except OSError as e:
+                logger.warning(f"Could not bind to interface {self.interface}: {e}")
+
         sock.bind(('', self.port))
         sock.setblocking(False)
         
@@ -400,11 +408,14 @@ class BroadcastDiscoveryProvider(DiscoveryProvider):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         
-        # Bind to interface if specified
-        if self.interface:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
-                           self.interface.encode())
-        
+        # Bind to interface if specified (SO_BINDTODEVICE is Linux-only)
+        if self.interface and hasattr(socket, 'SO_BINDTODEVICE'):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                               self.interface.encode())
+            except OSError as e:
+                logger.warning(f"Could not bind to interface {self.interface}: {e}")
+
         message = {
             "type": "discovery_request",
             "coordinator_id": socket.gethostname(),

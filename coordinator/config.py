@@ -95,6 +95,17 @@ class Settings(BaseSettings):
         False, description="Automatically load models on startup"
     )
     
+    # CORS
+    cors_origins: list = Field(
+        default_factory=lambda: ["*"],
+        description="Allowed CORS origins. Use specific origins in production.",
+    )
+
+    # Per-worker concurrency limit
+    max_concurrent_requests_per_worker: int = Field(
+        10, description="Maximum concurrent requests per worker", ge=1
+    )
+
     # Performance
     enable_batching: bool = Field(
         True, description="Enable continuous batching"
