@@ -1,7 +1,19 @@
 # Root docker-compose.yml
 # =======================
 # Docker Compose configuration for the AI Cluster
-# Uses a single universal worker image (wgpu/Vulkan) for any GPU.
+#
+# Worker image selection — uncomment the block that matches your GPU:
+#
+#   ┌─────────────────────────────────────────────────────────────────┐
+#   │  Dockerfile               Backend   AMD  NVIDIA  Intel  Perf   │
+#   │  Dockerfile.worker        wgpu      ✓    ✓       ✓      good   │ ← default
+#   │  Dockerfile.worker.amd    burn/rocm ✓    ✗       ✗      best   │
+#   │  Dockerfile.worker.nvidia burn/cuda ✗    ✓       ✗      best   │
+#   └─────────────────────────────────────────────────────────────────┘
+#
+# The default "worker" service uses the universal wgpu image with AMD
+# device passthrough.  NVIDIA and high-perf AMD alternatives are
+# commented out below — swap the active "worker" block as needed.
 
 services:
   # Coordinator
@@ -43,8 +55,12 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # Universal GPU Worker
-  # By default, starts a single worker on GPU 0.
+  # ==========================================================================
+  # Worker — Universal wgpu/Vulkan (AMD + NVIDIA + Intel)
+  # Default: AMD device passthrough.
+  # NVIDIA users: remove "devices / security_opt / group_add" and add the
+  #   "deploy.resources.reservations.devices" block from the NVIDIA section.
+  # ==========================================================================
   worker:
     build:
       context: .
@@ -69,6 +85,7 @@ services:
     logging: *default-logging
     depends_on:
       - coordinator
+    # AMD Vulkan device passthrough — remove these three keys for NVIDIA
     devices:
       - /dev/kfd
       - /dev/dri
@@ -80,19 +97,133 @@ services:
     restart: unless-stopped
 
   # ==========================================================================
-  # Multi-GPU example: uncomment and adjust for machines with multiple GPUs.
-  # Each worker gets a unique GPU_INDEX and port pair.
+  # Worker — NVIDIA wgpu/Vulkan (same universal image, NVIDIA device access)
+  # Replace the "worker" service above with this block on NVIDIA machines.
+  # Requires NVIDIA Container Toolkit:
+  #   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
   # ==========================================================================
-  # worker-gpu-0:
+  # worker:
   #   build:
   #     context: .
   #     dockerfile: docker/Dockerfile.worker
   #   image: ai-worker:latest
   #   environment:
+  #     - GPU_INDEX=${GPU_INDEX:-0}
+  #     - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
+  #     - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
+  #     - RUST_LOG=info
+  #     - RUST_BACKTRACE=1
+  #     - HF_TOKEN=${HF_TOKEN}
+  #   volumes:
+  #     - ./config:/app/config:ro
+  #     - ./models:/app/models
+  #     - ./data:/app/data
+  #   networks:
+  #     - ai-cluster-net
+  #   ports:
+  #     - "${GRPC_PORT:-50051}:${GRPC_PORT:-50051}"
+  #     - "${METRICS_PORT:-9091}:${METRICS_PORT:-9091}"
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             device_ids: ["${GPU_INDEX:-0}"]
+  #             capabilities: [gpu]
+  #   depends_on:
+  #     - coordinator
+  #   restart: unless-stopped
+
+  # ==========================================================================
+  # Worker — AMD native ROCm (burn/rocm, maximum AMD performance)
+  # Replace the "worker" service above with this block for AMD max performance.
+  # ==========================================================================
+  # worker:
+  #   build:
+  #     context: .
+  #     dockerfile: docker/Dockerfile.worker.amd
+  #   image: ai-worker-amd:latest
+  #   environment:
+  #     - GPU_INDEX=${GPU_INDEX:-0}
+  #     - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
+  #     - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
+  #     - RUST_LOG=info
+  #     - RUST_BACKTRACE=1
+  #     - HF_TOKEN=${HF_TOKEN}
+  #   volumes:
+  #     - ./config:/app/config:ro
+  #     - ./models:/app/models
+  #     - ./data:/app/data
+  #   networks:
+  #     - ai-cluster-net
+  #   ports:
+  #     - "${GRPC_PORT:-50051}:${GRPC_PORT:-50051}"
+  #     - "${METRICS_PORT:-9091}:${METRICS_PORT:-9091}"
+  #   devices:
+  #     - /dev/kfd
+  #     - /dev/dri
+  #   security_opt:
+  #     - seccomp=unconfined
+  #   group_add:
+  #     - video
+  #     - render
+  #   depends_on:
+  #     - coordinator
+  #   restart: unless-stopped
+
+  # ==========================================================================
+  # Worker — NVIDIA native CUDA (burn/cuda, maximum NVIDIA performance)
+  # Replace the "worker" service above with this block for NVIDIA max performance.
+  # Requires NVIDIA Container Toolkit.
+  # ==========================================================================
+  # worker:
+  #   build:
+  #     context: .
+  #     dockerfile: docker/Dockerfile.worker.nvidia
+  #   image: ai-worker-nvidia:latest
+  #   environment:
+  #     - GPU_INDEX=${GPU_INDEX:-0}
+  #     - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
+  #     - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
+  #     - RUST_LOG=info
+  #     - RUST_BACKTRACE=1
+  #     - HF_TOKEN=${HF_TOKEN}
+  #   volumes:
+  #     - ./config:/app/config:ro
+  #     - ./models:/app/models
+  #     - ./data:/app/data
+  #   networks:
+  #     - ai-cluster-net
+  #   ports:
+  #     - "${GRPC_PORT:-50051}:${GRPC_PORT:-50051}"
+  #     - "${METRICS_PORT:-9091}:${METRICS_PORT:-9091}"
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             device_ids: ["${GPU_INDEX:-0}"]
+  #             capabilities: [gpu]
+  #   depends_on:
+  #     - coordinator
+  #   restart: unless-stopped
+
+  # ==========================================================================
+  # Multi-GPU example: uncomment and adjust for machines with multiple GPUs.
+  # Each worker gets a unique GPU_INDEX and port pair.
+  # Applies to any of the Dockerfile variants above — just change the
+  # dockerfile and image fields to match your chosen backend.
+  # ==========================================================================
+  # worker-gpu-0:
+  #   build:
+  #     context: .
+  #     dockerfile: docker/Dockerfile.worker   # or .amd / .nvidia
+  #   image: ai-worker:latest
+  #   environment:
   #     - GPU_INDEX=0
   #     - GRPC_BASE_PORT=50051
   #     - METRICS_BASE_PORT=9091
-  #     - RUST_LOG=trace
+  #     - RUST_LOG=info
   #   volumes:
   #     - ./config:/app/config:ro
   #     - ./models:/app/models
@@ -104,17 +235,16 @@ services:
   #   depends_on:
   #     - coordinator
 
-  # # Worker 2 (GPU 1)
   # worker-gpu-1:
   #   build:
   #     context: .
-  #     dockerfile: docker/Dockerfile.worker
+  #     dockerfile: docker/Dockerfile.worker   # or .amd / .nvidia
   #   image: ai-worker:latest
   #   environment:
   #     - GPU_INDEX=1
-  #     - GRPC_BASE_PORT=50052
-  #     - METRICS_BASE_PORT=9092
-  #     - RUST_LOG=trace
+  #     - GRPC_BASE_PORT=50051
+  #     - METRICS_BASE_PORT=9091
+  #     - RUST_LOG=info
   #   volumes:
   #     - ./config:/app/config:ro
   #     - ./models:/app/models
@@ -149,8 +279,8 @@ services:
     image: grafana/grafana:latest
     container_name: ai-grafana
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
       - GF_INSTALL_PLUGINS=grafana-piechart-panel
     volumes:
       - grafana-data:/var/lib/grafana
@@ -171,7 +301,7 @@ services:
     container_name: ai-open-webui
     environment:
       - OPENAI_API_BASE_URLS=http://coordinator:8000/v1
-      - OPENAI_API_KEY=sk-1234567890abcdef # Default from coordinator.yaml
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-placeholder}
       - ENABLE_OLLAMA_API=False
       - WEBUI_AUTH=False # Disable login screen for local network
     volumes:

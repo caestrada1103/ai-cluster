@@ -1,35 +1,35 @@
-# Multi-stage build for Rust worker — Universal GPU (wgpu / Vulkan)
+# Multi-stage build for Rust worker with native ROCm support (AMD)
 # =================================================================
-# This image auto-detects any GPU via the Vulkan API at runtime.
-# It is the recommended default for mixed or unknown hardware.
+# AMD worker image — uses the burn/rocm backend for maximum AMD GPU performance.
+# Requires ROCm-compatible AMD GPU (RX 5000 series or newer / CDNA).
 #
-#   AMD    → mount /dev/kfd + /dev/dri (see docker-compose.yml)
-#   NVIDIA → NVIDIA Container Toolkit injects the Vulkan ICD automatically
-#             (set NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics)
-#   Intel  → works out of the box via Mesa Intel ANV driver
+# Build:   docker build -f docker/Dockerfile.worker.amd -t ai-worker-amd:latest .
+# Run:     docker run --device /dev/kfd --device /dev/dri \
+#                     --group-add video --group-add render \
+#                     ai-worker-amd:latest
 #
-# For maximum vendor-specific performance use:
-#   docker/Dockerfile.worker.amd    (burn/rocm)
-#   docker/Dockerfile.worker.nvidia (burn/cuda)
+# For universal GPU support (AMD + NVIDIA + Intel) use Dockerfile.worker instead.
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM ubuntu:24.04 AS builder
+FROM rocm/dev-ubuntu-24.04:6.2.1 AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Install build dependencies, Vulkan SDK headers, and Rust
+# ROCm is pre-installed at /opt/rocm; wire it up for cargo build
+ENV ROCM_PATH=/opt/rocm
+ENV PATH="${ROCM_PATH}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${ROCM_PATH}/lib:${LD_LIBRARY_PATH:-}"
+
+# Install build dependencies and Rust
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     pkg-config \
     libssl-dev \
     curl \
-    gnupg \
     git \
     protobuf-compiler \
     ca-certificates \
-    libvulkan-dev \
-    mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/* \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.89 \
     && . "$HOME/.cargo/env"
@@ -53,7 +53,7 @@ RUN mkdir src && \
     echo "fn main() {}" > benches/inference.rs
 
 # Build dependencies (cached layer — only invalidated by Cargo.toml changes)
-RUN cargo build --release --features="wgpu"
+RUN cargo build --release --features="rocm"
 
 # Copy real source and do the final build
 COPY worker/src ./src/
@@ -61,32 +61,24 @@ COPY worker/models ./models/
 COPY worker/benches ./benches/
 
 RUN touch src/main.rs src/lib.rs benches/inference.rs && \
-    cargo build --release --features="wgpu"
+    cargo build --release --features="rocm"
 
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-# Plain Ubuntu keeps the image small and vendor-neutral.
-# AMD Vulkan is covered by the Mesa drivers below.
-# NVIDIA Vulkan is injected at runtime by the NVIDIA Container Toolkit.
-FROM ubuntu:24.04 AS runtime
+# Re-use the same ROCm base so all runtime libraries are already present.
+# The "complete" variant is not needed here — the base image includes the
+# HIP runtime and MIOpen libraries required for inference.
+FROM rocm/dev-ubuntu-24.04:6.2.1 AS runtime
 
 LABEL maintainer="Carlos Estrada <caestrada1103@gmail.com>"
-LABEL description="AI Cluster Worker (Universal GPU via wgpu/Vulkan)"
+LABEL description="AI Cluster Worker (AMD GPU via ROCm/burn)"
 LABEL version="0.1.0"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     libssl3 \
-    libvulkan1 \
-    mesa-vulkan-drivers \
-    vulkan-tools \
     && rm -rf /var/lib/apt/lists/*
-
-# NVIDIA Container Toolkit: expose GPU + inject Vulkan ICD when running on NVIDIA.
-# On AMD/Intel these variables are ignored.
-ENV NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 
 # Create non-root user (handle existing UID 1000 in Ubuntu 24.04 base)
 RUN if getent passwd 1000; then userdel -f $(getent passwd 1000 | cut -d: -f1); fi && \
@@ -94,7 +86,9 @@ RUN if getent passwd 1000; then userdel -f $(getent passwd 1000 | cut -d: -f1); 
     groupadd -r -g 1000 worker && \
     useradd -r -g worker -u 1000 -m -d /app worker
 
-ENV RUST_LOG=info \
+ENV ROCM_PATH=/opt/rocm \
+    LD_LIBRARY_PATH="/opt/rocm/lib:${LD_LIBRARY_PATH:-}" \
+    RUST_LOG=info \
     RUST_BACKTRACE=1 \
     WORKER_ID= \
     GPU_INDEX=0 \
@@ -114,7 +108,7 @@ RUN chmod +x /app/entrypoint.sh
 
 USER worker
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:${METRICS_PORT:-9091}/health || exit 1
 
 EXPOSE 50051-50058
