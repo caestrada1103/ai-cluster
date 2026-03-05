@@ -23,6 +23,11 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
+# Claude files
+.claude/settings.json
+.claude/settings.local.json
+TODO.md
+
 # Models
 /models/*
 !models/.gitkeep
