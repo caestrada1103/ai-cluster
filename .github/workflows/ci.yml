@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [master, feature]
+  pull_request:
+    branches: [master]
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install protoc
+        run: sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: cargo check (wgpu feature)
+        run: cargo check -p ai-worker --features wgpu
+
+      - name: cargo clippy
+        run: cargo clippy -p ai-worker --features wgpu -- -D warnings
+
+      - name: cargo test
+        run: cargo test -p ai-worker --features wgpu
+
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r coordinator/requirements.txt
+
+      - name: ruff check
+        run: ruff check coordinator/
+
+      - name: black --check
+        run: black --check --line-length 100 coordinator/
+
+      - name: mypy
+        run: mypy coordinator/
+
+      - name: pytest
+        run: pytest coordinator/ -v --tb=short
