@@ -1,9 +1,9 @@
 """Model registry and configuration."""
 
-from enum import Enum
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, field
 import logging
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 

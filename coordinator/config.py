@@ -2,12 +2,12 @@
 
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Union
 
+import toml
+import yaml
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-import yaml
-import toml
 
 
 class DiscoveryMethod(str, Enum):

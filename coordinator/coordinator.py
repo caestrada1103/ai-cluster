@@ -4,20 +4,18 @@ import asyncio
 import logging
 import time
 import uuid
-from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Any
 from enum import Enum
+from typing import Any, Dict, List, Optional
 
 import grpc
-from tenacity import retry, stop_after_attempt, wait_exponential
 
-from coordinator.config import Settings
-from coordinator.models import ModelRegistry, Quantization
-from coordinator.discovery import WorkerDiscovery
-from coordinator.monitoring import metrics
 import coordinator.proto.cluster_pb2 as pb
 import coordinator.proto.cluster_pb2_grpc as pb_grpc
+from coordinator.config import Settings
+from coordinator.discovery import WorkerDiscovery
+from coordinator.models import ModelRegistry, Quantization
+from coordinator.monitoring import metrics
 
 logger = logging.getLogger(__name__)
 

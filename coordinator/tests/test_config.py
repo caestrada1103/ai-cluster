@@ -1,13 +1,11 @@
 """Tests for coordinator.config — Settings defaults and validators."""
 
-import pytest
-from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from pydantic import ValidationError
 
 from coordinator.config import DiscoveryMethod, Settings
-
 
 # ---------------------------------------------------------------------------
 # Defaults
