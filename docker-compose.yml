@@ -28,7 +28,10 @@ services:
       - COORDINATOR_PORT=8000
       - COORDINATOR_DISCOVERY_METHOD=static
       - COORDINATOR_STATIC_WORKERS=["worker:50051"]
-      - RUST_LOG=info
+      - COORDINATOR_API_KEYS=${COORDINATOR_API_KEYS:-}
+      - COORDINATOR_JWT_SECRET=${COORDINATOR_JWT_SECRET:-}
+      - COORDINATOR_CORS_ORIGINS=${COORDINATOR_CORS_ORIGINS:-*}
+      - RUST_LOG=${RUST_LOG:-info}
       - CONFIG_FILE=/app/config/coordinator.yaml
     volumes:
       - ./config:/app/config:ro
@@ -68,11 +71,13 @@ services:
     image: ai-worker:latest
     environment:
       - GPU_INDEX=${GPU_INDEX:-0}
+      - GPU_VRAM_GB=${GPU_VRAM_GB:-6}
+      - WORKER_ID=${WORKER_ID:-}
       - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
       - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
-      - RUST_LOG=info
-      - RUST_BACKTRACE=1
-      - HF_TOKEN=${HF_TOKEN}
+      - RUST_LOG=${RUST_LOG:-info}
+      - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
+      - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - ./config:/app/config:ro
       - ./models:/app/models
@@ -109,11 +114,13 @@ services:
   #   image: ai-worker:latest
   #   environment:
   #     - GPU_INDEX=${GPU_INDEX:-0}
+  #     - GPU_VRAM_GB=${GPU_VRAM_GB:-6}
+  #     - WORKER_ID=${WORKER_ID:-}
   #     - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
   #     - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
-  #     - RUST_LOG=info
-  #     - RUST_BACKTRACE=1
-  #     - HF_TOKEN=${HF_TOKEN}
+  #     - RUST_LOG=${RUST_LOG:-info}
+  #     - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
+  #     - HF_TOKEN=${HF_TOKEN:-}
   #   volumes:
   #     - ./config:/app/config:ro
   #     - ./models:/app/models
@@ -145,11 +152,13 @@ services:
   #   image: ai-worker-amd:latest
   #   environment:
   #     - GPU_INDEX=${GPU_INDEX:-0}
+  #     - GPU_VRAM_GB=${GPU_VRAM_GB:-6}
+  #     - WORKER_ID=${WORKER_ID:-}
   #     - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
   #     - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
-  #     - RUST_LOG=info
-  #     - RUST_BACKTRACE=1
-  #     - HF_TOKEN=${HF_TOKEN}
+  #     - RUST_LOG=${RUST_LOG:-info}
+  #     - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
+  #     - HF_TOKEN=${HF_TOKEN:-}
   #   volumes:
   #     - ./config:/app/config:ro
   #     - ./models:/app/models
@@ -183,11 +192,13 @@ services:
   #   image: ai-worker-nvidia:latest
   #   environment:
   #     - GPU_INDEX=${GPU_INDEX:-0}
+  #     - GPU_VRAM_GB=${GPU_VRAM_GB:-6}
+  #     - WORKER_ID=${WORKER_ID:-}
   #     - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
   #     - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
-  #     - RUST_LOG=info
-  #     - RUST_BACKTRACE=1
-  #     - HF_TOKEN=${HF_TOKEN}
+  #     - RUST_LOG=${RUST_LOG:-info}
+  #     - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
+  #     - HF_TOKEN=${HF_TOKEN:-}
   #   volumes:
   #     - ./config:/app/config:ro
   #     - ./models:/app/models
