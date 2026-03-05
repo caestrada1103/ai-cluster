@@ -17,6 +17,11 @@ use futures::Stream;
 use std::pin::Pin;
 use std::path::Path;
 
+/// Per-layer KV cache entry: (keys, values) shaped [1, n_kv_heads, seq_so_far, head_dim]
+pub type KvEntry<B> = (Tensor<B, 4>, Tensor<B, 4>);
+/// Full model KV cache — one entry per transformer layer
+pub type KvCache<B> = Vec<KvEntry<B>>;
+
 // ---------------------------------------------------------------------------
 // Attention
 // ---------------------------------------------------------------------------
@@ -120,6 +125,53 @@ impl<B: Backend> LlamaAttention<B> {
 
         self.o_proj.forward(output)
     }
+
+    /// Decode-step forward: processes a single new token using the KV cache.
+    ///
+    /// Appends the new K/V to `kv` and attends over the full cached sequence.
+    /// No causal mask is needed — the single query token can attend to all
+    /// cached positions by construction.
+    pub fn forward_decode(
+        &self,
+        hidden: Tensor<B, 3>,          // [1, 1, hidden]
+        rope: &RotaryEmbedding<B>,
+        start_pos: usize,              // absolute position of the new token in the sequence
+        kv: &mut KvEntry<B>,
+    ) -> Tensor<B, 3> {
+        let q = self.q_proj.forward(hidden.clone())
+            .reshape([1, 1, self.num_heads, self.head_dim])
+            .swap_dims(1, 2);                           // [1, n_heads, 1, head_dim]
+        let new_k = self.k_proj.forward(hidden.clone())
+            .reshape([1, 1, self.num_kv_heads, self.head_dim])
+            .swap_dims(1, 2);
+        let new_v = self.v_proj.forward(hidden)
+            .reshape([1, 1, self.num_kv_heads, self.head_dim])
+            .swap_dims(1, 2);
+
+        // Apply RoPE at the correct absolute position
+        let (q, new_k) = rope.apply(q, new_k, start_pos);
+
+        // Extend cache along the sequence dimension
+        let k = Tensor::cat(vec![kv.0.clone(), new_k], 2); // [1, n_kv_heads, seq+1, head_dim]
+        let v = Tensor::cat(vec![kv.1.clone(), new_v], 2);
+        *kv = (k.clone(), v.clone());
+
+        // GQA expand then attend (single query — no causal mask needed)
+        let n_rep = self.num_heads / self.num_kv_heads;
+        let k_full = repeat_kv(k, n_rep);
+        let v_full = repeat_kv(v, n_rep);
+
+        let scale = (self.head_dim as f64).sqrt();
+        let attn = burn::tensor::activation::softmax(
+            q.matmul(k_full.swap_dims(2, 3)).div_scalar(scale),
+            3,
+        );
+        self.o_proj.forward(
+            attn.matmul(v_full)
+                .swap_dims(1, 2)
+                .reshape([1, 1, self.num_heads * self.head_dim]),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +252,25 @@ impl<B: Backend> LlamaLayer<B> {
         let x = self.post_attention_layernorm.forward(x);
         let x = self.mlp.forward(x);
         x + residual
+    }
+
+    /// Decode-step forward: processes a single token using the KV cache.
+    pub fn forward_decode(
+        &self,
+        x: Tensor<B, 3>,               // [1, 1, hidden]
+        rope: &RotaryEmbedding<B>,
+        start_pos: usize,
+        kv: &mut KvEntry<B>,
+    ) -> Tensor<B, 3> {
+        let residual = x.clone();
+        let h = self.input_layernorm.forward(x);
+        let h = self.attention.forward_decode(h, rope, start_pos, kv);
+        let h = h + residual;
+
+        let residual = h.clone();
+        let h = self.post_attention_layernorm.forward(h);
+        let h = self.mlp.forward(h);
+        h + residual
     }
 }
 
@@ -379,7 +450,169 @@ impl<B: Backend> Llama<B> {
         let attn = c.num_layers * 4 * c.hidden_size * c.hidden_size;
         let ffn = c.num_layers * 3 * c.hidden_size * c.intermediate_size;
         let norm = (c.num_layers * 2 + 1) * c.hidden_size;
-        (embed + attn + ffn + norm) * 2
+        (embed + attn + ffn) * 2 + norm * 2
+    }
+
+    /// Prefill: run the full forward pass on the prompt, return last-position logits
+    /// (as `Vec<f32>`, already on CPU) and the populated KV cache.
+    ///
+    /// The causal bias is computed once at this level and reused across all layers,
+    /// eliminating the per-layer O(seq²) allocation that existed in the old approach.
+    pub fn prefill(&self, input_ids: Tensor<B, 2>) -> (Vec<f32>, KvCache<B>) {
+        let [_, seq_len] = input_ids.dims();
+        let device = input_ids.device();
+        let config   = &*self.config;
+        let n_heads  = config.num_attention_heads;
+        let n_kv     = config.num_kv_heads;
+        let head_dim = config.head_dim;
+        let n_rep    = (n_heads / n_kv).max(1);
+
+        // Build additive causal bias once — [1, 1, seq, seq]
+        // bias[i,j] = 0.0 when j ≤ i (allowed), -1e9 when j > i (masked)
+        let causal_bias: Option<Tensor<B, 4>> = if seq_len > 1 {
+            let mut data = vec![-1e9_f32; seq_len * seq_len];
+            for i in 0..seq_len {
+                for j in 0..=i {
+                    data[i * seq_len + j] = 0.0;
+                }
+            }
+            Some(
+                Tensor::<B, 1>::from_floats(data.as_slice(), &device)
+                    .reshape([1, 1, seq_len, seq_len]),
+            )
+        } else {
+            None
+        };
+
+        let mut x = self.embed_tokens.forward(input_ids.int());
+        let mut kv_cache: KvCache<B> = Vec::with_capacity(self.layers.len());
+
+        for layer in &self.layers {
+            let h = layer.input_layernorm.forward(x.clone());
+            let [b, s, _] = h.dims();
+
+            // Project Q, K, V
+            let q = layer.attention.q_proj.forward(h.clone())
+                .reshape([b, s, n_heads, head_dim])
+                .swap_dims(1, 2);                       // [b, n_heads, s, head_dim]
+            let k = layer.attention.k_proj.forward(h.clone())
+                .reshape([b, s, n_kv, head_dim])
+                .swap_dims(1, 2);
+            let v = layer.attention.v_proj.forward(h)
+                .reshape([b, s, n_kv, head_dim])
+                .swap_dims(1, 2);
+
+            // Apply RoPE starting at position 0
+            let (q, k) = self.rope.apply(q, k, 0);
+
+            // Store compact (pre-GQA) K, V in the cache
+            kv_cache.push((k.clone(), v.clone()));
+
+            // GQA expand for multi-head attention
+            let k_full = repeat_kv(k, n_rep);
+            let v_full = repeat_kv(v, n_rep);
+
+            // Scaled dot-product attention with causal bias
+            let scale = (head_dim as f64).sqrt();
+            let scores = q.matmul(k_full.swap_dims(2, 3)).div_scalar(scale);
+            let scores = match &causal_bias {
+                Some(bias) => scores + bias.clone(),
+                None => scores,
+            };
+            let attn = burn::tensor::activation::softmax(scores, 3);
+            let ctx = attn.matmul(v_full)
+                .swap_dims(1, 2)
+                .reshape([b, s, n_heads * head_dim]);
+            let attn_out = layer.attention.o_proj.forward(ctx);
+
+            // Residual + MLP
+            let x_attn = attn_out + x.clone();
+            let h2 = layer.post_attention_layernorm.forward(x_attn.clone());
+            x = layer.mlp.forward(h2) + x_attn;
+        }
+
+        // Final norm + lm_head
+        let x = self.norm.forward(x);
+        let logits = self.lm_head.forward(x);           // [1, seq, vocab]
+        let [_, s, vocab] = logits.dims();
+        let last = logits.slice([0..1, s - 1..s, 0..vocab]).reshape([vocab]);
+        let logits_vec: Vec<f32> = last.into_data().to_vec().unwrap_or_default();
+
+        (logits_vec, kv_cache)
+    }
+
+    /// Decode-step: process a single new token using the KV cache.
+    ///
+    /// Returns the logit vector for the new position (already pulled to CPU).
+    /// Complexity is O(seq_cached) — linear in accumulated sequence length.
+    pub fn decode_step(
+        &self,
+        token_id: u32,
+        start_pos: usize,
+        kv_cache: &mut KvCache<B>,
+    ) -> Vec<f32> {
+        let device = &*self.device;
+        let vocab = self.config.vocab_size;
+
+        let input = Tensor::<B, 1>::from_floats([token_id as f32], device)
+            .reshape([1, 1]);                           // [1, 1]
+        let mut x = self.embed_tokens.forward(input.int()); // [1, 1, hidden]
+
+        for (layer, kv) in self.layers.iter().zip(kv_cache.iter_mut()) {
+            x = layer.forward_decode(x, &self.rope, start_pos, kv);
+        }
+
+        let x = self.norm.forward(x);                  // [1, 1, hidden]
+        let logits = self.lm_head.forward(x);          // [1, 1, vocab]
+        logits.reshape([vocab]).into_data().to_vec().unwrap_or_default()
+    }
+
+    /// Tokenize a prompt, correctly handling known special tokens.
+    ///
+    /// Special tokens like `</s>`, `<s>`, `<|user|>`, `<|assistant|>` are
+    /// looked up in the vocabulary as single tokens rather than being split
+    /// into sub-word pieces by the BPE tokenizer.
+    pub fn tokenize_prompt(&self, prompt: &str) -> Result<Vec<u32>, WorkerError> {
+        let special_tokens = ["</s>", "<s>", "<|user|>", "<|assistant|>"];
+        let mut tokens = Vec::new();
+        let mut current_pos = 0;
+
+        while current_pos < prompt.len() {
+            let mut best_match = None;
+            let mut min_idx = prompt.len();
+
+            for st in &special_tokens {
+                if let Some(idx) = prompt[current_pos..].find(st) {
+                    let abs_idx = current_pos + idx;
+                    if abs_idx < min_idx {
+                        min_idx = abs_idx;
+                        best_match = Some(st);
+                    }
+                }
+            }
+
+            if min_idx > current_pos {
+                let text_segment = &prompt[current_pos..min_idx];
+                let add_special = current_pos == 0;
+                let encoding = self.tokenizer.encode(text_segment, add_special)
+                    .map_err(|e| WorkerError::Internal(format!("Tokenizer error: {}", e)))?;
+                tokens.extend_from_slice(encoding.get_ids());
+            }
+
+            if let Some(st) = best_match {
+                if let Some(id) = self.tokenizer.token_to_id(st) {
+                    tokens.push(id);
+                } else {
+                    let encoding = self.tokenizer.encode(*st, false)
+                        .map_err(|e| WorkerError::Internal(format!("Tokenizer error (special): {}", e)))?;
+                    tokens.extend_from_slice(encoding.get_ids());
+                }
+                current_pos = min_idx + st.len();
+            } else {
+                break;
+            }
+        }
+        Ok(tokens)
     }
 }
 
@@ -410,6 +643,10 @@ impl<B: Backend> Model<B> for Llama<B> {
     fn memory_used(&self) -> usize {
         self.memory_usage()
     }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
 }
 impl<B: Backend> TextGeneration for Llama<B> {
     fn generate(
@@ -420,150 +657,87 @@ impl<B: Backend> TextGeneration for Llama<B> {
         top_p: f32,
         top_k: usize,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String, WorkerError>> + Send>>, WorkerError> {
-        let device = self.device.clone();
-        
-        // Encode prompt
-        // Helper to check for known special tokens and parsed prompts
-        // We manually handle these to ensure they are encoded as single tokens (if in vocab)
-        // rather than being split into constituent characters.
-        let special_tokens = ["</s>", "<s>", "<|user|>", "<|assistant|>"];
-
-        let mut tokens = Vec::new();
-        let mut current_pos = 0;
-
-        while current_pos < prompt.len() {
-            // Find the nearest special token
-            let mut best_match = None;
-            let mut min_idx = prompt.len();
-
-            for st in &special_tokens {
-                if let Some(idx) = prompt[current_pos..].find(st) {
-                    let abs_idx = current_pos + idx;
-                    if abs_idx < min_idx {
-                        min_idx = abs_idx;
-                        best_match = Some(st);
-                    }
-                }
-            }
-
-            // Encode text before the match (or the rest of the string if no match)
-            if min_idx > current_pos {
-                let text_segment = &prompt[current_pos..min_idx];
-                // Only add special tokens (BOS) for the very first segment if it's at the start
-                let add_special = current_pos == 0; 
-                let encoding = self.tokenizer.encode(text_segment, add_special)
-                    .map_err(|e| WorkerError::Internal(format!("Tokenizer error: {}", e)))?;
-                tokens.extend_from_slice(encoding.get_ids());
-            }
-
-            // Handle the matched special token
-            if let Some(st) = best_match {
-                if let Some(id) = self.tokenizer.token_to_id(st) {
-                    tokens.push(id);
-                } else {
-                    // Fallback: special token not in vocab, encode as text
-                    let encoding = self.tokenizer.encode(*st, false)
-                        .map_err(|e| WorkerError::Internal(format!("Tokenizer error (special): {}", e)))?;
-                    tokens.extend_from_slice(encoding.get_ids());
-                }
-                current_pos = min_idx + st.len();
-            } else {
-                // No more special tokens found, remainder processed above
-                break;
-            }
-        }
-
+        let tokens = self.tokenize_prompt(prompt)?;
         let prompt_len = tokens.len();
-        
-        // Clone model so stream doesn't borrow &self
+
+        // Single model clone — moved outside the loop so it is NOT repeated per token.
         let model = self.clone();
-        
-        // Stream
-        let stream = stream! {
-            let mut prev_text_len = 0usize;
-            for _ in 0..max_tokens {
-                // Create input tensor
-                let token_floats: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
-                let len = token_floats.len();
-                let input = Tensor::<B, 1>::from_floats(token_floats.as_slice(), &device).reshape([1, len]);
-                
-                // Offload heavy inference to a blocking thread to avoid starving the Tokio event loop
-                let model_clone = model.clone();
-                let input_clone = input.clone();
-                
-                let logit_data_res = tokio::task::spawn_blocking(move || {
-                    let output = model_clone.forward_pass(input_clone, 0);
-                    let [_batch, seq, vocab] = output.dims();
-                    if seq == 0 {
-                        return Err(WorkerError::Internal("Model produced empty output sequence".to_string()));
-                    }
-                    let last_logits = output.slice([0..1, seq-1..seq, 0..vocab]).reshape([vocab]);
-                    Ok(last_logits.into_data().to_vec().unwrap_or_default())
-                }).await;
 
-                let logit_data: Vec<f32> = match logit_data_res {
-                    Ok(Ok(data)) => data,
-                    Ok(Err(e)) => {
-                        yield Err(e);
-                        break;
-                    }
-                    Err(e) => {
-                        yield Err(WorkerError::Internal(format!("Inference task panicked: {}", e)));
-                        break;
-                    }
-                };
-                
-                let token_id = if temperature < 0.01 {
-                    // Greedy (argmax)
-                    logit_data.iter().enumerate()
+        // Channel to stream results from the blocking inference thread to async consumers.
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<String, WorkerError>>(max_tokens + 2);
+
+        // Run the entire prefill + decode loop in ONE blocking thread.
+        // This eliminates per-token spawn_blocking overhead and per-token Tokio context switches.
+        tokio::task::spawn_blocking(move || {
+            // ── PREFILL ──────────────────────────────────────────────────────────────
+            let input_f32: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
+            let device: &<B as burn::tensor::backend::Backend>::Device = &*model.device;
+            let input = Tensor::<B, 1>::from_floats(input_f32.as_slice(), device)
+                .reshape([1, prompt_len]);
+            let (logits_vec, mut kv_cache) = model.prefill(input);
+
+            // Inline helper: sample a token from a logit vector
+            let sample = |logits: &[f32]| -> u32 {
+                if temperature < 0.01 {
+                    logits.iter().enumerate()
                         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                        .map(|(i, _)| i).unwrap_or(0)
+                        .map(|(i, _)| i as u32)
+                        .unwrap_or(0)
                 } else {
-                    // Temperature + top-k/top-p sampling
-                    super::common::top_k_top_p_sample(&logit_data, temperature, top_p, top_k)
+                    super::common::top_k_top_p_sample(logits, temperature, top_p, top_k) as u32
+                }
+            };
+
+            // Inline helper: compute delta text from newly generated token ids
+            let delta_text = |tok_ids: &[u32], prev_len: &mut usize, tokenizer: &Tokenizer| -> Result<String, WorkerError> {
+                let text = tokenizer
+                    .decode(tok_ids, true)
+                    .map_err(|e| WorkerError::Internal(format!("Decode error: {}", e)))?;
+                let delta = if text.len() > *prev_len {
+                    let mut start = *prev_len;
+                    while start < text.len() && !text.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    if start < text.len() { text[start..].to_string() } else { String::new() }
+                } else {
+                    String::new()
                 };
-                let token_id_u32 = token_id as u32;
-                
-                tokens.push(token_id_u32);
-                
-                // Decode full generated sequence and emit delta (preserves spaces)
-                let generated_ids = &tokens[prompt_len..];
-                let full_text = model.tokenizer.decode(generated_ids, true)
-                    .map_err(|e| WorkerError::Internal(format!("Decode error: {}", e)));
-                    
-                match full_text {
-                    Ok(t) => {
-                        let delta = if t.len() > prev_text_len {
-                            // Find the nearest valid character boundary at or after prev_text_len
-                            let mut start = prev_text_len;
-                            while start < t.len() && !t.is_char_boundary(start) {
-                                start += 1;
-                            }
-                            
-                            if start < t.len() {
-                                t[start..].to_string()
-                            } else {
-                                String::new()
-                            }
-                        } else {
-                            String::new()
-                        };
-                        
-                        prev_text_len = t.len();
-                        yield Ok(delta);
-                    },
-                    Err(e) => { yield Err(e); break; }
-                }
+                *prev_len = text.len();
+                Ok(delta)
+            };
 
-                // Stop if EOS using tokenizer vocab
-                if let Some(eos_id) = model.tokenizer.get_vocab(true).get("</s>") {
-                     if token_id_u32 == *eos_id {
-                         break;
-                     }
-                }
+            // Look up EOS id once
+            let eos_id: Option<u32> = model.tokenizer.get_vocab(true).get("</s>").copied();
 
-                // Yield to allow other tasks (like gRPC pings) to run
-                tokio::task::yield_now().await;
+            // ── FIRST GENERATED TOKEN (from prefill logits) ───────────────────────
+            let first_tok = sample(&logits_vec);
+            let mut all_tokens = tokens;
+            all_tokens.push(first_tok);
+            let mut prev_text_len = 0usize;
+            let _ = tx.blocking_send(delta_text(
+                &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
+            ));
+            if eos_id == Some(first_tok) { return; }
+
+            // ── DECODE LOOP (one GPU dispatch per step, no Tokio context switch) ──
+            for _step in 1..max_tokens {
+                let cur_tok  = *all_tokens.last().unwrap();
+                let start    = all_tokens.len() - 1; // absolute position of cur_tok
+                let logits   = model.decode_step(cur_tok, start, &mut kv_cache);
+                let next_tok = sample(&logits);
+                all_tokens.push(next_tok);
+                let _ = tx.blocking_send(delta_text(
+                    &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
+                ));
+                if eos_id == Some(next_tok) { break; }
+            }
+        });
+
+        // Bridge the mpsc receiver into the async stream expected by the gRPC layer.
+        let stream = stream! {
+            while let Some(item) = rx.recv().await {
+                yield item;
             }
         };
 

@@ -49,6 +49,15 @@ pub trait Model<B: Backend>: Send + 'static {
 
     /// Get memory usage in bytes
     fn memory_used(&self) -> usize;
+
+    /// Return a type-erased reference to enable downcasting to concrete types.
+    ///
+    /// Override to return `Some(self)` in architectures that support tensor
+    /// parallelism. The default `None` causes `ParallelModel` to fall back to
+    /// the standard single-GPU forward pass with a warning.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 /// Configuration common to all models
