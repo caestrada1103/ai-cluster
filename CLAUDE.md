@@ -90,7 +90,7 @@ Client (REST) → Coordinator (FastAPI) → Workers (Rust/Burn) → GPU
 - `config.rs` — Worker config struct, reads `worker.toml`
 - `error.rs` — Shared error types (`thiserror`)
 - `metrics.rs` — Prometheus metrics definitions
-- `parallelism.rs` — Pipeline/tensor/expert parallelism; `AllReduce<B>` trait; TP/PP/EP fully implemented
+- `parallelism.rs` — Tensor/pipeline/expert parallelism core functions; `AllReduce<B>` trait; standalone TP/PP functions compile and are correct but not yet wired to the gRPC service layer
 
 **Configuration files** (`config/`):
 - `coordinator.yaml` — Server, discovery, routing, security, health checks
@@ -133,20 +133,43 @@ Client (REST) → Coordinator (FastAPI) → Workers (Rust/Burn) → GPU
 
 ## Worker Model Architecture
 
+**`worker/models/common.rs`** shared utilities:
+- `build_causal_bias<B>()` — builds `[1,1,seq,seq]` additive causal mask once; call at model level and pass to layers to avoid O(seq²) per-layer allocation
+- `RotaryEmbedding::apply()` — asserts `start_pos + seq_len <= max_seq_len` before slicing (panic guard)
+- `top_k_top_p_sample()` — guards empty probs after truncation; uses single-pass running sum for re-normalisation
+
+**`worker/models/mod.rs`** shared model types:
+- `TextStream` — `Pin<Box<dyn Stream<Item = Result<String, WorkerError>> + Send>>` type alias; the uniform return type for all generation
+- `TextGeneration` trait — type-erased generation interface (`fn generate(...)`) stored as `dyn TextGeneration` in `ModelInstance`
+- `ModelInstance` — metadata wrapper (memory, GPU IDs, quantization, inference count); holds the concrete model behind `Arc<Mutex<dyn TextGeneration>>`
+
 **`worker/models/llama.rs`** key types and methods:
 - `KvEntry<B>` / `KvCache<B>` — per-layer KV cache types (pub, shared with `parallelism.rs`)
+- `LlamaAttention::forward()` — accepts `causal_bias: Option<&Tensor<B,4>>` (pre-built, not rebuilt per layer)
 - `Llama::prefill()` — full-sequence forward, returns `(Vec<f32>, KvCache<B>)`; one GPU→CPU transfer total
 - `Llama::decode_step()` — single-token decode using KV cache, O(seq_cached) per step
-- `Llama::tokenize_prompt()` — special-token-aware tokenization (`</s>`, `<s>`, `<|user|>`, `<|assistant|>`)
+- `Llama::tokenize_prompt()` — special-token-aware tokenization; EOS looked up via O(1) `token_to_id()`
 - `TextGeneration::generate()` — single `spawn_blocking` + mpsc channel; model cloned once outside loop
+
+**`worker/models/mistral.rs`** — sliding window causal mask implemented in `MistralAttention::forward()`; query `i` attends to keys in `[max(0, i-window+1), i]` only
+
+**`worker/models/deepseek.rs`** — `DeepSeekMoE::forward()` uses sparse top-k routing: selects `num_experts_per_tok` experts per token via CPU sort, skips experts unused by the whole batch, broadcasts per-token weight mask on GPU
+
+**`worker/src/gpu_manager.rs`** — `get_available_memory()` is O(1) via `AtomicU64 used_bytes` per device (updated on alloc/free); `nvidia-smi`/`rocm-smi` wrapped with 3-second thread timeout
+
+**`worker/src/model_loader.rs`** — safetensors deserialization and dtype conversion run in `spawn_blocking`; async read and tensor creation stay on the runtime
+
+**`worker/src/worker.rs`** — `active_requests` is `Arc<DashMap<String, Instant>>` (lock-free); `loaded_models` is `Arc<RwLock<HashMap<String, ModelInstance>>>`
 
 **`worker/src/parallelism.rs`** key types and functions:
 - `TpKvCache<B>` — `Vec<Vec<KvEntry<B>>>` per-layer-per-shard KV for TP generation
-- `AllReduce<B>` trait + `LocalAllReduce` — pluggable all-reduce (future NCCL impl drops in)
+- `AllReduce<B>` trait + `LocalAllReduce` — pluggable all-reduce; panics early with clear message on empty partials
 - `tensor_parallel_llama_prefill()` — full-sequence TP forward capturing per-shard KV
 - `tensor_parallel_llama_decode_step()` — single-token TP decode with KV cache extension
-- `pipeline_parallel_llama_forward()` — layer-chunk partitioning across stages
-- `ParallelStrategy::ExpertParallel` — stub variant; returns error (requires MoE architecture)
+- `pipeline_parallel_llama_forward()` — layer-chunk partitioning across stages; uses shared `build_causal_bias`
+- `ParallelStrategy` enum — `Single | DataParallel | TensorParallel | PipelineParallel | ExpertParallel`; ExpertParallel is a stub
+- `clamp_shards()` — logs `tracing::warn` when shard count is silently reduced
+- Note: `ParallelModel` routing wrapper was removed (it depended on the deleted `Model<B>` trait); TP/PP functions are standalone and ready to wire into a future `TextGeneration` impl
 
 ## Git Conventions
 

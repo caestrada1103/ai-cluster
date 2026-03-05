@@ -8,22 +8,19 @@ This module provides multiple discovery methods:
 """
 
 import asyncio
-import ipaddress
 import json
 import logging
 import socket
-import struct
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, Callable, Awaitable
-from enum import Enum
 from pathlib import Path
-import time
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
-import yaml
 import aiohttp
+import yaml
 
-from coordinator.config import Settings, DiscoveryMethod
+from coordinator.config import DiscoveryMethod, Settings
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +189,7 @@ class MDNSDiscoveryProvider(DiscoveryProvider):
         
         # Try to import zeroconf
         try:
-            from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
+            from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
             self.zeroconf = Zeroconf
             self.service_browser = ServiceBrowser
             self.service_listener = ServiceListener

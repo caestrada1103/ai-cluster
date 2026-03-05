@@ -116,18 +116,6 @@ impl WorkerConfig {
         Ok(config)
     }
 
-    /// Save configuration to a TOML file.
-    pub fn save_to_file(&self, path: &str) -> Result<(), WorkerError> {
-        let contents = toml::to_string_pretty(self).map_err(|e| {
-            WorkerError::Configuration(format!("Failed to serialize config: {}", e))
-        })?;
-
-        std::fs::write(path, contents).map_err(|e| {
-            WorkerError::Configuration(format!("Failed to write config file: {}", e))
-        })?;
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]

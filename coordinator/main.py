@@ -9,9 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import make_asgi_app
 
 from coordinator.api import router as api_router
-from coordinator.coordinator import ClusterCoordinator
 from coordinator.config import Settings
-from coordinator.monitoring import metrics
+from coordinator.coordinator import ClusterCoordinator
 
 # Configure logging
 logging.basicConfig(

@@ -7,7 +7,8 @@ use std::time::Instant;
 
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
-use tokio::sync::{Mutex, RwLock};
+use dashmap::DashMap;
+use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn, error, debug, instrument};
@@ -36,8 +37,8 @@ pub struct WorkerService {
     /// Loaded models (model_name -> ModelInstance)
     loaded_models: Arc<RwLock<HashMap<String, ModelInstance>>>,
 
-    /// Active inference requests
-    active_requests: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Active inference requests (lock-free concurrent map)
+    active_requests: Arc<DashMap<String, Instant>>,
 
     /// Service start time (for uptime reporting)
     start_time: Instant,
@@ -62,7 +63,7 @@ impl WorkerService {
             gpu_manager,
             model_loader,
             loaded_models: Arc::new(RwLock::new(HashMap::new())),
-            active_requests: Arc::new(Mutex::new(HashMap::new())),
+            active_requests: Arc::new(DashMap::new()),
             start_time: Instant::now(),
             config,
             metrics: Metrics::new(),
@@ -74,34 +75,7 @@ impl WorkerService {
         env!("CARGO_PKG_VERSION")
     }
 
-    /// Get number of active requests
-    pub async fn active_request_count(&self) -> usize {
-        self.active_requests.lock().await.len()
-    }
 
-    /// Get loaded model names
-    pub async fn loaded_models(&self) -> Vec<String> {
-        let models = self.loaded_models.read().await;
-        models.keys().cloned().collect()
-    }
-
-    /// Check if worker is healthy
-    pub async fn is_healthy(&self) -> bool {
-        self.gpu_manager.is_healthy().await
-    }
-
-    /// Update metrics from loaded models
-    pub async fn update_metrics(&self) {
-        let models = self.loaded_models.read().await;
-        self.metrics.set_loaded_models(models.len() as i64);
-
-        for (name, model) in models.iter() {
-            self.metrics.set_model_memory(
-                name,
-                model.memory_used() as i64,
-            );
-        }
-    }
 }
 
 #[tonic::async_trait]
@@ -197,10 +171,8 @@ impl Worker for WorkerService {
             request_id, req.model_name, req.prompt.len()
         );
 
-        debug!("Inference request {}: waiting for active_requests lock", request_id);
         // Track active request
-        self.active_requests.lock().await.insert(request_id.clone(), Instant::now());
-        debug!("Inference request {}: acquired active_requests lock and inserted", request_id);
+        self.active_requests.insert(request_id.clone(), Instant::now());
 
         // Get model
         debug!("Inference request {}: waiting for loaded_models read lock", request_id);
@@ -214,7 +186,7 @@ impl Worker for WorkerService {
             Some(m) => m,
             None => {
                 debug!("Inference request {}: removing from active_requests mapping", request_id);
-                self.active_requests.lock().await.remove(&request_id);
+                self.active_requests.remove(&request_id);
                 return Err(Status::not_found(format!("Model {} not loaded", req.model_name)));
             }
         };
@@ -317,7 +289,7 @@ impl Worker for WorkerService {
             }
 
             // Clean up
-            active_requests.lock().await.remove(&req_id);
+            active_requests.remove(&req_id);
         };
 
         Ok(Response::new(Box::pin(stream)))
@@ -351,8 +323,7 @@ impl Worker for WorkerService {
         };
 
         // Get system info
-        debug!("Status: waiting for active_requests lock");
-        let active_requests = self.active_requests.lock().await.len();
+        let active_requests = self.active_requests.len();
         debug!("Status: waiting for system memory info");
         let (memory_available, memory_total) = self.gpu_manager.system_memory().await;
         debug!("Status: all info collected");
@@ -364,8 +335,8 @@ impl Worker for WorkerService {
             gpus: gpu_infos,
             loaded_models,
             cpu_utilization: 0.0,
-            memory_available: memory_available as u64,
-            memory_total: memory_total as u64,
+            memory_available,
+            memory_total,
             active_requests: active_requests as u32,
             queued_requests: 0,
         }))

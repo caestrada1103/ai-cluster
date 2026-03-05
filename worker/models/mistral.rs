@@ -3,14 +3,15 @@
 //! Mistral uses Sliding Window Attention (SWA) as its key differentiator
 //! from the standard Llama architecture.
 
+#![allow(dead_code)]
+
 use burn::{
     module::{Module, Ignored},
     nn::{Linear, LinearConfig, Embedding, EmbeddingConfig},
     tensor::{backend::Backend, Tensor},
 };
-use super::{Model, ModelConfig, ModelOutput, ModelInput, TokenStream};
+use super::ModelConfig;
 use super::common::{RMSNorm, RotaryEmbedding, swiglu};
-use crate::error::WorkerError;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -147,8 +148,26 @@ impl<B: Backend> MistralAttention<B> {
         let scale = (self.head_dim as f64).sqrt();
         let attn_weights = q.matmul(k.swap_dims(2, 3)).div_scalar(scale);
 
-        // Apply sliding window mask
-        // (In production, this would mask positions > sliding_window distance)
+        // Sliding-window causal mask: query i can only attend to keys in
+        // [max(0, i - sliding_window + 1), i]. Positions outside this window
+        // or in the future receive an additive -1e9 bias (effectively -∞ pre-softmax).
+        let attn_weights = if seq_len > 1 {
+            let device = attn_weights.device();
+            let window = self.sliding_window.max(1);
+            let mut mask_data = vec![-1e9_f32; seq_len * seq_len];
+            for i in 0..seq_len {
+                let start = i.saturating_sub(window - 1);
+                for j in start..=i {
+                    mask_data[i * seq_len + j] = 0.0;
+                }
+            }
+            let bias = Tensor::<B, 1>::from_floats(mask_data.as_slice(), &device)
+                .reshape([1, 1, seq_len, seq_len]);
+            attn_weights + bias
+        } else {
+            attn_weights
+        };
+
         let attn_weights = burn::tensor::activation::softmax(attn_weights, 3);
 
         let attn_output = attn_weights
@@ -321,31 +340,3 @@ impl<B: Backend> Mistral<B> {
     }
 }
 
-impl<B: Backend> Model<B> for Mistral<B> {
-    fn name(&self) -> &str {
-        "mistral"
-    }
-
-    fn config(&self) -> ModelConfig {
-        self.config.to_model_config()
-    }
-
-    fn forward(&self, input: ModelInput<B>) -> Result<ModelOutput<B>, WorkerError> {
-        Ok(self.forward_pass(input, 0))
-    }
-
-    fn generate(
-        &self,
-        _prompt: &str,
-        max_tokens: usize,
-        _temperature: f32,
-        _top_p: f32,
-        _top_k: usize,
-    ) -> Result<TokenStream, WorkerError> {
-        Ok(TokenStream::new(max_tokens))
-    }
-
-    fn memory_used(&self) -> usize {
-        self.memory_usage()
-    }
-}

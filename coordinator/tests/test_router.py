@@ -5,7 +5,6 @@ RequestRouter is not tested here because it depends on coordinator.monitoring.me
 runtime). The pure dataclasses and state machines are fully testable in isolation.
 """
 
-import time
 
 import pytest
 
@@ -15,7 +14,6 @@ from coordinator.router import (
     QueuePriority,
     WorkerLoad,
 )
-
 
 # ---------------------------------------------------------------------------
 # Enum sanity checks

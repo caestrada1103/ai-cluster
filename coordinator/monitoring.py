@@ -7,7 +7,7 @@ metrics API used across coordinator modules.
 import logging
 from typing import List, Optional
 
-from prometheus_client import Counter, Histogram, Gauge, CollectorRegistry, REGISTRY
+from prometheus_client import REGISTRY, CollectorRegistry, Counter, Gauge, Histogram
 
 logger = logging.getLogger(__name__)
 

@@ -7,14 +7,14 @@ Endpoints:
     POST /models/load  - Load a model onto a worker
     GET  /workers      - List connected workers
 """
+import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-import json
-import time
 
 logger = logging.getLogger(__name__)
 

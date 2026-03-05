@@ -9,17 +9,17 @@ This module handles:
 """
 
 import asyncio
+import hashlib
 import logging
-import time
 import random
-from collections import defaultdict, deque
+import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple, Any, Callable
-import hashlib
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from coordinator.coordinator import WorkerInfo
-from coordinator.models import ModelConfig, ModelRegistry
+from coordinator.models import ModelRegistry
 from coordinator.monitoring import metrics
 
 logger = logging.getLogger(__name__)
