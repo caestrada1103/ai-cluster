@@ -148,35 +148,35 @@ Workers perform the actual inference, written in Rust using the Burn framework.
 #### Internal Architecture:
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                        Worker                           │
-├─────────────────────────────────────────────────────────┤
-│   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐     │
-│   │   gRPC      │  │   Metrics   │  │   Health    │     │
-│   │   Server    │  │   Server    │  │   Checks    │     │
-│   └─────────────┘  └─────────────┘  └─────────────┘     │
-│           │               │               │             │
-│    ┌──────▼───────────────▼───────────────▼──────┐      │
-│    │              WorkerService Core             │      │
-│    │  • LoadModel     • Infer     • GetStatus    │      │
-│    │  • UnloadModel   • HealthCheck              │      │
-│    └─────────────────────────────────────────────┘      │
-│          │                │                │            │
-│   ┌──────▼───────┐ ┌──────▼───────┐ ┌──────▼───────┐    │
-│   │ GPU Manager  │ │ Model Loader │ │ Parallelism  │    │
-│   │ • Detection  │ │ • Download   │ │ • Pipeline   │    │
-│   │ • Memory     │ │ • Convert    │ │ • Tensor     │    │
-│   │ • Streams    │ │ • Cache      │ │ • Data       │    │
-│   │ • P2P        │ │ • Quantize   │ │ • Expert     │    │
-│   └──────────────┘ └──────────────┘ └──────────────┘    │
-│           │               │               │             │
-│    ┌──────▼───────────────▼───────────────▼──────┐      │
-│    │              Model Implementations          │      │
-│    │  • DeepSeek (MoE)    • Llama (GQA)          │      │
-│    │  • Mistral           • Mixtral              │      │
-│    │  • Gemma             • Phi                  │      │
-│    └─────────────────────────────────────────────┘      │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                        Worker                            │
+├──────────────────────────────────────────────────────────┤
+│   ┌─────────────┐  ┌─────────────┐  ┌──────────────┐     │
+│   │   gRPC      │  │   Metrics   │  │   Health     │     │
+│   │   Server    │  │   Server    │  │   Checks     │     │
+│   └─────────────┘  └─────────────┘  └──────────────┘     │
+│           │               │               │              │
+│    ┌──────▼───────────────▼───────────────▼──────┐       │
+│    │              WorkerService Core             │       │
+│    │  • LoadModel     • Infer     • GetStatus    │       │
+│    │  • UnloadModel   • HealthCheck              │       │
+│    └─────────────────────────────────────────────┘       │
+│          │                │                │             │
+│   ┌──────▼───────┐ ┌──────▼───────┐ ┌──────▼────────┐    │
+│   │ GPU Manager  │ │ Model Loader │ │ Parallelism   │    │
+│   │ • Detection  │ │ • Download   │ │ • Pipeline    │    │
+│   │ • Memory     │ │ • Convert    │ │ • Tensor      │    │
+│   │ • wgpu/CUDA  │ │ • Cache      │ │ • Data        │    │
+│   │ • ROCm/Metal │ │ • Quantize   │ │ • Expert(stub)│    │
+│   └──────────────┘ └──────────────┘ └───────────────┘    │
+│           │               │               │              │
+│    ┌──────▼───────────────▼───────────────▼──────┐       │
+│    │              Model Implementations          │       │
+│    │  • DeepSeek (MoE)    • Llama (GQA)          │       │
+│    │  • Mistral           • Mixtral              │       │
+│    │  • Gemma             • Phi                  │       │
+│    └─────────────────────────────────────────────┘       │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ### 3. Model Layer
@@ -185,14 +185,13 @@ The model layer provides implementations for various architectures.
 
 #### Supported Models:
 
-| Model Family | Architecture | Parallelism Support | Quantization |
-|--------------|--------------|-------------------|--------------|
-| DeepSeek | MoE (Mixture of Experts) | Pipeline, Expert | FP16, INT8, INT4 |
-| Llama 3 | GQA (Grouped Query Attention) | Pipeline, Tensor | FP16, INT8, INT4 |
+> **Implementation status**: Only the three architectures below have Rust implementations in `worker/models/`. The remaining model families listed in the README (Mixtral, Gemma, Phi, Qwen) are planned future additions.
+
+| Model Family | Architecture | Parallelism (core algorithms) | Quantization |
+|--------------|--------------|-------------------------------|--------------|
+| DeepSeek | MoE (Mixture of Experts) with sparse top-k routing | Pipeline, Expert (stub) | FP16, INT8, INT4 |
+| Llama 3 | GQA (Grouped Query Attention) + KV cache | Pipeline, Tensor | FP16, INT8, INT4 |
 | Mistral | Sliding Window Attention | Pipeline | FP16, INT8 |
-| Mixtral | MoE + GQA | Pipeline, Tensor, Expert | INT8, INT4 |
-| Gemma | MQA (Multi Query Attention) | Pipeline | FP16, INT8 |
-| Phi | Standard Transformer | Single | FP16 |
 
 ---
 
@@ -365,9 +364,9 @@ pub struct ModelConfig {
 
 ## Parallelism Strategies
 
-> **Note on Implementation Status**: The AI Cluster natively supports **Data Parallelism** (running independent models on multiple workers, either on the same machine or across the network). The implementations for **Pipeline, Tensor, and Expert Parallelism** within a single worker are active roadmap items utilizing the `burn` framework's multi-device capabilities.
+> **Note on Implementation Status**: The AI Cluster natively supports **Data Parallelism** (running independent models on multiple workers, either on the same machine or across the network). **Tensor and Pipeline Parallelism** core algorithms are implemented in `worker/src/parallelism.rs` but are not yet wired to the gRPC inference service — models currently run on a single GPU per worker. **Expert Parallelism** is a stub (returns an error). Wiring TP/PP into the service layer is the next development step.
 
-### 1. Pipeline Parallelism (Planned)
+### 1. Pipeline Parallelism (Core Implemented — Service Wiring Pending)
 
 Splits model layers across multiple GPUs.
 
@@ -397,7 +396,7 @@ Micro-batching for efficiency:
 └───────────────────────────────────────────────────────┘
 ```
 
-### 2. Tensor Parallelism (Planned)
+### 2. Tensor Parallelism (Core Implemented — Service Wiring Pending)
 
 Splits individual tensors across multiple GPUs.
 
@@ -451,7 +450,7 @@ Replicates model across GPUs, splits batch.
 └──────────────────────────────────────────────────────┘
 ```
 
-### 4. Expert Parallelism (MoE) (Planned)
+### 4. Expert Parallelism (MoE) (Stub — Returns Error)
 
 Distributes experts across GPUs for Mixture of Experts models.
 

@@ -77,17 +77,28 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
 
 ### Roadmap & Planned Optimizations
 
-The following features are under active development to improve performance, particularly for limited hardware environments or constrained networks:
+**Status legend:**
 
-| Feature | Description |
-|---------|-------------|
-| **Advanced Parallelism** | Tensor and Pipeline parallelism within a single worker (currently supports Data Parallelism via multi-worker scaling) |
-| **Continuous Batching** | High-throughput inference with dynamic batching |
-| **Paged KV Cache** | Memory-efficient attention cache for long contexts |
-| **Speculative Decoding** | 2-3x speedup for generation |
-| **Flash Attention** | Fast and memory-efficient exact attention |
-| **Distributed Tracing** | Jaeger integration for debugging and tracing requests |
-| **Extended Infrastructure** | Redis (caching), MinIO (model storage), Vault (secrets), Elastic (logs) |
+| Badge | Meaning |
+|-------|---------|
+| ✅ Done (Completed) | Fully implemented and wired end-to-end |
+| 🔶 Done (Partially) | Core logic implemented; integration or secondary features missing |
+| 🔄 In-Progress | Actively being developed on the current branch |
+| 🔲 To-Do | Not yet started |
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **KV Cache** | ✅ Done (Completed) | Per-layer `KvEntry<B>` / `KvCache<B>`; prefill + autoregressive decode fully wired in Llama; TP-sharded `TpKvCache<B>` also implemented |
+| **Tensor Parallelism** | 🔶 Done (Partially) | `tensor_parallel_llama_prefill` and `tensor_parallel_llama_decode_step` implemented with Megatron-LM style column/row split and `AllReduce` abstraction; not yet wired to the gRPC service layer |
+| **Pipeline Parallelism** | 🔶 Done (Partially) | `pipeline_parallel_llama_forward` implements layer-chunk partitioning; not yet wired to the gRPC service layer |
+| **Expert Parallelism (MoE)** | 🔄 In-Progress | `DeepSeekMoE` sparse top-k routing implemented in `worker/models/deepseek.rs`; distributed expert routing across GPUs is a stub returning an error |
+| **Data Parallelism** | ✅ Done (Completed) | Fully operational — deploy multiple independent workers (one per GPU) behind the coordinator's load balancer |
+| **Continuous Batching** | 🔲 To-Do | High-throughput inference with dynamic batching |
+| **Paged KV Cache** | 🔲 To-Do | vLLM-style memory-efficient paged attention; basic KV cache is done, the paged variant is not |
+| **Speculative Decoding** | 🔲 To-Do | 2-3x generation speedup with draft model |
+| **Flash Attention** | 🔲 To-Do | Fast and memory-efficient exact attention |
+| **Distributed Tracing** | 🔲 To-Do | Jaeger integration for end-to-end request tracing |
+| **Extended Infrastructure** | 🔲 To-Do | Redis (caching), MinIO (model storage), Vault (secrets), Elastic (logs) |
 
 ---
 
@@ -214,7 +225,7 @@ pip install -r coordinator/requirements.txt
 # 4. Build and run the Rust Worker locally
 # In a new terminal:
 cd worker
-# For AMD: cargo run --release --features hip
+# For AMD: cargo run --release --features rocm
 # For NVIDIA: cargo run --release --features cuda
 cargo run --release --features cuda
 
@@ -259,15 +270,15 @@ curl -X POST http://localhost:8000/v1/completions \
 
 AI Cluster supports a wide range of popular models:
 
-| Model Family | Sizes | Parallelism Support | Quantization |
-|--------------|-------|---------------------|--------------|
-| **DeepSeek** | 7B, 67B | Single Worker / Data Parallel | FP16, INT8, INT4 |
-| **Llama 3** | 8B, 70B | Single Worker / Data Parallel | FP16, INT8, INT4 |
-| **Mistral** | 7B | Single Worker / Data Parallel | FP16, INT8 |
-| **Mixtral** | 8x7B | Single Worker / Data Parallel | INT8, INT4 |
-| **Gemma** | 2B, 7B | Single Worker / Data Parallel | FP16, INT8 |
-| **Phi** | 2, 3-mini | Single Worker / Data Parallel | FP16 |
-| **Qwen** | 7B, 14B | Single Worker / Data Parallel | FP16, INT8 |
+| Model Family | Sizes | Status | Quantization |
+|--------------|-------|--------|--------------|
+| **DeepSeek** | 7B, 67B | ✅ Implemented | FP16, INT8, INT4 |
+| **Llama 3** | 8B, 70B | ✅ Implemented | FP16, INT8, INT4 |
+| **Mistral** | 7B | ✅ Implemented | FP16, INT8 |
+| **Mixtral** | 8x7B | 🔲 Planned | INT8, INT4 |
+| **Gemma** | 2B, 7B | 🔲 Planned | FP16, INT8 |
+| **Phi** | 2, 3-mini | 🔲 Planned | FP16 |
+| **Qwen** | 7B, 14B | 🔲 Planned | FP16, INT8 |
 
 ### Adding Custom Models
 
@@ -430,7 +441,7 @@ curl -X POST http://localhost:8000/v1/models/load \
 
 ### 2. **Running Large Models (Future Optimization)**
 
-> **Note**: Tensor and Pipeline parallelism within a single worker are active roadmap items utilizing the `burn` framework's multi-device capabilities. Currently, models must fit within the memory of a single GPU, or you can leverage Data Parallelism by deploying multiple identical model workers on the same machine.
+> **Note**: Tensor and Pipeline parallelism core algorithms are implemented in `worker/src/parallelism.rs` (functions `tensor_parallel_llama_prefill`, `tensor_parallel_llama_decode_step`, `pipeline_parallel_llama_forward`), but are not yet wired into the gRPC inference service. Currently, models must fit within the memory of a single GPU, or you can leverage Data Parallelism by deploying multiple identical model workers on the same machine.
 
 When fully implemented, you will be able to configure model splitting like this:
 1.  **Configure**: Ensure `config/models.toml` allows sufficient GPUs (Planned feature).
@@ -473,7 +484,7 @@ pip install -r coordinator/requirements.txt
 
 # Build Rust worker
 cd worker
-cargo build --release --features=hip  # For AMD
+cargo build --release --features=rocm  # For AMD
 # or
 cargo build --release --features=cuda  # For NVIDIA
 
