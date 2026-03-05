@@ -744,9 +744,6 @@ limitations under the License.
 ### Support
 
 - 📚 [Documentation](docs/)
-- 💬 [Discord](https://discord.gg/ai-cluster)
-- 🐦 [Twitter](https://twitter.com/ai_cluster)
-- 📧 [Email](mailto:support@ai-cluster.com)
 
 ---
 
