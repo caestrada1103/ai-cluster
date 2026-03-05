@@ -26,10 +26,6 @@ pub enum WorkerError {
     #[error("Internal error: {0}")]
     Internal(String),
 
-    /// config error
-    #[error("Config error: {0}")]
-    Config(String),
-
     /// Tokio runtime creation or usage error.
     #[error("Runtime error: {0}")]
     Runtime(String),

@@ -11,6 +11,7 @@ use burn::{
 use super::{Model, ModelConfig, ModelOutput, ModelInput, TokenStream, TextGeneration};
 use super::common::{RMSNorm, RotaryEmbedding, swiglu, repeat_kv};
 use crate::error::WorkerError;
+use tracing;
 use tokenizers::Tokenizer;
 use async_stream::stream;
 use futures::Stream;
@@ -64,12 +65,17 @@ impl<B: Backend> LlamaAttention<B> {
         }
     }
 
-    /// Forward pass
+    /// Forward pass.
+    ///
+    /// `causal_bias` is an additive `[1, 1, seq, seq]` mask built once at the
+    /// `Llama` level and reused across all layers — avoids an O(seq²) allocation
+    /// per layer. Pass `None` for single-token inputs (decode step).
     pub fn forward(
         &self,
         hidden: Tensor<B, 3>,
         rope: &RotaryEmbedding<B>,
         start_pos: usize,
+        causal_bias: Option<&Tensor<B, 4>>,
     ) -> Tensor<B, 3> {
         let [batch, seq_len, _] = hidden.dims();
 
@@ -91,33 +97,14 @@ impl<B: Backend> LlamaAttention<B> {
         let k = repeat_kv(k, n_rep);
         let v = repeat_kv(v, n_rep);
 
-        // Attention with causal mask
+        // Scaled dot-product attention; apply the pre-built additive causal bias if provided
         let scale = (self.head_dim as f64).sqrt();
         let attn_scores = q.matmul(k.swap_dims(2, 3)).div_scalar(scale);
-        
-        // Apply causal mask: positions can only attend to <= their own position
-        let attn_scores = if seq_len > 1 {
-            // Build lower-triangular mask [seq_len, seq_len]
-            // 1.0 for allowed positions, 0.0 for masked (future) positions
-            let mut mask_data = vec![0.0f32; seq_len * seq_len];
-            for i in 0..seq_len {
-                for j in 0..=i {
-                    mask_data[i * seq_len + j] = 1.0;
-                }
-            }
-            let mask = Tensor::<B, 1>::from_floats(mask_data.as_slice(), &attn_scores.device())
-                .reshape([1, 1, seq_len, seq_len]);
-            
-            // Where mask == 0, set attention score to -inf
-            let neg_inf = Tensor::<B, 4>::full([1, 1, seq_len, seq_len], -1e9, &attn_scores.device());
-            let ones = Tensor::<B, 4>::full([1, 1, seq_len, seq_len], 1.0, &attn_scores.device());
-            // masked_fill: attn = attn * mask + neg_inf * (1 - mask)
-            attn_scores * mask.clone() + neg_inf * (ones - mask)
-        } else {
-            // Single token: no masking needed
-            attn_scores
+        let attn_scores = match causal_bias {
+            Some(bias) => attn_scores + bias.clone(),
+            None => attn_scores,
         };
-        
+
         let attn = burn::tensor::activation::softmax(attn_scores, 3);
         let output = attn.matmul(v)
             .swap_dims(1, 2)
@@ -242,10 +229,11 @@ impl<B: Backend> LlamaLayer<B> {
         input: Tensor<B, 3>,
         rope: &RotaryEmbedding<B>,
         start_pos: usize,
+        causal_bias: Option<&Tensor<B, 4>>,
     ) -> Tensor<B, 3> {
         let residual = input.clone();
         let x = self.input_layernorm.forward(input);
-        let x = self.attention.forward(x, rope, start_pos);
+        let x = self.attention.forward(x, rope, start_pos, causal_bias);
         let x = x + residual;
 
         let residual = x.clone();
@@ -427,16 +415,21 @@ impl<B: Backend> Llama<B> {
         })
     }
 
-    /// Forward pass through the model
+    /// Forward pass through the model.
+    ///
+    /// Builds the causal bias once and threads it through all layers,
+    /// avoiding an O(seq²) allocation per layer.
     pub fn forward_pass(
         &self,
         input_ids: Tensor<B, 2>,
         start_pos: usize,
     ) -> Tensor<B, 3> {
+        let [_, seq_len] = input_ids.dims();
+        let causal_bias = super::common::build_causal_bias::<B>(seq_len, &*self.device);
         let mut x = self.embed_tokens.forward(input_ids.int());
-        
+
         for layer in &self.layers {
-            x = layer.forward(x, &self.rope, start_pos);
+            x = layer.forward(x, &self.rope, start_pos, causal_bias.as_ref());
         }
 
         let x = self.norm.forward(x);
@@ -536,7 +529,10 @@ impl<B: Backend> Llama<B> {
         let logits = self.lm_head.forward(x);           // [1, seq, vocab]
         let [_, s, vocab] = logits.dims();
         let last = logits.slice([0..1, s - 1..s, 0..vocab]).reshape([vocab]);
-        let logits_vec: Vec<f32> = last.into_data().to_vec().unwrap_or_default();
+        let logits_vec: Vec<f32> = last.into_data().to_vec().unwrap_or_else(|e| {
+            tracing::error!("prefill: failed to pull logits from GPU: {e:?}");
+            vec![0.0; vocab]
+        });
 
         (logits_vec, kv_cache)
     }
@@ -564,7 +560,10 @@ impl<B: Backend> Llama<B> {
 
         let x = self.norm.forward(x);                  // [1, 1, hidden]
         let logits = self.lm_head.forward(x);          // [1, 1, vocab]
-        logits.reshape([vocab]).into_data().to_vec().unwrap_or_default()
+        logits.reshape([vocab]).into_data().to_vec().unwrap_or_else(|e| {
+            tracing::error!("decode_step: failed to pull logits from GPU: {e:?}");
+            vec![0.0; vocab]
+        })
     }
 
     /// Tokenize a prompt, correctly handling known special tokens.
@@ -707,8 +706,8 @@ impl<B: Backend> TextGeneration for Llama<B> {
                 Ok(delta)
             };
 
-            // Look up EOS id once
-            let eos_id: Option<u32> = model.tokenizer.get_vocab(true).get("</s>").copied();
+            // Look up EOS id via O(1) token_to_id (avoids rebuilding the full vocab HashMap)
+            let eos_id: Option<u32> = model.tokenizer.token_to_id("</s>");
 
             // ── FIRST GENERATED TOKEN (from prefill logits) ───────────────────────
             let first_tok = sample(&logits_vec);

@@ -92,9 +92,8 @@ pub struct LocalAllReduce;
 
 impl<B: Backend> AllReduce<B> for LocalAllReduce {
     fn sum(&self, partials: Vec<Tensor<B, 2>>) -> Tensor<B, 2> {
-        partials.into_iter()
-            .reduce(|a, b| a + b)
-            .expect("all-reduce requires at least one partial")
+        assert!(!partials.is_empty(), "LocalAllReduce::sum: called with zero partials");
+        partials.into_iter().reduce(|a, b| a + b).unwrap()
     }
 }
 
@@ -397,6 +396,12 @@ fn clamp_shards(num_shards: usize, num_kv_heads: usize) -> usize {
     let mut n = num_shards.min(num_kv_heads).max(1);
     while n > 1 && num_kv_heads % n != 0 {
         n -= 1;
+    }
+    if n != num_shards {
+        tracing::warn!(
+            "clamp_shards: requested {num_shards} shards but num_kv_heads={num_kv_heads} \
+             is not evenly divisible; clamped to {n}"
+        );
     }
     n
 }
@@ -849,11 +854,13 @@ pub fn pipeline_parallel_llama_forward<B: Backend>(
     let num_stages = num_stages.max(1).min(num_layers);
     let layers_per_stage = (num_layers + num_stages - 1) / num_stages;
 
+    let [_, seq_len] = input_ids.dims();
+    let causal_bias = crate::models::common::build_causal_bias::<B>(seq_len, &model.device);
     let mut x = model.embed_tokens.forward(input_ids.int());
 
     for (_stage_idx, chunk) in model.layers.chunks(layers_per_stage).enumerate() {
         for layer in chunk {
-            x = layer.forward(x, &model.rope, 0);
+            x = layer.forward(x, &model.rope, 0, causal_bias.as_ref());
         }
         // In multi-GPU: transfer activation to next stage's device here.
         // Currently a no-op since all stages share the same device.
@@ -875,7 +882,7 @@ pub async fn create_parallel_model<B: Backend>(
     device_ids: Vec<usize>,
 ) -> Result<ParallelModel<B>, WorkerError> {
     if device_ids.is_empty() {
-        return Err(WorkerError::Config(
+        return Err(WorkerError::Configuration(
             "No devices specified for parallel model".into(),
         ));
     }

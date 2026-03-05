@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 
 use dashmap::DashMap;
@@ -86,6 +87,10 @@ pub struct GPUManager {
     /// Memory allocations per device
     allocations: Arc<DashMap<usize, Vec<MemoryAllocation>>>,
 
+    /// Running sum of allocated bytes per device — updated atomically on alloc/free
+    /// to avoid O(n) iteration in `get_available_memory`.
+    used_bytes: Arc<Vec<AtomicU64>>,
+
     /// Memory locks per device (for concurrent access)
     memory_locks: Vec<Arc<Semaphore>>,
 
@@ -146,10 +151,12 @@ impl GPUManager {
             return Err(WorkerError::NoGpusFound);
         }
 
+        let num_devices = devices.len();
         Ok(Self {
             devices,
             device_map,
             allocations: Arc::new(DashMap::new()),
+            used_bytes: Arc::new((0..num_devices).map(|_| AtomicU64::new(0)).collect()),
             memory_locks,
             _p2p_enabled: false,
         })
@@ -235,14 +242,21 @@ impl GPUManager {
         devices
     }
 
-    /// Try to run nvidia-smi to get total VRAM
+    /// Try to run nvidia-smi to get total VRAM (3-second timeout).
     fn try_detect_nvidia_memory() -> Option<u64> {
-        let output = Command::new("nvidia-smi")
-            .arg("--query-gpu=memory.total")
-            .arg("--format=csv,noheader,nounits")
-            .output()
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = Command::new("nvidia-smi")
+                .arg("--query-gpu=memory.total")
+                .arg("--format=csv,noheader,nounits")
+                .output();
+            let _ = tx.send(out);
+        });
+        let output = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .ok()?
             .ok()?;
-            
+
         if output.status.success() {
             let val_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if let Ok(mb) = val_str.parse::<u64>() {
@@ -252,13 +266,20 @@ impl GPUManager {
         None
     }
 
-    /// Try to run rocm-smi to get total VRAM for AMD
+    /// Try to run rocm-smi to get total VRAM for AMD (3-second timeout).
     fn try_detect_amd_memory(device_idx: usize) -> Option<u64> {
-        let output = Command::new("rocm-smi")
-            .arg("--showmeminfo")
-            .arg("vram")
-            .arg("--json")
-            .output()
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = Command::new("rocm-smi")
+                .arg("--showmeminfo")
+                .arg("vram")
+                .arg("--json")
+                .output();
+            let _ = tx.send(out);
+        });
+        let output = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .ok()?
             .ok()?;
             
         if output.status.success() {
@@ -351,22 +372,17 @@ impl GPUManager {
         infos
     }
 
-    /// Get available memory for a device (total minus tracked allocations)
+    /// Get available memory for a device (O(1) via atomic running sum).
     pub async fn get_available_memory(&self, device_id: usize) -> u64 {
         let device = match self.devices.get(device_id) {
             Some(d) => d,
             None => return 0,
         };
-
-        let mut available = device.available_memory;
-
-        if let Some(allocations) = self.allocations.get(&device_id) {
-            for alloc in allocations.value() {
-                available = available.saturating_sub(alloc.size);
-            }
-        }
-
-        available
+        let used = self.used_bytes
+            .get(device_id)
+            .map(|a| a.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        device.available_memory.saturating_sub(used)
     }
 
     /// Allocate memory on a device (tracking only — actual GPU alloc via Burn)
@@ -396,18 +412,30 @@ impl GPUManager {
             _timestamp: std::time::Instant::now(),
             owner,
         });
+        if let Some(counter) = self.used_bytes.get(device_id) {
+            counter.fetch_add(size, Ordering::Relaxed);
+        }
 
         debug!("Allocated {} bytes on GPU {}", size, device_id);
         Ok(())
     }
 
-    /// Free memory allocated to an owner
+    /// Free memory allocated to an owner, updating the atomic running sum.
     pub async fn free_memory(&self, owner: &str) {
         for mut entry in self.allocations.iter_mut() {
             let device_id = *entry.key();
             let allocations = entry.value_mut();
+            let freed: u64 = allocations.iter()
+                .filter(|a| a.owner == owner)
+                .map(|a| a.size)
+                .sum();
             allocations.retain(|alloc| alloc.owner != owner);
-            debug!("Freed memory for {} on GPU {}", owner, device_id);
+            if freed > 0 {
+                if let Some(counter) = self.used_bytes.get(device_id) {
+                    counter.fetch_sub(freed, Ordering::Relaxed);
+                }
+                debug!("Freed {} bytes for {} on GPU {}", freed, owner, device_id);
+            }
         }
     }
 

@@ -90,6 +90,11 @@ impl<B: Backend> RotaryEmbedding<B> {
         let seq_len = q.dims()[2];
 
         // Slice the precomputed cos/sin to the relevant positions
+        let max_len = self.cos.dims()[0];
+        assert!(
+            start_pos + seq_len <= max_len,
+            "RoPE: start_pos ({start_pos}) + seq_len ({seq_len}) exceeds precomputed max_seq_len ({max_len})"
+        );
         let cos = self.cos.clone().slice([start_pos..start_pos + seq_len]);
         let sin = self.sin.clone().slice([start_pos..start_pos + seq_len]);
 
@@ -176,29 +181,63 @@ pub fn top_k_top_p_sample(logits: &[f32], temperature: f32, top_p: f32, top_k: u
         probs.truncate(top_k);
     }
 
-    // Top-p: keep tokens whose cumulative probability <= top_p
+    // Top-p: keep tokens whose cumulative probability <= top_p, tracking running sum
+    // to avoid a second pass for re-normalisation.
+    let mut running_total = 0.0_f32;
     if top_p < 1.0 {
-        let mut cumulative = 0.0;
         let mut cutoff = probs.len();
         for (i, &(_, p)) in probs.iter().enumerate() {
-            cumulative += p;
-            if cumulative >= top_p {
+            running_total += p;
+            if running_total >= top_p {
                 cutoff = i + 1;
                 break;
             }
         }
         probs.truncate(cutoff);
+    } else {
+        running_total = probs.iter().map(|(_, p)| p).sum();
     }
 
-    // Re-normalise
-    let total: f32 = probs.iter().map(|(_, p)| p).sum();
-    for item in probs.iter_mut() {
-        item.1 /= total;
+    // Guard: if top-p truncated everything (e.g. top_p = 0.0 edge case), return token 0
+    if probs.is_empty() {
+        return 0;
+    }
+
+    // Re-normalise using the already-computed running total
+    if running_total > 0.0 && running_total.is_finite() {
+        for item in probs.iter_mut() {
+            item.1 /= running_total;
+        }
     }
 
     // Sample (deterministic fallback: argmax)
     // In production this would use a proper RNG; for now pick the most likely.
     probs[0].0
+}
+
+// ---------------------------------------------------------------------------
+// Causal mask
+// ---------------------------------------------------------------------------
+
+/// Build an additive causal bias `[1, 1, seq, seq]`:
+/// `bias[i,j] = 0.0` when `j ≤ i` (allowed), `-1e9` otherwise (masked).
+///
+/// Returns `None` for `seq_len ≤ 1` (single token — no masking needed).
+/// Call this once at the model level and pass the result to each layer.
+pub fn build_causal_bias<B: Backend>(seq_len: usize, device: &B::Device) -> Option<Tensor<B, 4>> {
+    if seq_len <= 1 {
+        return None;
+    }
+    let mut data = vec![-1e9_f32; seq_len * seq_len];
+    for i in 0..seq_len {
+        for j in 0..=i {
+            data[i * seq_len + j] = 0.0;
+        }
+    }
+    Some(
+        Tensor::<B, 1>::from_floats(data.as_slice(), device)
+            .reshape([1, 1, seq_len, seq_len]),
+    )
 }
 
 // ---------------------------------------------------------------------------

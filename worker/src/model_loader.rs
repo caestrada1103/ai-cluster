@@ -224,35 +224,40 @@ impl ModelLoader {
         info!("Loading {} safetensors files...", files.len());
 
         for file in files {
-            let data = tokio::fs::read(&file).await.map_err(|e| WorkerError::ModelLoad(e.to_string()))?;
-            let safetensors = SafeTensors::deserialize(&data).map_err(|e| WorkerError::ModelLoad(e.to_string()))?;
-            
-            for (name, view) in safetensors.tensors() {
-                // Convert to f32
-                let floats: Vec<f32> = match view.dtype() {
-                    safetensors::Dtype::F16 => {
-                        view.data().chunks(2)
+            // Async read keeps the runtime free during I/O
+            let data = tokio::fs::read(&file).await
+                .map_err(|e| WorkerError::ModelLoad(e.to_string()))?;
+
+            // CPU-heavy deserialization and dtype conversion run on the blocking thread pool
+            let parsed: Vec<(String, Vec<f32>)> = tokio::task::spawn_blocking(move || {
+                let safetensors = SafeTensors::deserialize(&data)
+                    .map_err(|e| WorkerError::ModelLoad(e.to_string()))?;
+                let mut out: Vec<(String, Vec<f32>)> = Vec::new();
+                for (name, view) in safetensors.tensors() {
+                    let floats: Vec<f32> = match view.dtype() {
+                        safetensors::Dtype::F16 => view.data().chunks(2)
                             .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32())
-                            .collect()
-                    },
-                    safetensors::Dtype::BF16 => {
-                        view.data().chunks(2)
+                            .collect(),
+                        safetensors::Dtype::BF16 => view.data().chunks(2)
                             .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
-                            .collect()
-                    },
-                     safetensors::Dtype::F32 => {
-                        view.data().chunks(4)
+                            .collect(),
+                        safetensors::Dtype::F32 => view.data().chunks(4)
                             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                            .collect()
-                    },
-                    _ => continue, // Skip unused types
-                };
-                
-                let tensor = Tensor::<WorkerBackend, 1>::from_floats(
-                    floats.as_slice(),
-                    device,
-                );
-                weights.insert(name.to_string(), tensor);
+                            .collect(),
+                        _ => continue, // Skip unsupported dtypes
+                    };
+                    out.push((name.to_string(), floats));
+                }
+                Ok::<_, WorkerError>(out)
+            })
+            .await
+            .map_err(|e| WorkerError::Internal(format!("spawn_blocking join error: {e}")))?
+            .map_err(|e| e)?;
+
+            // Tensor creation stays in async context (WgpuDevice reference not moved)
+            for (name, floats) in parsed {
+                let tensor = Tensor::<WorkerBackend, 1>::from_floats(floats.as_slice(), device);
+                weights.insert(name, tensor);
             }
         }
         
