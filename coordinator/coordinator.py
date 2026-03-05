@@ -52,11 +52,12 @@ class WorkerInfo:
     active_requests: int = 0
     total_requests: int = 0
     avg_latency_ms: float = 0
+    max_requests: int = 10  # Configurable via coordinator settings
     
     async def get_status(self) -> Optional[pb.WorkerStatus]:
         """Get current worker status."""
         try:
-            status = await self.stub.GetStatus(pb.Empty(), timeout=5)
+            status = await self.stub.GetStatus(pb.Empty(), timeout=60)
             self.state = WorkerState.HEALTHY
             self.consecutive_failures = 0
             self.gpus = list(status.gpus)
@@ -68,7 +69,7 @@ class WorkerInfo:
         except Exception as e:
             self.consecutive_failures += 1
             self.last_error = str(e)
-            if self.consecutive_failures >= 3:
+            if self.consecutive_failures >= 10:
                 self.state = WorkerState.UNHEALTHY
             logger.warning(f"Failed to get status from {self.id}: {e}")
             return None
@@ -88,7 +89,7 @@ class WorkerInfo:
         """Whether worker can accept new requests."""
         return (
             self.state == WorkerState.HEALTHY
-            and self.active_requests < 10  # Configurable limit
+            and self.active_requests < self.max_requests
         )
 
 
@@ -107,6 +108,10 @@ class RequestContext:
     target_worker_id: Optional[str] = None
     error: Optional[str] = None
     tokens_generated: int = 0
+    
+    # Streaming
+    token_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    accumulated_text: str = ""
 
 
 class ClusterCoordinator:
@@ -128,6 +133,11 @@ class ClusterCoordinator:
         
         # Components
         self.discovery = WorkerDiscovery(settings)
+        
+        # Load models from configuration
+        config_dict = settings.load_models_config()
+        if config_dict:
+            ModelRegistry.load_from_dict(config_dict)
         
         # Metrics
         self.request_counter = metrics.counter(
@@ -151,6 +161,9 @@ class ClusterCoordinator:
         """Start the coordinator."""
         logger.info("Starting cluster coordinator...")
         self.is_running = True
+        
+        # Start components
+        await self.discovery.start()
         
         # Start background tasks
         self._discovery_task = asyncio.create_task(self._discovery_loop())
@@ -188,11 +201,11 @@ class ClusterCoordinator:
                 addresses = await self.discovery.discover()
                 
                 for addr in addresses:
-                    await self._connect_worker(addr)
+                    await self._connect_worker(addr.address)
                 
                 # Remove workers that are no longer discovered
                 async with self._workers_lock:
-                    discovered_set = set(addresses)
+                    discovered_set = {addr.address for addr in addresses}
                     for worker_id in list(self.workers.keys()):
                         worker = self.workers[worker_id]
                         if worker.address not in discovered_set:
@@ -219,8 +232,8 @@ class ClusterCoordinator:
                 channel = grpc.aio.insecure_channel(
                     address,
                     options=[
-                        ('grpc.keepalive_time_ms', 10000),
-                        ('grpc.keepalive_timeout_ms', 5000),
+                        ('grpc.keepalive_time_ms', 60000),      # 1 minute
+                        ('grpc.keepalive_timeout_ms', 40000),   # 40 seconds
                         ('grpc.http2.max_pings_without_data', 0),
                         ('grpc.keepalive_permit_without_calls', 1),
                     ]
@@ -229,8 +242,8 @@ class ClusterCoordinator:
                 # Create stub
                 stub = pb_grpc.WorkerStub(channel)
                 
-                # Test connection with status check
-                status = await stub.GetStatus(pb.Empty(), timeout=5)
+                # Test connection with status check (increased timeout for busy workers)
+                status = await stub.GetStatus(pb.Empty(), timeout=30)
                 
                 worker_id = status.worker_id or f"worker-{len(self.workers)}"
                 
@@ -239,6 +252,7 @@ class ClusterCoordinator:
                     address=address,
                     channel=channel,
                     stub=stub,
+                    max_requests=self.settings.max_concurrent_requests_per_worker,
                 )
                 worker.state = WorkerState.HEALTHY
                 worker.gpus = list(status.gpus)
@@ -256,15 +270,33 @@ class ClusterCoordinator:
         """Background task for checking worker health."""
         while self.is_running:
             try:
+                # 1. Get a snapshot of workers under lock
                 async with self._workers_lock:
-                    for worker in list(self.workers.values()):
-                        await worker.get_status()
-                        
-                        # Remove offline workers
+                    workers_to_check = list(self.workers.values())
+                
+                if not workers_to_check:
+                    await asyncio.sleep(self.settings.health_check_interval)
+                    continue
+
+                # 2. Perform health checks concurrently (NO LOCK HELD)
+                # This ensures slow network IO doesn't block the request processor
+                await asyncio.gather(
+                    *[worker.get_status() for worker in workers_to_check],
+                    return_exceptions=True
+                )
+                
+                # 3. Handle cleanup of offline workers under lock
+                async with self._workers_lock:
+                    for worker in workers_to_check:
                         if worker.state == WorkerState.OFFLINE:
-                            del self.workers[worker.id]
-                            await worker.channel.close()
-                            logger.info(f"Removed offline worker {worker.id}")
+                            if worker.id in self.workers:
+                                try:
+                                    await worker.channel.close()
+                                except Exception as e:
+                                    logger.warning(f"Error closing channel for {worker.id}: {e}")
+                                finally:
+                                    self.workers.pop(worker.id, None)
+                                    logger.info(f"Removed offline worker {worker.id}")
                             
             except Exception as e:
                 logger.error(f"Error in health check loop: {e}")
@@ -286,7 +318,8 @@ class ClusterCoordinator:
                 # Check for explicit worker targeting first
                 worker = None
                 if ctx.target_worker_id:
-                    worker = self.workers.get(ctx.target_worker_id)
+                    async with self._workers_lock:
+                        worker = self.workers.get(ctx.target_worker_id)
                     if not worker or not worker.is_available:
                         ctx.error = f"Target worker '{ctx.target_worker_id}' is not available"
                         self.request_counter.labels(model=ctx.model_name, status="failed").inc()
@@ -296,12 +329,16 @@ class ClusterCoordinator:
                     worker = await self._select_worker(ctx.model_name)
                 
                 if not worker:
+                    logger.warning(f"No worker available for model {ctx.model_name}")
                     ctx.error = "No available workers"
+                    ctx.completed_at = time.time()
                     self.request_counter.labels(model=ctx.model_name, status="failed").inc()
                     continue
                 
-                # Execute request
-                await self._execute_request(ctx, worker)
+                logger.debug(f"Selected worker {worker.id} for request {request_id}")
+                logger.info(f"Dispatching request {request_id} to worker {worker.id}")
+                # Execute request concurrently
+                asyncio.create_task(self._execute_request(ctx, worker))
                 
             except asyncio.CancelledError:
                 break
@@ -330,7 +367,7 @@ class ClusterCoordinator:
                     else:
                         # For unknown HuggingFace models, assume 8GB requirement for now
                         # We don't know the true size until the Rust worker downloads the safetensors metadata
-                        if worker.available_memory >= 6 * 1e9:
+                        if worker.available_memory >= 8 * 1e9:
                             available_workers.append(worker)
         
         if not available_workers:
@@ -362,7 +399,7 @@ class ClusterCoordinator:
                 top_p=ctx.params.get("top_p", 0.95),
                 top_k=ctx.params.get("top_k", 40),
                 request_id=ctx.id,
-                stream=False,
+                stream=ctx.params.get("stream", False),
             )
             
             # Execute inference
@@ -371,10 +408,11 @@ class ClusterCoordinator:
             async for response in response_stream:
                 ctx.tokens_generated = response.tokens_generated
                 
-                # For non-streaming, just accumulate
-                if not hasattr(ctx, 'accumulated_text'):
-                    ctx.accumulated_text = ""
+                # Accumulate text
                 ctx.accumulated_text += response.text
+                
+                # Push to token queue for streaming
+                await ctx.token_queue.put(response)
                 
                 if response.finished:
                     break
@@ -465,7 +503,7 @@ class ClusterCoordinator:
                 return False
                 
         except Exception as e:
-            logger.error(f"Error loading model on worker {worker.id}: {e}")
+            logger.exception(f"Error loading model on worker {worker.id}: {e}")
             return False
     
     async def infer(
@@ -498,6 +536,7 @@ class ClusterCoordinator:
             )
         except asyncio.TimeoutError:
             self.active_requests.pop(request_id, None)
+            self.active_requests_gauge.set(len(self.active_requests))
             raise RuntimeError("Request queue full, try again later")
         
         # Wait for completion
@@ -507,15 +546,21 @@ class ClusterCoordinator:
         while time.time() - start_time < timeout:
             if ctx.completed_at is not None:
                 if ctx.error:
+                    self.active_requests.pop(request_id, None)
                     raise RuntimeError(ctx.error)
-                
-                return {
+
+                result = {
                     "request_id": ctx.id,
                     "text": getattr(ctx, 'accumulated_text', ''),
                     "tokens_generated": ctx.tokens_generated,
                     "processing_time_ms": (ctx.completed_at - ctx.created_at) * 1000,
                     "worker_id": ctx.worker_id,
                 }
+                # For non-streaming requests clean up immediately.
+                # Streaming requests are cleaned up in api.py via .pop() on the context.
+                if not kwargs.get("stream", False):
+                    self.active_requests.pop(request_id, None)
+                return result
             
             await asyncio.sleep(0.1)
         

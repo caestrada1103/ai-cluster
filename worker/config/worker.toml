@@ -11,7 +11,7 @@ max_concurrent_requests = 32
 pin_memory = false
 
 # Storage
-model_cache_dir = "./data/models"
+model_cache_dir = "./models"
 download_dir = "./data/downloads"
 
 # Loading behavior

@@ -389,8 +389,8 @@ systemctl restart ai-worker@0
 
 # Solution 5: Use faster CPU or NVMe storage
 # Move models to faster storage
-mv /data/models /fast-nvme/models
-ln -s /fast-nvme/models /data/models
+mv ./models /fast-nvme/models
+ln -s /fast-nvme/models ./models
 ```
 
 ---
@@ -587,7 +587,7 @@ token = "hf_xxxxxxxxxxxx"
 export HF_ENDPOINT=https://hf-mirror.com
 
 # Solution 3: Download manually
-cd /data/models
+cd ./models
 git clone https://huggingface.co/deepseek-ai/deepseek-llm-7b-base
 
 # Solution 4: Increase timeout
@@ -597,7 +597,7 @@ download_timeout_seconds = 600  # Increase from 300
 # Solution 5: Use offline mode
 [model_loader]
 offline_mode = true
-# Place models manually in /data/models
+# Place models manually in ./models
 
 ### 2. **Llama 3 Loading Failure**
 
@@ -625,8 +625,8 @@ export HF_TOKEN=your_token_here
 
 ```bash
 # Step 1: Check model files
-ls -la /data/models/deepseek-7b/
-file /data/models/deepseek-7b/model.safetensors
+ls -la ./models/deepseek-7b/
+file ./models/deepseek-7b/model.safetensors
 
 # Step 2: Check Python conversion script
 python scripts/convert_model.py --model deepseek-7b --dry-run
@@ -677,11 +677,11 @@ model.save_pretrained('./models/deepseek-7b', safe_serialization=True)
 journalctl -u ai-worker@0 -f
 
 # Step 2: Check model path
-ls -la /data/models/deepseek-7b/
+ls -la ./models/deepseek-7b/
 
 # Step 3: Check permissions
-ls -la /data/models/
-sudo -u worker ls -la /data/models/deepseek-7b/
+ls -la ./models/
+sudo -u worker ls -la ./models/deepseek-7b/
 
 # Step 4: Check GPU memory
 nvidia-smi
@@ -691,9 +691,9 @@ nvidia-smi
 
 ```bash
 # Solution 1: Fix permissions
-sudo chown -R worker:worker /data/models
-sudo chmod 755 /data/models
-sudo chmod 644 /data/models/**/*
+sudo chown -R worker:worker ./models
+sudo chmod 755 ./models
+sudo chmod 644 ./models/**/*
 
 # Solution 2: Load with different quantization
 curl -X POST http://localhost:8000/v1/models/load \
@@ -709,7 +709,7 @@ sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'  # Clear disk cache
 sudo systemctl start ai-worker@0
 
 # Solution 5: Check model integrity
-md5sum -c /data/models/deepseek-7b/model.safetensors.md5
+md5sum -c ./models/deepseek-7b/model.safetensors.md5
 ```
 
 ---
@@ -990,7 +990,7 @@ iostat -x 1
 iotop
 
 # Step 2: Find I/O-intensive processes
-lsof /data/models
+lsof ./models
 
 # Step 3: Check disk health
 smartctl -a /dev/sda
@@ -1001,8 +1001,8 @@ smartctl -a /dev/sda
 ```bash
 # Solution 1: Use faster storage
 # Move to NVMe
-mv /data/models /mnt/nvme/models
-ln -s /mnt/nvme/models /data/models
+mv ./models /mnt/nvme/models
+ln -s /mnt/nvme/models ./models
 
 # Solution 2: Enable caching
 [cache]
@@ -1012,7 +1012,7 @@ prefetch_size_gb = 4
 # Solution 3: Use RAM disk for hot models
 sudo mkdir /mnt/ramdisk
 sudo mount -t tmpfs -o size=32G tmpfs /mnt/ramdisk
-cp -r /data/models/hot-model /mnt/ramdisk/
+cp -r ./models/hot-model /mnt/ramdisk/
 
 # Solution 4: Adjust I/O scheduler
 echo deadline > /sys/block/sda/queue/scheduler
@@ -1587,7 +1587,7 @@ ls -la
 realpath config/coordinator.yaml
 
 # Check permissions
-ls -la /data/models/
+ls -la ./models/
 ```
 
 **Solutions:**
@@ -1599,12 +1599,12 @@ models:
   cache_dir: "/absolute/path/to/models"
 
 # Create directories with correct permissions
-sudo mkdir -p /data/models
+sudo mkdir -p ./models
 sudo chown -R $USER:$USER /data
-chmod 755 /data/models
+chmod 755 ./models
 
 # Use environment variables for paths
-export MODEL_CACHE_DIR="/data/models"
+export MODEL_CACHE_DIR="./models"
 # In config
 models:
   cache_dir: ${MODEL_CACHE_DIR:-./models}
@@ -1705,8 +1705,8 @@ security:
 ps aux | grep ai-worker
 
 # Check file permissions
-ls -la /data/models/
-namei -l /data/models/model.safetensors
+ls -la ./models/
+namei -l ./models/model.safetensors
 
 # Check group membership
 groups $USER
@@ -1717,7 +1717,7 @@ groups worker
 
 ```bash
 # Fix ownership
-sudo chown -R worker:worker /data/models
+sudo chown -R worker:worker ./models
 sudo chown -R worker:worker /var/log/ai-cluster
 
 # Add user to groups
@@ -1726,11 +1726,11 @@ sudo usermod -a -G docker $USER
 
 # Set proper permissions
 chmod 755 /data
-chmod 755 /data/models
-chmod 644 /data/models/**/*
+chmod 755 ./models
+chmod 644 ./models/**/*
 
 # Use ACLs for fine-grained control
-setfacl -m u:worker:rwx /data/models
+setfacl -m u:worker:rwx ./models
 ```
 
 ---

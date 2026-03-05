@@ -13,7 +13,16 @@ def chat():
     parser.add_argument('--max-tokens', type=int, default=512, help='Maximum tokens to generate (default: 512)')
     parser.add_argument('--temp', type=float, default=0.7, help='Temperature (default: 0.7)')
     parser.add_argument('--host', type=str, default='localhost:50051', help='Worker gRPC host')
+    parser.add_argument('--quant', type=str, default='fp16', choices=['fp16', 'int8', 'int4'], help='Quantization type (default: fp16)')
     args = parser.parse_args()
+
+    # Map string to proto enum
+    quant_map = {
+        'fp16': cluster_pb2.Quantization.FP16,
+        'int8': cluster_pb2.Quantization.INT8,
+        'int4': cluster_pb2.Quantization.INT4,
+    }
+    quantization = quant_map.get(args.quant, cluster_pb2.Quantization.FP16)
 
     # Connect to worker
     channel = grpc.insecure_channel(args.host)
@@ -33,13 +42,14 @@ def chat():
         return
 
     model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    # model_name = "deepseek-7b"
     
     # Ensure model is loaded (optional if already loaded, but good practice)
-    print(f"Ensuring model {model_name} is loaded...")
+    print(f"Ensuring model {model_name} is loaded with {args.quant} quantization...")
     try:
         stub.LoadModel(cluster_pb2.LoadModelRequest(
             model_name=model_name,
-            quantization=cluster_pb2.Quantization.FP16
+            quantization=quantization
         ))
     except grpc.RpcError as e:
         print(f"Load failed: {e}")

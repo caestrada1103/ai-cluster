@@ -93,6 +93,8 @@ class ModelRegistry:
     @classmethod
     def initialize(cls):
         """Initialize the model registry with default models."""
+        # Note: In a production environment, this could be empty and 
+        # only populated via load_from_config.
         
         # DeepSeek models
         cls.MODELS["deepseek-7b"] = ModelConfig(
@@ -236,6 +238,85 @@ class ModelRegistry:
         )
         
         logger.info(f"Initialized model registry with {len(cls.MODELS)} models")
+
+    @classmethod
+    def load_from_dict(cls, config_dict: Dict[str, Any]):
+        """Load models from a configuration dictionary (e.g. from models.toml)."""
+        if "models" not in config_dict:
+            return
+
+        defaults = config_dict.get("defaults", {})
+
+        for name, data in config_dict["models"].items():
+            try:
+                # Merge with defaults
+                # We need to be careful with nested dicts like 'architecture'
+                # For now, we just do a shallow copy of defaults and update with model data
+                final_data = defaults.copy()
+                final_data.update(data)
+                
+                # Extract components with robustness for string vs dict
+                def get_dict(key):
+                    val = final_data.get(key, {})
+                    if isinstance(val, dict):
+                        return val
+                    return {"default": val} # Fallback for flat values from defaults
+
+                arch = get_dict("architecture")
+                quants = get_dict("quantization")
+                parallel = get_dict("parallelism")
+                paths = get_dict("paths")
+                
+                # Determine supported quantizations
+                supported_quants = quants.get("supported")
+                if not supported_quants:
+                    default_q = quants.get("default", "fp16")
+                    supported_quants = [default_q]
+
+                # Determine supported parallelism
+                supported_parallel = parallel.get("supported")
+                if not supported_parallel:
+                    default_p = parallel.get("default", "auto")
+                    supported_parallel = [default_p]
+
+                model_name = final_data.get("name", name)
+                raw_family = final_data.get("family", "llama")
+                try:
+                    model_family = ModelFamily(raw_family)
+                except ValueError:
+                    logger.warning(f"Unknown model family '{raw_family}' for model {name}, defaulting to llama")
+                    model_family = ModelFamily.LLAMA
+
+                model = ModelConfig(
+                    name=model_name,
+                    family=model_family,
+                    parameters=final_data.get("parameters", "Unknown"),
+                    min_memory_gb=float(final_data.get("min_memory_gb", 8.0)),
+                    recommended_gpus=int(final_data.get("recommended_gpus", 1)),
+                    max_gpus=int(final_data.get("max_gpus", 1)),
+                    num_layers=int(arch.get("num_layers", 0)),
+                    hidden_size=int(arch.get("hidden_size", 0)),
+                    num_attention_heads=int(arch.get("num_attention_heads", 0)),
+                    vocab_size=int(arch.get("vocab_size", 32000)),
+                    max_seq_len=int(arch.get("max_seq_len", 2048)),
+                    intermediate_size=int(arch.get("intermediate_size", 0)),
+                    num_kv_heads=arch.get("num_kv_heads"),
+                    supports_quantization=[Quantization(q) for q in supported_quants],
+                    supports_parallelism=[ParallelismStrategy(p) for p in supported_parallel],
+                    is_moe=arch.get("is_moe", False),
+                    num_experts=arch.get("num_experts"),
+                    config_path=paths.get("config"),
+                    tokenizer_path=paths.get("tokenizer"),
+                    weights_path=paths.get("weights"),
+                    description=final_data.get("description", ""),
+                )
+                cls.MODELS[model_name] = model
+            except Exception as e:
+                logger.error(f"Failed to load model {name} from config: {e}")
+
+        logger.info(f"Updated model registry. Total models: {len(cls.MODELS)}")
+
+
     
     @classmethod
     def get_model(cls, name: str) -> Optional[ModelConfig]:

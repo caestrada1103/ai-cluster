@@ -46,7 +46,12 @@ class WorkerEndpoint:
     @property
     def port(self) -> int:
         parts = self.address.split(":")
-        return int(parts[1]) if len(parts) > 1 else 50051
+        if len(parts) > 1:
+            try:
+                return int(parts[1])
+            except ValueError:
+                logger.warning(f"Invalid port in address '{self.address}', using default 50051")
+        return 50051
 
 
 class DiscoveryProvider(ABC):
@@ -98,55 +103,60 @@ class StaticDiscoveryProvider(DiscoveryProvider):
                 pass
     
     def _load_config(self):
-        """Load worker configuration from file."""
-        if not self.config_path.exists():
-            # Use static workers from settings
-            self.workers = [
-                WorkerEndpoint(address=addr)
-                for addr in self.settings.static_workers
-            ]
-            return
+        """Load worker configuration from settings and file."""
+        new_workers = []
         
-        try:
-            with open(self.config_path) as f:
-                if self.config_path.suffix == ".yaml":
-                    config = yaml.safe_load(f)
-                else:
-                    config = json.load(f)
+        # 1. Load from settings
+        for addr in self.settings.static_workers:
+            new_workers.append(WorkerEndpoint(address=addr))
             
-            new_workers = []
-            for worker_config in config.get("workers", []):
-                endpoint = WorkerEndpoint(
-                    address=worker_config["address"],
-                    worker_id=worker_config.get("id"),
-                    gpu_count=worker_config.get("gpu_count", 0),
-                    total_memory_gb=worker_config.get("memory_gb", 0),
-                    tags=worker_config.get("tags", {}),
-                )
-                new_workers.append(endpoint)
-            
-            # Check for changes
-            old_addresses = {w.address for w in self.workers}
-            new_addresses = {w.address for w in new_workers}
-            
-            self.workers = new_workers
-            
-            # Notify about new workers
-            for addr in new_addresses - old_addresses:
-                worker = next(w for w in new_workers if w.address == addr)
-                if self.on_worker_found:
-                    asyncio.create_task(self.on_worker_found(worker))
-            
-            # Notify about lost workers
-            for addr in old_addresses - new_addresses:
-                worker = WorkerEndpoint(address=addr)  # Minimal info
-                if self.on_worker_lost:
-                    asyncio.create_task(self.on_worker_lost(worker))
-            
-            logger.debug(f"Loaded {len(self.workers)} workers from config")
-            
-        except Exception as e:
-            logger.error(f"Failed to load worker config: {e}")
+        # 2. Load from file if it exists (merges with settings)
+        if self.config_path.exists():
+            try:
+                with open(self.config_path) as f:
+                    if self.config_path.suffix == ".yaml":
+                        config = yaml.safe_load(f)
+                    else:
+                        config = json.load(f)
+                
+                for worker_config in config.get("workers", []):
+                    # Avoid duplicates if already in settings
+                    addr = worker_config["address"]
+                    if any(w.address == addr for w in new_workers):
+                        continue
+                        
+                    endpoint = WorkerEndpoint(
+                        address=addr,
+                        worker_id=worker_config.get("id"),
+                        gpu_count=worker_config.get("gpu_count", 0),
+                        total_memory_gb=worker_config.get("memory_gb", 0),
+                        tags=worker_config.get("tags", {}),
+                    )
+                    new_workers.append(endpoint)
+            except Exception as e:
+                logger.error(f"Failed to load worker config from {self.config_path}: {e}")
+        
+        # 3. Check for changes and notify
+        old_addresses = {w.address for w in self.workers}
+        new_addresses = {w.address for w in new_workers}
+        
+        # Notify about new workers
+        for addr in (new_addresses - old_addresses):
+            worker = next((w for w in new_workers if w.address == addr), None)
+            if worker and self.on_worker_found:
+                asyncio.create_task(self.on_worker_found(worker))
+                logger.info(f"Discovered static worker: {addr}")
+
+        # Notify about removed workers
+        for addr in (old_addresses - new_addresses):
+            worker = next((w for w in self.workers if w.address == addr), None)
+            if worker and self.on_worker_lost:
+                asyncio.create_task(self.on_worker_lost(worker))
+                logger.info(f"Lost static worker: {addr}")
+                
+        self.workers = new_workers
+        logger.debug(f"Static discovery updated: {len(self.workers)} workers total")
+
     
     async def _watch_config(self):
         """Watch config file for changes."""
@@ -335,11 +345,14 @@ class BroadcastDiscoveryProvider(DiscoveryProvider):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
-        # Bind to interface if specified
-        if self.interface:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
-                           self.interface.encode())
-        
+        # Bind to interface if specified (SO_BINDTODEVICE is Linux-only)
+        if self.interface and hasattr(socket, 'SO_BINDTODEVICE'):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                               self.interface.encode())
+            except OSError as e:
+                logger.warning(f"Could not bind to interface {self.interface}: {e}")
+
         sock.bind(('', self.port))
         sock.setblocking(False)
         
@@ -395,11 +408,14 @@ class BroadcastDiscoveryProvider(DiscoveryProvider):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         
-        # Bind to interface if specified
-        if self.interface:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
-                           self.interface.encode())
-        
+        # Bind to interface if specified (SO_BINDTODEVICE is Linux-only)
+        if self.interface and hasattr(socket, 'SO_BINDTODEVICE'):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                               self.interface.encode())
+            except OSError as e:
+                logger.warning(f"Could not bind to interface {self.interface}: {e}")
+
         message = {
             "type": "discovery_request",
             "coordinator_id": socket.gethostname(),

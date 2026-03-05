@@ -160,7 +160,8 @@ impl GPUManager {
     async fn detect_devices() -> Vec<GPUDevice> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            flags: wgpu::InstanceFlags::default() & !wgpu::InstanceFlags::VALIDATION & !wgpu::InstanceFlags::DEBUG,
+            flags: wgpu::InstanceFlags::default()
+                .difference(wgpu::InstanceFlags::VALIDATION | wgpu::InstanceFlags::DEBUG),
             ..Default::default()
         });
         
@@ -191,6 +192,10 @@ impl GPUManager {
             // Try to get precise VRAM for NVIDIA via nvidia-smi
             if info.name.to_lowercase().contains("nvidia") {
                 if let Some(vram) = Self::try_detect_nvidia_memory() {
+                    total_memory = vram;
+                }
+            } else if info.name.to_lowercase().contains("amd") {
+                if let Some(vram) = Self::try_detect_amd_memory(idx) {
                     total_memory = vram;
                 }
             }
@@ -242,6 +247,34 @@ impl GPUManager {
             let val_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if let Ok(mb) = val_str.parse::<u64>() {
                 return Some(mb * 1024 * 1024);
+            }
+        }
+        None
+    }
+
+    /// Try to run rocm-smi to get total VRAM for AMD
+    fn try_detect_amd_memory(device_idx: usize) -> Option<u64> {
+        let output = Command::new("rocm-smi")
+            .arg("--showmeminfo")
+            .arg("vram")
+            .arg("--json")
+            .output()
+            .ok()?;
+            
+        if output.status.success() {
+            let json_str = String::from_utf8_lossy(&output.stdout);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                // rocm-smi returns a JSON object where keys are usually "card0", "card1", etc.
+                // We try "card{idx}" first, then fallback to any available card if idx fails.
+                let card_key = format!("card{}", device_idx);
+                
+                if let Some(card_data) = v.get(&card_key).or_else(|| v.as_object().and_then(|obj| obj.values().next())) {
+                    if let Some(vram_str) = card_data.get("VRAM Total Memory (B)").and_then(|v| v.as_str()) {
+                        if let Ok(vram_bytes) = vram_str.parse::<u64>() {
+                            return Some(vram_bytes);
+                        }
+                    }
+                }
             }
         }
         None
@@ -404,10 +437,6 @@ impl GPUManager {
     /// Check if all GPUs are healthy
     pub async fn is_healthy(&self) -> bool {
         for device in &self.devices {
-            let available = self.get_available_memory(device.id).await;
-            if available == 0 && device.total_memory > 0 {
-                return false;
-            }
             if device.temperature > 100.0 {
                 return false;
             }

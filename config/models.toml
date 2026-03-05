@@ -39,10 +39,10 @@ num_experts = 64
 num_experts_per_tok = 6
 
 [models.deepseek-7b.paths]
-config = "/data/models/deepseek-7b/config.json"
-weights = "/data/models/deepseek-7b/model.safetensors"
-tokenizer = "/data/models/deepseek-7b/tokenizer.json"
-vocab = "/data/models/deepseek-7b/vocab.json"
+config = "./models/deepseek-7b/config.json"
+weights = "./models/deepseek-7b/model.safetensors"
+tokenizer = "./models/deepseek-7b/tokenizer.json"
+vocab = "./models/deepseek-7b/vocab.json"
 
 [models.deepseek-7b.quantization]
 supported = ["fp16", "int8", "int4"]
@@ -79,9 +79,9 @@ num_experts = 128
 num_experts_per_tok = 8
 
 [models.deepseek-67b.paths]
-config = "/data/models/deepseek-67b/config.json"
-weights = "/data/models/deepseek-67b/model.safetensors"
-tokenizer = "/data/models/deepseek-67b/tokenizer.json"
+config = "./models/deepseek-67b/config.json"
+weights = "./models/deepseek-67b/model.safetensors"
+tokenizer = "./models/deepseek-67b/tokenizer.json"
 
 [models.deepseek-67b.quantization]
 supported = ["int8", "int4", "fp8"]
@@ -119,9 +119,9 @@ rope_theta = 500000.0
 is_moe = false
 
 [models.llama3-8b.paths]
-config = "/data/models/llama3-8b/config.json"
-weights = "/data/models/llama3-8b/model.safetensors"
-tokenizer = "/data/models/llama3-8b/tokenizer.json"
+config = "./models/llama3-8b/config.json"
+weights = "./models/llama3-8b/model.safetensors"
+tokenizer = "./models/llama3-8b/tokenizer.json"
 
 [models.llama3-8b.quantization]
 supported = ["fp16", "int8", "int4"]
@@ -156,9 +156,9 @@ rope_theta = 500000.0
 is_moe = false
 
 [models.llama3-70b.paths]
-config = "/data/models/llama3-70b/config.json"
-weights = "/data/models/llama3-70b/model.safetensors"
-tokenizer = "/data/models/llama3-70b/tokenizer.json"
+config = "./models/llama3-70b/config.json"
+weights = "./models/llama3-70b/model.safetensors"
+tokenizer = "./models/llama3-70b/tokenizer.json"
 
 [models.llama3-70b.quantization]
 supported = ["int8", "int4"]
@@ -197,9 +197,9 @@ sliding_window = 4096
 is_moe = false
 
 [models.mistral-7b.paths]
-config = "/data/models/mistral-7b/config.json"
-weights = "/data/models/mistral-7b/model.safetensors"
-tokenizer = "/data/models/mistral-7b/tokenizer.json"
+config = "./models/mistral-7b/config.json"
+weights = "./models/mistral-7b/model.safetensors"
+tokenizer = "./models/mistral-7b/tokenizer.json"
 
 [models.mistral-7b.quantization]
 supported = ["fp16", "int8"]
@@ -236,9 +236,9 @@ layer_norm_eps = 1e-5
 is_moe = false
 
 [models.phi-2.paths]
-config = "/data/models/phi-2/config.json"
-weights = "/data/models/phi-2/model.safetensors"
-tokenizer = "/data/models/phi-2/tokenizer.json"
+config = "./models/phi-2/config.json"
+weights = "./models/phi-2/model.safetensors"
+tokenizer = "./models/phi-2/tokenizer.json"
 
 [models.phi-2.quantization]
 supported = ["fp16"]
@@ -276,9 +276,9 @@ rope_theta = 10000.0
 is_moe = false
 
 [models.gemma-2b.paths]
-config = "/data/models/gemma-2b/config.json"
-weights = "/data/models/gemma-2b/model.safetensors"
-tokenizer = "/data/models/gemma-2b/tokenizer.json"
+config = "./models/gemma-2b/config.json"
+weights = "./models/gemma-2b/model.safetensors"
+tokenizer = "./models/gemma-2b/tokenizer.json"
 
 [models.gemma-2b.quantization]
 supported = ["fp16", "int8"]
@@ -309,9 +309,9 @@ rope_theta = 10000.0
 is_moe = false
 
 [models.gemma-7b.paths]
-config = "/data/models/gemma-7b/config.json"
-weights = "/data/models/gemma-7b/model.safetensors"
-tokenizer = "/data/models/gemma-7b/tokenizer.json"
+config = "./models/gemma-7b/config.json"
+weights = "./models/gemma-7b/model.safetensors"
+tokenizer = "./models/gemma-7b/tokenizer.json"
 
 [models.gemma-7b.hf]
 repo_id = "google/gemma-7b"
@@ -343,9 +343,9 @@ num_experts = 8
 num_experts_per_tok = 2
 
 [models.mixtral-8x7b.paths]
-config = "/data/models/mixtral-8x7b/config.json"
-weights = "/data/models/mixtral-8x7b/model.safetensors"
-tokenizer = "/data/models/mixtral-8x7b/tokenizer.json"
+config = "./models/mixtral-8x7b/config.json"
+weights = "./models/mixtral-8x7b/model.safetensors"
+tokenizer = "./models/mixtral-8x7b/tokenizer.json"
 
 [models.mixtral-8x7b.quantization]
 supported = ["int8", "int4"]
@@ -358,3 +358,33 @@ default = "auto"
 [models.mixtral-8x7b.hf]
 repo_id = "mistralai/Mixtral-8x7B-v0.1"
 filename = "model-00001-of-00019.safetensors"
+
+# TinyLlama Models
+# =================
+
+[models."TinyLlama/TinyLlama-1.1B-Chat-v1.0"]
+family = "llama"
+description = "TinyLlama 1.1B Chat v1.0"
+parameters = "1.1B"
+min_memory_gb = 2
+recommended_gpus = 1
+max_gpus = 1
+
+[models."TinyLlama/TinyLlama-1.1B-Chat-v1.0".architecture]
+num_layers = 22
+hidden_size = 2048
+num_attention_heads = 32
+num_kv_heads = 4
+vocab_size = 32003
+max_seq_len = 2048
+intermediate_size = 5632
+rms_norm_eps = 1e-5
+is_moe = false
+
+[models."TinyLlama/TinyLlama-1.1B-Chat-v1.0".quantization]
+supported = ["fp16", "int8", "int4"]
+default = "fp16"
+
+[models."TinyLlama/TinyLlama-1.1B-Chat-v1.0".hf]
+repo_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+filename = "model.safetensors"

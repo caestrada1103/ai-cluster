@@ -78,7 +78,7 @@ class Settings(BaseSettings):
         "deepseek-7b", description="Default model for inference"
     )
     request_timeout: int = Field(
-        60, description="Request timeout (seconds)", ge=1
+        300, description="Request timeout (seconds)", ge=1
     )
     max_queue_size: int = Field(
         1000, description="Maximum queued requests", ge=1
@@ -95,6 +95,17 @@ class Settings(BaseSettings):
         False, description="Automatically load models on startup"
     )
     
+    # CORS
+    cors_origins: list = Field(
+        default_factory=lambda: ["*"],
+        description="Allowed CORS origins. Use specific origins in production.",
+    )
+
+    # Per-worker concurrency limit
+    max_concurrent_requests_per_worker: int = Field(
+        10, description="Maximum concurrent requests per worker", ge=1
+    )
+
     # Performance
     enable_batching: bool = Field(
         True, description="Enable continuous batching"

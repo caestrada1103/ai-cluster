@@ -45,7 +45,7 @@ pub struct ModelLoaderConfig {
 impl Default for ModelLoaderConfig {
     fn default() -> Self {
         Self {
-            cache_dir: PathBuf::from("./data/models"),
+            cache_dir: PathBuf::from("./models"),
             download_dir: PathBuf::from("./data/downloads"),
             max_concurrent_loads: 2,
             load_timeout_secs: 300,
@@ -112,6 +112,12 @@ impl ModelLoader {
             WorkerError::Resource(format!("Failed to acquire load permit: {}", e))
         })?;
 
+        // Re-check after acquiring semaphore — another task may have loaded it concurrently.
+        if let Some(entry) = self.loaded_models.get(model_name) {
+            info!("Model {} loaded by concurrent task", model_name);
+            return Ok(entry.value().clone());
+        }
+
         info!("Loading model {}...", model_name);
         let model_path = self.get_model_path(model_name).await?;
         let config = self.load_model_config(model_name, model_config, &model_path).await?;
@@ -125,7 +131,13 @@ impl ModelLoader {
             ).await?;
         }
 
-        let device = WgpuDevice::BestAvailable;
+        let device = if let Some(&id) = gpu_ids.first() {
+            WgpuDevice::DiscreteGpu(id as usize)
+        } else {
+            // WgpuDevice::default() is the modern replacement for the deprecated BestAvailable;
+            // it selects the best adapter the wgpu backend can find (DX12/Vulkan/Metal).
+            WgpuDevice::default()
+        };
 
         // Load weights
         let mut weights = self.load_safetensors(&model_name, &device).await?;
@@ -160,7 +172,7 @@ impl ModelLoader {
                 let record = create_llama_record(&mut weights, &llama_config, &device)?;
                 info!("Record created. Initializing Llama...");
                 
-                let model = Llama::new(&llama_config, &device, &model_path).load_record(record);
+                let model = Llama::new(&llama_config, &device, &model_path)?.load_record(record);
                 Arc::new(Mutex::new(model))
             }
             _ => return Err(WorkerError::ModelLoad(format!("Unsupported architecture: {}", config.architecture))),
@@ -190,7 +202,8 @@ impl ModelLoader {
 
         // Check for index (sharded) or single file
         if let Ok(index_path) = repo.get("model.safetensors.index.json").await {
-            let index_content = std::fs::read_to_string(index_path)?;
+            let index_content = tokio::fs::read_to_string(&index_path).await
+                .map_err(|e| WorkerError::ModelLoad(format!("Failed to read index: {}", e)))?;
             let json: serde_json::Value = serde_json::from_str(&index_content)
                 .map_err(|e| WorkerError::ModelLoad(format!("Json error: {}", e)))?;
             
@@ -211,7 +224,7 @@ impl ModelLoader {
         info!("Loading {} safetensors files...", files.len());
 
         for file in files {
-            let data = std::fs::read(file).map_err(|e| WorkerError::ModelLoad(e.to_string()))?;
+            let data = tokio::fs::read(&file).await.map_err(|e| WorkerError::ModelLoad(e.to_string()))?;
             let safetensors = SafeTensors::deserialize(&data).map_err(|e| WorkerError::ModelLoad(e.to_string()))?;
             
             for (name, view) in safetensors.tensors() {
@@ -250,14 +263,18 @@ impl ModelLoader {
         if let Some(api) = &self.hf_api {
              let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
              let config = repo.get("config.json").await.map_err(|e| WorkerError::ModelLoad(e.to_string()))?;
-             return Ok(config.parent().unwrap().to_path_buf());
+             let parent = config.parent().ok_or_else(|| {
+                WorkerError::ModelLoad("config.json path has no parent directory".to_string())
+            })?;
+             return Ok(parent.to_path_buf());
         }
         Err(WorkerError::ModelLoad("No HF API".to_string()))
     }
 
     async fn load_model_config(&self, _name: &str, _provided: Option<&crate::cluster::ModelConfig>, path: &Path) -> Result<ModelConfig, WorkerError> {
         let config_path = path.join("config.json");
-        let s = std::fs::read_to_string(config_path)?;
+        let s = tokio::fs::read_to_string(&config_path).await
+            .map_err(|e| WorkerError::ModelLoad(format!("Failed to read config: {}", e)))?;
         let json: serde_json::Value = serde_json::from_str(&s)?;
         let arch = json["architectures"][0].as_str().unwrap_or("llama").to_lowercase();
         Ok(ModelConfig {
@@ -275,8 +292,20 @@ impl ModelLoader {
         })
     }
 
-    fn calculate_memory_usage(&self, config: &ModelConfig, _q: crate::cluster::Quantization) -> usize {
-        config.num_layers * config.hidden_size * config.hidden_size * 4 * 2 // simplified
+    fn calculate_memory_usage(&self, config: &ModelConfig, q: crate::cluster::Quantization) -> usize {
+        let embed = config.vocab_size * config.hidden_size;
+        let attn = config.num_layers * 4 * config.hidden_size * config.hidden_size;
+        let ffn = config.num_layers * 3 * config.hidden_size * config.intermediate_size;
+        let norm = (config.num_layers * 2 + 1) * config.hidden_size;
+        let params = embed + attn + ffn + norm;
+
+        // Bytes per parameter depends on quantization precision
+        match q {
+            crate::cluster::Quantization::Int4 => params / 2,   // 0.5 bytes/param
+            crate::cluster::Quantization::Int8 => params,       // 1 byte/param
+            crate::cluster::Quantization::Fp8 => params,        // 1 byte/param
+            _ => params * 2,                                     // FP16 = 2 bytes/param
+        }
     }
     
     pub async fn unload_model(&self, model_name: &str) -> Result<(), WorkerError> {

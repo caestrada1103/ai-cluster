@@ -61,6 +61,7 @@ We have end-to-end integration tests in the `tests/` directory.
 ```bash
 python tests/test_client.py
 python tests/cluster_chat.py
+python tests/interactive_chat.py
 ```
 
 ## Helper Scripts
@@ -79,4 +80,10 @@ Please use the GitHub Issue Tracker to report bugs or request features. Provide 
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the MIT License.
+By contributing, you agree that your contributions will be licensed under the Apache License 2.0.
+
+### Contributor License Agreement (CLA)
+
+To accept your contributions, we require you to sign our Contributor License Agreement (CLA). This ensures that we have the necessary rights to use your contribution and can safely distribute the project under the current license.
+
+A bot will prompt you to sign the CLA when you open a Pull Request. We cannot merge any PRs without a signed CLA.

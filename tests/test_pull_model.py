@@ -20,6 +20,7 @@ def register_worker():
 
 def test_chat(worker_id):
     model_name = f"TinyLlama/TinyLlama-1.1B-Chat-v1.0@{worker_id}"
+    # model_name = f"deepseek-7b@{worker_id}"
     print(f"\nSending chat completion request for model: {model_name}")
     print("This might take a minute as the Rust worker automatically downloads the model weights from HuggingFace...")
     

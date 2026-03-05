@@ -121,13 +121,17 @@ class CircuitBreaker:
         self.half_open_requests = 0
         self.total_failures = 0
         self.total_successes = 0
-    
+
+    @property
+    def total_requests(self) -> int:
+        return self.total_failures + self.total_successes
+
     def record_success(self):
         """Record a successful request."""
         self.total_successes += 1
-        
+
         if self.state == self.State.HALF_OPEN:
-            self.half_open_requests -= 1
+            self.half_open_requests = max(0, self.half_open_requests - 1)
             if self.half_open_requests <= 0:
                 logger.info("Circuit breaker closing after successful test")
                 self._close()
@@ -402,6 +406,8 @@ class RequestRouter:
         workers: List[WorkerInfo],
     ) -> WorkerInfo:
         """Select worker with lowest load."""
+        if not workers:
+            raise ValueError("No workers available for selection")
         best_worker = None
         best_score = float('inf')
         

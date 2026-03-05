@@ -22,24 +22,24 @@ The AI Cluster is a distributed system designed to run large language models (LL
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                            Client Applications                        │
-│                    (REST API, Web UI, CLI, SDKs)                     │
+│                          Client Applications                        │
+│                    (REST API, Web UI, CLI, SDKs)                    │
 └────────────────────────────────┬────────────────────────────────────┘
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        Load Balancer (Optional)                       │
-│                         (HAProxy, Nginx, etc.)                        │
+│                      Load Balancer (Optional)                       │
+│                       (HAProxy, Nginx, etc.)                        │
 └────────────────────────────────┬────────────────────────────────────┘
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         Coordinator Cluster                           │
+│                       Coordinator Cluster                           │
 │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐      │
 │  │   Coordinator   │  │   Coordinator   │  │   Coordinator   │      │
 │  │     Primary     │──│    Replica 1    │──│    Replica 2    │      │
 │  └─────────────────┘  └─────────────────┘  └─────────────────┘      │
-│                           (Leader Election)                           │
+│                         (Leader Election)                           │
 └────────────────────────────────┬────────────────────────────────────┘
                                  │
                     ┌────────────┴────────────┐
@@ -51,7 +51,7 @@ The AI Cluster is a distributed system designed to run large language models (LL
 │  │ Worker AMD  │ │ Worker AMD  │  │  │  │Worker NVIDIA│ │Worker NVIDIA│  │
 │  │   GPU 0-3   │ │   GPU 4-7   │  │  │  │   GPU 0-3   │ │   GPU 4-7   │  │
 │  └─────────────┘ └─────────────┘  │  │  └─────────────┘ └─────────────┘  │
-│                                    │  │                                   │
+│                                   │  │                                   │
 │  ┌─────────────┐ ┌─────────────┐  │  │  ┌─────────────┐ ┌─────────────┐  │
 │  │ Worker AMD  │ │ Worker AMD  │  │  │  │Worker NVIDIA│ │Worker NVIDIA│  │
 │  │   CPU Only  │ │  Mixture    │  │  │  │   CPU Only  │ │  Mixture    │  │
@@ -62,16 +62,22 @@ The AI Cluster is a distributed system designed to run large language models (LL
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         Infrastructure Layer                          │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐   │
-│  │   Prometheus│ │    Grafana  │ │    Redis    │ │    MinIO    │   │
-│  │   Metrics   │ │  Dashboards │ │    Cache    │ │Model Storage│   │
-│  └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘   │
+│                 Implementation Layer (Current)                      │
+│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐                   │
+│   │   Prometheus│ │    Grafana  │ │    Consul   │                   │
+│   │    (Docker) │ │   (Docker)  │ │   Discovery │                   │
+│   └─────────────┘ └─────────────┘ └─────────────┘                   │
 │                                                                     │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐   │
-│  │    Jaeger   │ │    Consul   │ │    Vault    │ │   Elastic   │   │
-│  │   Tracing   │ │   Discovery │ │   Secrets   │ │    Logs     │   │
-│  └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘   │
+│                 Infrastructure Layer (Roadmap)                      │
+│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐   │
+│   │    Redis    │ │    MinIO    │ │    Jaeger   │ │    Vault    │   │
+│   │    Cache    │ │Model Storage│ │   Tracing   │ │   Secrets   │   │
+│   └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘   │
+│                                                                     │
+│   ┌─────────────┐                                                   │
+│   │   Elastic   │                                                   │
+│   │    Logs     │                                                   │
+│   └─────────────┘                                                   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -104,26 +110,26 @@ The coordinator is the brain of the cluster, written in Python using FastAPI.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                     Coordinator                          │
+│                     Coordinator                         │
 ├─────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
-│  │    FastAPI  │  │   gRPC      │  │  Prometheus │    │
-│  │   Endpoints │  │   Client    │  │   Metrics   │    │
-│  └─────────────┘  └─────────────┘  └─────────────┘    │
-│         │               │               │              │
-│  ┌──────▼───────────────▼───────────────▼──────┐     │
-│  │           ClusterCoordinator Core           │     │
-│  │  • Worker Management    • Request Routing   │     │
-│  │  • Health Checks        • Circuit Breakers  │     │
-│  │  • Model Loading        • Queue Management  │     │
-│  └─────────────────────────────────────────────┘     │
-│         │               │               │              │
-│  ┌──────▼───────┐ ┌──────▼───────┐ ┌──────▼───────┐  │
-│  │   Discovery  │ │    Router    │ │    Models    │  │
-│  │   • Static   │ │  • Strategies│ │  • Registry  │  │
-│  │   • mDNS     │ │  • Affinity  │ │  • Configs   │  │
-│  │   • Consul   │ │  • Priorities│ │  • Validation│  │
-│  └──────────────┘ └──────────────┘ └──────────────┘  │
+│    ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│    │    FastAPI  │  │   gRPC      │  │  Prometheus │    │
+│    │   Endpoints │  │   Client    │  │   Metrics   │    │
+│    └─────────────┘  └─────────────┘  └─────────────┘    │
+│           │               │               │             │
+│     ┌─────▼───────────────▼───────────────▼──────┐      │
+│     │           ClusterCoordinator Core          │      │
+│     │  • Worker Management    • Request Routing  │      │
+│     │  • Health Checks        • Circuit Breakers │      │
+│     │  • Model Loading        • Queue Management │      │
+│     └────────────────────────────────────────────┘      │
+│          │                │                │            │
+│   ┌──────▼───────┐ ┌──────▼───────┐ ┌──────▼───────┐    │
+│   │   Discovery  │ │    Router    │ │    Models    │    │
+│   │   • Static   │ │  • Strategies│ │  • Registry  │    │
+│   │   • mDNS     │ │  • Affinity  │ │  • Configs   │    │
+│   │   • Consul   │ │  • Priorities│ │  • Validation│    │
+│   └──────────────┘ └──────────────┘ └──────────────┘    │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -143,33 +149,33 @@ Workers perform the actual inference, written in Rust using the Burn framework.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                       Worker                             │
+│                        Worker                           │
 ├─────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
-│  │   gRPC      │  │   Metrics   │  │   Health    │    │
-│  │   Server    │  │   Server    │  │   Checks    │    │
-│  └─────────────┘  └─────────────┘  └─────────────┘    │
-│         │               │               │              │
-│  ┌──────▼───────────────▼───────────────▼──────┐     │
-│  │              WorkerService Core              │     │
-│  │  • LoadModel     • Infer     • GetStatus    │     │
-│  │  • UnloadModel   • HealthCheck              │     │
-│  └─────────────────────────────────────────────┘     │
-│         │               │               │              │
-│  ┌──────▼───────┐ ┌──────▼───────┐ ┌──────▼───────┐  │
-│  │ GPU Manager  │ │ Model Loader │ │  Parallelism │  │
-│  │ • Detection  │ │ • Download   │ │ • Pipeline   │  │
-│  │ • Memory     │ │ • Convert    │ │ • Tensor     │  │
-│  │ • Streams    │ │ • Cache      │ │ • Data       │  │
-│  │ • P2P        │ │ • Quantize   │ │ • Expert     │  │
-│  └──────────────┘ └──────────────┘ └──────────────┘  │
-│         │               │               │              │
-│  ┌──────▼───────────────▼───────────────▼──────┐     │
-│  │              Model Implementations           │     │
-│  │  • DeepSeek (MoE)    • Llama (GQA)          │     │
-│  │  • Mistral           • Mixtral              │     │
-│  │  • Gemma             • Phi                  │     │
-│  └─────────────────────────────────────────────┘     │
+│   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐     │
+│   │   gRPC      │  │   Metrics   │  │   Health    │     │
+│   │   Server    │  │   Server    │  │   Checks    │     │
+│   └─────────────┘  └─────────────┘  └─────────────┘     │
+│           │               │               │             │
+│    ┌──────▼───────────────▼───────────────▼──────┐      │
+│    │              WorkerService Core             │      │
+│    │  • LoadModel     • Infer     • GetStatus    │      │
+│    │  • UnloadModel   • HealthCheck              │      │
+│    └─────────────────────────────────────────────┘      │
+│          │                │                │            │
+│   ┌──────▼───────┐ ┌──────▼───────┐ ┌──────▼───────┐    │
+│   │ GPU Manager  │ │ Model Loader │ │ Parallelism  │    │
+│   │ • Detection  │ │ • Download   │ │ • Pipeline   │    │
+│   │ • Memory     │ │ • Convert    │ │ • Tensor     │    │
+│   │ • Streams    │ │ • Cache      │ │ • Data       │    │
+│   │ • P2P        │ │ • Quantize   │ │ • Expert     │    │
+│   └──────────────┘ └──────────────┘ └──────────────┘    │
+│           │               │               │             │
+│    ┌──────▼───────────────▼───────────────▼──────┐      │
+│    │              Model Implementations          │      │
+│    │  • DeepSeek (MoE)    • Llama (GQA)          │      │
+│    │  • Mistral           • Mixtral              │      │
+│    │  • Gemma             • Phi                  │      │
+│    └─────────────────────────────────────────────┘      │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -195,43 +201,43 @@ The model layer provides implementations for various architectures.
 ### 1. Worker Discovery
 
 ```
-┌──────────┐                  ┌──────────┐                  ┌──────────┐
-│Coordinator│                  │Discovery │                  │  Worker  │
-│           │                  │ Provider │                  │          │
-└─────┬─────┘                  └─────┬────┘                  └─────┬────┘
+┌───────────┐                  ┌──────────┐                   ┌──────────┐
+│Coordinator│                  │Discovery │                   │  Worker  │
+│           │                  │ Provider │                   │          │
+└─────┬─────┘                  └─────┬────┘                   └─────┬────┘
       │                              │                              │
-      │ Start                         │                              │
-      │──────────────────────────────>│                              │
+      │ Start                        │                              │
+      │─────────────────────────────>│                              │
       │                              │                              │
       │                              │ Broadcast/Query              │
       │                              │─────────────────────────────>│
       │                              │                              │
-      │                              │           Announce/Response  │
+      │                              │        Announce/Response     │
       │                              │<─────────────────────────────│
       │                              │                              │
       │        Worker Found          │                              │
       │<──────────────────────────────                              │
       │                              │                              │
       │ Connect and GetStatus        │                              │
-      │───────────────────────────────────────────────────────────>│
+      │────────────────────────────────────────────────────────────>│
       │                              │                              │
       │           Worker Status      │                              │
-      │<───────────────────────────────────────────────────────────│
+      │<────────────────────────────────────────────────────────────│
       │                              │                              │
       │ Add to active workers        │                              │
-      │──────────────────────────────>│                              │
+      │─────────────────────────────>│                              │
       │                              │                              │
 ```
 
 ### 2. Model Loading
 
 ```
-┌──────────┐                  ┌──────────┐                  ┌──────────┐
-│Coordinator│                  │  Worker  │                  │   GPU    │
-│           │                  │          │                  │  Memory  │
-└─────┬─────┘                  └─────┬────┘                  └─────┬────┘
+┌───────────┐                  ┌──────────┐                   ┌──────────┐
+│Coordinator│                  │  Worker  │                   │   GPU    │
+│           │                  │          │                   │  Memory  │
+└─────┬─────┘                  └─────┬────┘                   └─────┬────┘
       │                              │                              │
-      │ LoadModel Request             │                              │
+      │ LoadModel Request            │                              │
       │─────────────────────────────>│                              │
       │                              │                              │
       │                              │ Check available memory       │
@@ -256,7 +262,7 @@ The model layer provides implementations for various architectures.
       │                              │  │ Create compute graph      │
       │                              │<─┘                           │
       │                              │                              │
-      │ LoadModel Response            │                              │
+      │ LoadModel Response           │                              │
       │<─────────────────────────────│                              │
       │                              │                              │
 ```
@@ -264,11 +270,11 @@ The model layer provides implementations for various architectures.
 ### 3. Inference Request
 
 ```
-┌──────────┐                  ┌──────────┐                  ┌──────────┐
+┌──────────┐                  ┌───────────┐                  ┌──────────┐
 │  Client  │                  │Coordinator│                  │  Worker  │
-└────┬─────┘                  └─────┬────┘                  └─────┬────┘
+└────┬─────┘                  └─────┬─────┘                  └─────┬────┘
      │                              │                              │
-     │ POST /v1/completions          │                              │
+     │ POST /v1/completions         │                              │
      │─────────────────────────────>│                              │
      │                              │                              │
      │                              │ Select worker                │
@@ -288,13 +294,13 @@ The model layer provides implementations for various architectures.
      │                              │ Stream Response (tokens)     │
      │                              │<─────────────────────────────│
      │                              │                              │
-     │ HTTP Stream Response          │                              │
+     │ HTTP Stream Response         │                              │
      │<─────────────────────────────│                              │
      │                              │                              │
-     │                              │ Complete                      │
+     │                              │ Complete                     │
      │                              │<─────────────────────────────│
      │                              │                              │
-     │ Complete Response             │                              │
+     │ Complete Response            │                              │
      │<─────────────────────────────│                              │
      │                              │                              │
 ```
@@ -359,60 +365,62 @@ pub struct ModelConfig {
 
 ## Parallelism Strategies
 
-### 1. Pipeline Parallelism
+> **Note on Implementation Status**: The AI Cluster natively supports **Data Parallelism** (running independent models on multiple workers, either on the same machine or across the network). The implementations for **Pipeline, Tensor, and Expert Parallelism** within a single worker are active roadmap items utilizing the `burn` framework's multi-device capabilities.
+
+### 1. Pipeline Parallelism (Planned)
 
 Splits model layers across multiple GPUs.
 
 ```
-                    Pipeline Parallelism
-┌─────────────────────────────────────────────────────────┐
-│                      Input Batch                         │
-│                          │                               │
-│                          ▼                               │
+                  Pipeline Parallelism
+┌────────────────────────────────────────────────────────┐
+│                     Input Batch                        │
+│                         │                              │
+│                         ▼                              │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
 │  │   GPU 0      │  │   GPU 1      │  │   GPU 2      │  │
 │  │  Layers 0-10 │─>│ Layers 11-20 │─>│ Layers 21-30 │  │
 │  └──────────────┘  └──────────────┘  └──────────────┘  │
-│                          │                               │
-│                          ▼                               │
-│                     Output Batch                          │
-└─────────────────────────────────────────────────────────┘
+│                          │                             │
+│                          ▼                             │
+│                     Output Batch                       │
+└────────────────────────────────────────────────────────┘
 
 Micro-batching for efficiency:
-┌─────────────────────────────────────────────────────────┐
-│ Batch: [MB0][MB1][MB2][MB3]                              │
-│                                                          │
-│ GPU0: MB0 FWD → GPU1: MB0 FWD → GPU2: MB0 FWD           │
-│       MB1 FWD → GPU1: MB1 FWD → GPU2: MB1 FWD           │
-│       MB2 FWD → GPU1: MB2 FWD → GPU2: MB2 FWD           │
-│       MB3 FWD → GPU1: MB3 FWD → GPU2: MB3 FWD           │
-└─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│ Batch: [MB0][MB1][MB2][MB3]                           │
+│                                                       │
+│ GPU0: MB0 FWD → GPU1: MB0 FWD → GPU2: MB0 FWD         │
+│       MB1 FWD → GPU1: MB1 FWD → GPU2: MB1 FWD         │
+│       MB2 FWD → GPU1: MB2 FWD → GPU2: MB2 FWD         │
+│       MB3 FWD → GPU1: MB3 FWD → GPU2: MB3 FWD         │
+└───────────────────────────────────────────────────────┘
 ```
 
-### 2. Tensor Parallelism
+### 2. Tensor Parallelism (Planned)
 
 Splits individual tensors across multiple GPUs.
 
 ```
                     Tensor Parallelism
-┌─────────────────────────────────────────────────────────┐
-│                      Input X [N, D]                      │
-│                          │                               │
-│        ┌─────────────────┼─────────────────┐            │
-│        ▼                 ▼                 ▼            │
-│  ┌───────────┐     ┌───────────┐     ┌───────────┐     │
-│  │   GPU 0   │     │   GPU 1   │     │   GPU 2   │     │
-│  │  X[:,0:D/3]│     │X[:,D/3:2D/3]│     │X[:,2D/3:D]│     │
-│  │   W0 [D/3,4D]│   │   W1 [D/3,4D]│   │   W2 [D/3,4D]│   │
-│  │   Y0 = X0·W0 │   │   Y1 = X1·W1 │   │   Y2 = X2·W2 │   │
-│  └───────┬───────┘  └───────┬───────┘  └───────┬───────┘  │
-│          └──────────────────┼──────────────────┘          │
-│                             ▼                              │
-│                    All-Reduce Y = Y0+Y1+Y2                 │
-│                             │                              │
-│                             ▼                              │
-│                      Output Y [N,4D]                       │
-└─────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────┐
+│                      Input X [N, D]                    │
+│                          │                             │
+│        ┌─────────────────┼─────────────────┐           │
+│        ▼                 ▼                 ▼           │
+│  ┌────────────┐    ┌──────────────┐   ┌─────────────┐  │
+│  │   GPU 0    │    │   GPU 1      │   │   GPU 2     │  │
+│  │ X[:,0:D/3] │    │ X[:,D/3:2D/3]│   │ X[:,2D/3:D] │  │
+│  │ W0 [D/3,4D]│    │ W1 [D/3,4D]  │   │ W2 [D/3,4D] │  │
+│  │ Y0 = X0·W0 │    │ Y1 = X1·W1   │   │ Y2 = X2·W2  │  │
+│  └───────┬────┘    └────────┬─────┘   └───────┬─────┘  │
+│          └──────────────────┼─────────────────┘        │
+│                             ▼                          │
+│                    All-Reduce Y = Y0+Y1+Y2             │
+│                             │                          │
+│                             ▼                          │
+│                      Output Y [N,4D]                   │
+└────────────────────────────────────────────────────────┘
 ```
 
 ### 3. Data Parallelism
@@ -421,54 +429,54 @@ Replicates model across GPUs, splits batch.
 
 ```
                     Data Parallelism
-┌─────────────────────────────────────────────────────────┐
-│                      Input Batch                         │
-│                          │                               │
-│        ┌─────────────────┼─────────────────┐            │
-│        ▼                 ▼                 ▼            │
-│  ┌───────────┐     ┌───────────┐     ┌───────────┐     │
-│  │   GPU 0   │     │   GPU 1   │     │   GPU 2   │     │
-│  │  Model    │     │  Model    │     │  Model    │     │
-│  │  Copy     │     │  Copy     │     │  Copy     │     │
-│  │           │     │           │     │           │     │
-│  │ Batch 0-33│     │ Batch 34-66│     │ Batch 67-99│    │
-│  │ Inference │     │ Inference │     │ Inference │     │
-│  └───────┬───┘     └───────┬───┘     └───────┬───┘     │
-│          └──────────────────┼──────────────────┘          │
-│                             ▼                              │
-│                    Concatenate Results                     │
-│                             │                              │
-│                             ▼                              │
-│                      Output Batch                          │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                      Input Batch                     │
+│                          │                           │
+│        ┌─────────────────┼─────────────────┐         │
+│        ▼                 ▼                 ▼         │
+│  ┌───────────┐     ┌────────────┐    ┌────────────┐  │
+│  │   GPU 0   │     │   GPU 1    │    │   GPU 2    │  │
+│  │  Model    │     │  Model     │    │  Model     │  │
+│  │  Copy     │     │  Copy      │    │  Copy      │  │
+│  │           │     │            │    │            │  │
+│  │ Batch 0-33│     │ Batch 34-66│    │ Batch 67-99│  │
+│  │ Inference │     │ Inference  │    │ Inference  │  │
+│  └───────┬───┘     └──────┬─────┘    └───────┬────┘  │
+│          └────────────────┼──────────────────┘       │
+│                           ▼                          │
+│                  Concatenate Results                 │
+│                           │                          │
+│                           ▼                          │
+│                    Output Batch                      │
+└──────────────────────────────────────────────────────┘
 ```
 
-### 4. Expert Parallelism (MoE)
+### 4. Expert Parallelism (MoE) (Planned)
 
 Distributes experts across GPUs for Mixture of Experts models.
 
 ```
                     Expert Parallelism
 ┌─────────────────────────────────────────────────────────┐
-│                      Input Tokens                        │
-│                          │                               │
-│                    Router/Gate                           │
-│        ┌─────────────────┼─────────────────┐            │
-│        ▼                 ▼                 ▼            │
-│  ┌───────────┐     ┌───────────┐     ┌───────────┐     │
-│  │   GPU 0   │     │   GPU 1   │     │   GPU 2   │     │
-│  │ Experts   │     │ Experts   │     │ Experts   │     │
-│  │ 0-3       │     │ 4-7       │     │ 8-11      │     │
-│  │           │     │           │     │           │     │
-│  │ Tokens →  │     │ Tokens →  │     │ Tokens →  │     │
-│  │ Expert 2  │     │ Expert 5  │     │ Expert 9  │     │
-│  └───────┬───┘     └───────┬───┘     └───────┬───┘     │
-│          └──────────────────┼──────────────────┘          │
-│                             ▼                              │
-│                    Combine Expert Outputs                  │
-│                             │                              │
-│                             ▼                              │
-│                      Output Tokens                         │
+│                      Input Tokens                       │
+│                            │                            │
+│                      Router/Gate                        │
+│          ┌─────────────────┼─────────────────┐          │
+│          ▼                 ▼                 ▼          │
+│    ┌───────────┐     ┌───────────┐     ┌───────────┐    │
+│    │   GPU 0   │     │   GPU 1   │     │   GPU 2   │    │
+│    │ Experts   │     │ Experts   │     │ Experts   │    │
+│    │ 0-3       │     │ 4-7       │     │ 8-11      │    │
+│    │           │     │           │     │           │    │
+│    │ Tokens →  │     │ Tokens →  │     │ Tokens →  │    │
+│    │ Expert 2  │     │ Expert 5  │     │ Expert 9  │    │
+│    └──────┬────┘     └──────┬────┘     └──────┬────┘    │
+│           └─────────────────┼─────────────────┘         │
+│                             ▼                           │
+│                    Combine Expert Outputs               │
+│                             │                           │
+│                             ▼                           │
+│                       Output Tokens                     │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -479,24 +487,24 @@ Distributes experts across GPUs for Mixture of Experts models.
 ### 1. Single Machine, Multiple GPUs
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Single Server                         │
-│  ┌─────────────────────────────────────────────────┐   │
-│  │              Coordinator Container               │   │
-│  │              Port: 8000, 9090                    │   │
-│  └─────────────────────┬───────────────────────────┘   │
-│                        │                                 │
-│  ┌─────────────────────┼───────────────────────────┐   │
-│  │    GPU 0    │    GPU 1    │    GPU 2    │    GPU 3 │   │
-│  │ Worker 0    │ Worker 1    │ Worker 2    │ Worker 3 │   │
-│  │ Port: 50051 │ Port: 50052 │ Port: 50053 │ Port: 50054 │
-│  └─────────────┴─────────────┴─────────────┴─────────────┘   │
-│                        │                                 │
-│  ┌─────────────────────┴───────────────────────────┐   │
-│  │         Prometheus │ Grafana │ Redis            │   │
-│  │         Ports: 9090, 3000, 6379                 │   │
-│  └─────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│                      Single Server                         │
+│    ┌─────────────────────────────────────────────────┐     │
+│    │              Coordinator Container              │     │
+│    │              Port: 8000, 9090                   │     │
+│    └──────────────────────┬──────────────────────────┘     │
+│                           │                                │
+│  ┌─────────────┬──────────┴──┬─────────────┬─────────────┐ │
+│  │    GPU 0    │    GPU 1    │    GPU 2    │    GPU 3    │ │
+│  │ Worker 0    │ Worker 1    │ Worker 2    │ Worker 3    │ │
+│  │ Port: 50051 │ Port: 50052 │ Port: 50053 │ Port: 50054 │ │
+│  └─────────────┴─────────────┴─────────────┴─────────────┘ │
+│                            │                               │
+│    ┌───────────────────────┴─────────────────────────┐     │
+│    │         Prometheus │ Grafana │ Redis            │     │
+│    │         Ports: 9090, 3000, 6379                 │     │
+│    └─────────────────────────────────────────────────┘     │
+└────────────────────────────────────────────────────────────┘
 ```
 
 ### 2. Multi-Machine Cluster
@@ -517,10 +525,10 @@ Distributes experts across GPUs for Mixture of Experts models.
          │                       │                       │
          └───────────────────────┼───────────────────────┘
                                  │
-                         ┌───────▼───────┐
-                         │    Network    │
-                         │  10GbE/InfiniBand│
-                         └───────────────┘
+                         ┌───────▼─────────┐
+                         │   Network       │
+                         │ 10GbE/InfiniBand│
+                         └─────────────────┘
 ```
 
 ### 3. Kubernetes Deployment
@@ -560,16 +568,16 @@ spec:
 
 ### 1. Memory Management
 
-- **Paged KV Cache**: Reduces memory usage by 50-70% for long sequences
-- **Memory Pooling**: Reuses GPU memory allocations
-- **Quantization**: INT8 reduces memory by 75%, INT4 by 87.5%
+- **Quantization (Implemented)**: INT8 reduces memory by 75%, INT4 by 87.5%
+- **Memory Pooling (Implemented)**: Reuses GPU memory allocations
+- **Paged KV Cache (Roadmap)**: Planned implementation to reduce memory usage by 50-70% for long sequences
 
 ### 2. Latency Optimization
 
-- **Continuous Batching**: 2-3x throughput improvement
-- **Speculative Decoding**: 2-3x speedup for generation
-- **Flash Attention**: 2-4x faster attention computation
-- **Tensor Core Utilization**: 2x speedup on supported hardware
+- **Tensor Core Utilization (Implemented)**: 2x speedup on supported hardware
+- **Continuous Batching (Roadmap)**: Planned to provide 2-3x throughput improvement
+- **Speculative Decoding (Roadmap)**: Planned logic for 2-3x speedup for generation
+- **Flash Attention (Roadmap)**: Planned integration for 2-4x faster attention computation
 
 ### 3. Throughput Scaling
 
@@ -617,10 +625,13 @@ spec:
 
 ### 3. Data Security
 
-- **Model Encryption**: Encrypted model weights at rest
 - **Memory Isolation**: Processes run in separate memory spaces
 - **Secure Erasure**: Memory zeroed after model unloading
 - **Audit Logging**: All access logged for compliance
+
+*(Roadmap)* 
+- **Model Encryption**: Encrypted model weights at rest
+- **Secrets Management**: Vault integration for securely managing API keys
 
 ---
 
@@ -640,53 +651,55 @@ spec:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  AI Cluster Overview Dashboard                           │
+│  AI Cluster Overview Dashboard                          │
 ├─────────────────────────────────────────────────────────┤
-│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐       │
-│ │ Active Reqs │ │ Queue Size  │ │ Error Rate  │       │
-│ │     12      │ │      3      │ │    0.1%     │       │
-│ └─────────────┘ └─────────────┘ └─────────────┘       │
+│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐       │
+│   │ Active Reqs │ │ Queue Size  │ │ Error Rate  │       │
+│   │     12      │ │      3      │ │    0.1%     │       │
+│   └─────────────┘ └─────────────┘ └─────────────┘       │
 │                                                         │
-│ ┌─────────────────────────────────────────────────┐   │
-│ │ Request Rate (requests/sec)                     │   │
-│ │   ████▁▁▁▁████▁▁▁▁████▁▁▁▁████▁▁▁▁               │   │
-│ └─────────────────────────────────────────────────┘   │
+│   ┌─────────────────────────────────────────────────┐   │
+│   │ Request Rate (requests/sec)                     │   │
+│   │   ████▁▁▁▁████▁▁▁▁████▁▁▁▁████▁▁▁▁              │   │
+│   └─────────────────────────────────────────────────┘   │
 │                                                         │
-│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐       │
-│ │ GPU 0       │ │ GPU 1       │ │ GPU 2       │       │
-│ │ 75% Util    │ │ 82% Util    │ │ 45% Util    │       │
-│ │ 65°C        │ │ 68°C        │ │ 52°C        │       │
-│ └─────────────┘ └─────────────┘ └─────────────┘       │
+│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐       │
+│   │ GPU 0       │ │ GPU 1       │ │ GPU 2       │       │
+│   │ 75% Util    │ │ 82% Util    │ │ 45% Util    │       │
+│   │ 65°C        │ │ 68°C        │ │ 52°C        │       │
+│   └─────────────┘ └─────────────┘ └─────────────┘       │
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 3. Tracing with Jaeger
+### 3. Distributed Tracing (Roadmap)
+
+Jaeger integration is planned for providing end-to-end tracing functionality.
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│ Trace: inference-123456                                 │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│ Coordinator: route_request ─────────────────────┐      │
-│   [2ms]                                          │      │
-│                                                  │      │
-│ Worker: load_model                               │      │
-│   [150ms]                                        │      │
-│                                                  │      │
-│ Worker: infer ────────────────────────────────┐ │      │
-│   [450ms]                                      │ │      │
-│   ├─ tokenization [2ms]                        │ │      │
-│   ├─ forward_pass [400ms]                       │ │      │
-│   │   ├─ attention [150ms]                      │ │      │
-│   │   ├─ mlp [120ms]                             │ │      │
-│   │   └─ moe_routing [130ms]                     │ │      │
-│   └─ sampling [48ms]                             │ │      │
-│                                                  │ │      │
-│ Coordinator: stream_response ───────────────────┘ │      │
-│   [5ms]                                            │      │
-│                                                    │      │
-│ Total: 607ms                                       │      │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│ Trace: inference-123456 (Planned View)              │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│ Coordinator: route_request ──────────────────┐      │
+│   [2ms]                                      │      │
+│                                              │      │
+│ Worker: load_model                           │      │
+│   [150ms]                                    │      │
+│                                              │      │
+│ Worker: infer ─────────────────────────────┐ │      │
+│   [450ms]                                  │ │      │
+│   ├─ tokenization [2ms]                    │ │      │
+│   ├─ forward_pass [400ms]                  │ │      │
+│   │   ├─ attention [150ms]                 │ │      │
+│   │   ├─ mlp [120ms]                       │ │      │
+│   │   └─ moe_routing [130ms]               │ │      │
+│   └─ sampling [48ms]                       │ │      │
+│                                            │ │      │
+│ Coordinator: stream_response ──────────────┘ │      │
+│   [5ms]                                      │      │
+│                                              │      │
+│ Total: 607ms                                 │      │
+└─────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -696,9 +709,9 @@ spec:
 ### 1. Worker Failure
 
 ```
-┌──────────┐      ┌──────────┐      ┌──────────┐
+┌───────────┐      ┌──────────┐      ┌──────────┐
 │Coordinator│      │ Worker 1 │      │ Worker 2 │
-└─────┬────┘      └─────┬────┘      └─────┬────┘
+└─────┬─────┘      └─────┬────┘      └──────┬───┘
       │                  │                  │
       │ Health Check     │                  │
       │─────────────────>│                  │
