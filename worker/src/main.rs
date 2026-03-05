@@ -18,6 +18,7 @@ use tonic::transport::Server;
 use tracing::{info, warn, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+/// Burn backend selection (wgpu / CUDA / ROCm / ndarray).
 pub mod backend;
 mod config;
 mod error;
@@ -30,6 +31,7 @@ mod parallelism;
 mod worker;
 
 /// Generated protobuf code
+#[allow(missing_docs)]
 pub mod cluster {
     tonic::include_proto!("cluster");
 }
@@ -203,7 +205,6 @@ async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Re
     let metrics_server = MetricsServer::new(
         args.metrics_port,
         gpu_manager.clone(),
-        Arc::new(worker_service.clone()),
     );
     tokio::spawn(async move {
         if let Err(e) = metrics_server.run().await {

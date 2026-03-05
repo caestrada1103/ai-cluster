@@ -3,7 +3,6 @@
 //! This module provides Prometheus metrics for monitoring worker performance,
 //! GPU utilization, request statistics, and more.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +21,6 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use tracing::info;
 
 use crate::gpu_manager::GPUManager;
-use crate::worker::WorkerService;
 
 /// Metrics registry and server
 #[derive(Clone)]
@@ -118,25 +116,6 @@ impl Metrics {
         );
     }
 
-    /// Update GPU metrics
-    pub fn update_gpu_metrics(&self, gpu_id: usize, utilization: f32, memory_used: u64, temperature: f32, power: u32) {
-        let gpu_label = gpu_id.to_string();
-        gauge!("worker_gpu_utilization_percent", utilization as f64, "gpu" => gpu_label.clone());
-        gauge!("worker_gpu_memory_used_bytes", memory_used as f64, "gpu" => gpu_label.clone());
-        gauge!("worker_gpu_temperature_celsius", temperature as f64, "gpu" => gpu_label.clone());
-        gauge!("worker_gpu_power_watts", power as f64, "gpu" => gpu_label);
-    }
-
-    /// Set active requests
-    pub fn set_active_requests(&self, count: i64) {
-        gauge!("worker_active_requests", count as f64);
-    }
-
-    /// Set loaded models count
-    pub fn set_loaded_models(&self, count: i64) {
-        gauge!("worker_loaded_models", count as f64);
-    }
-
     /// Set model memory usage
     pub fn set_model_memory(&self, model_name: &str, memory_bytes: i64) {
         gauge!(
@@ -153,20 +132,6 @@ impl Metrics {
         );
     }
 
-    /// Record batch size
-    pub fn record_batch_size(&self, size: usize) {
-        histogram!("worker_batch_size", size as f64);
-    }
-
-    /// Record error
-    pub fn record_error(&self, error_type: &str) {
-        counter!("worker_errors_total", 1, "type" => error_type.to_string());
-    }
-
-    /// Record queue size
-    pub fn set_queue_size(&self, size: i64) {
-        gauge!("worker_queue_size", size as f64);
-    }
 }
 
 /// Metrics HTTP handler
@@ -191,56 +156,9 @@ async fn metrics_handler(
     }
 }
 
-/// Custom metrics recorder for detailed GPU stats
-pub struct GPUMetricsCollector {
-    gpu_manager: Arc<GPUManager>,
-}
-
-impl GPUMetricsCollector {
-    pub fn new(gpu_manager: Arc<GPUManager>) -> Self {
-        Self { gpu_manager }
-    }
-
-    pub async fn collect(&self) -> HashMap<String, f64> {
-        let mut metrics = HashMap::new();
-
-        for gpu_info in self.gpu_manager.get_all_gpu_info().await {
-            metrics.insert(
-                format!("gpu_{}_utilization", gpu_info.id),
-                gpu_info.utilization as f64,
-            );
-            metrics.insert(
-                format!("gpu_{}_memory_used_gb", gpu_info.id),
-                (gpu_info.total_memory - gpu_info.available_memory) as f64 / 1e9
-            );
-            metrics.insert(
-                format!("gpu_{}_temperature", gpu_info.id),
-                gpu_info.temperature as f64
-            );
-            metrics.insert(
-                format!("gpu_{}_power_watts", gpu_info.id),
-                gpu_info.power_usage as f64
-            );
-        }
-
-        metrics
-    }
-}
-
 /// Health check endpoint for Kubernetes
 pub async fn health_check() -> impl IntoResponse {
     "OK"
-}
-
-/// Readiness probe endpoint
-pub async fn readiness_check(
-    State(worker_service): State<Arc<WorkerService>>,
-) -> impl IntoResponse {
-    if worker_service.is_healthy().await {
-        "READY"
-    } else {
-        "NOT READY"
-    }
 }
 
 /// Liveness probe endpoint
@@ -251,7 +169,6 @@ pub async fn liveness_check() -> impl IntoResponse {
 #[derive(Clone)]
 struct MetricsAppState {
     gpu_manager: Arc<GPUManager>,
-    worker_service: Arc<WorkerService>,
     prometheus_handle: Option<Arc<PrometheusHandle>>,
 }
 
@@ -259,7 +176,6 @@ struct MetricsAppState {
 pub struct MetricsServer {
     port: u16,
     gpu_manager: Arc<GPUManager>,
-    worker_service: Arc<WorkerService>,
 }
 
 impl MetricsServer {
@@ -267,12 +183,10 @@ impl MetricsServer {
     pub fn new(
         port: u16,
         gpu_manager: Arc<GPUManager>,
-        worker_service: Arc<WorkerService>,
     ) -> Self {
         Self {
             port,
             gpu_manager,
-            worker_service,
         }
     }
 
@@ -284,7 +198,6 @@ impl MetricsServer {
 
         let state = Arc::new(MetricsAppState {
             gpu_manager: self.gpu_manager.clone(),
-            worker_service: self.worker_service.clone(),
             prometheus_handle: Some(Arc::new(handle)),
         });
 

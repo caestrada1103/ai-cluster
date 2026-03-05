@@ -3,12 +3,14 @@
 //! DeepSeek models use Mixture of Experts (MoE) architecture with
 //! specialized routing and load balancing mechanisms.
 
+#![allow(dead_code)]
+
 use burn::{
     module::{Module, Ignored},
     nn::{Linear, LinearConfig, Embedding, EmbeddingConfig},
     tensor::{backend::Backend, Tensor},
 };
-use super::{Model, ModelConfig, ModelOutput, ModelInput, TokenStream};
+use super::ModelConfig;
 use super::common::{RMSNorm, RotaryEmbedding, swiglu, repeat_kv};
 use crate::error::WorkerError;
 
@@ -18,18 +20,13 @@ use crate::error::WorkerError;
 
 /// Expert activation functions
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub enum ExpertActivation {
     /// GELU activation
     Gelu,
     /// SiLU activation (SwiGLU)
+    #[default]
     Silu,
-}
-
-impl Default for ExpertActivation {
-    fn default() -> Self {
-        Self::Silu
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -457,31 +454,3 @@ impl<B: Backend> DeepSeek<B> {
     }
 }
 
-impl<B: Backend> Model<B> for DeepSeek<B> {
-    fn name(&self) -> &str {
-        "deepseek"
-    }
-
-    fn config(&self) -> ModelConfig {
-        self.config.to_model_config()
-    }
-
-    fn forward(&self, input: ModelInput<B>) -> Result<ModelOutput<B>, WorkerError> {
-        Ok(self.forward_pass(input, 0))
-    }
-
-    fn generate(
-        &self,
-        _prompt: &str,
-        max_tokens: usize,
-        _temperature: f32,
-        _top_p: f32,
-        _top_k: usize,
-    ) -> Result<TokenStream, WorkerError> {
-        Ok(TokenStream::new(max_tokens))
-    }
-
-    fn memory_used(&self) -> usize {
-        self.memory_usage()
-    }
-}

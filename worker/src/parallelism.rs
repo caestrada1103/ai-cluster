@@ -3,6 +3,10 @@
 //! Implements three parallelism modes for Llama-family models:
 //!
 //! * **Tensor parallelism** (Megatron-LM style) — column/row-parallel projections
+
+#![allow(dead_code)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::needless_range_loop)]
 //!   with KV-cache-aware autoregressive generation.
 //! * **Pipeline parallelism** — layer partitioning across stages with sequential
 //!   activation passing.
@@ -46,20 +50,11 @@
 //! [`LocalAllReduce`] sums partials on the same device.  A real multi-GPU
 //! deployment would implement an `NcclAllReduce` or `WgpuAllReduce` variant.
 
-use std::sync::Arc;
-use std::pin::Pin;
-use tokio::sync::Mutex;
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
-use tracing::warn;
-use futures::Stream;
-use async_stream::stream;
 
-use crate::error::WorkerError;
-use crate::models::{Model, ModelOutput, ModelInput};
-use crate::models::common::{repeat_kv, top_k_top_p_sample};
+use crate::models::common::repeat_kv;
 use crate::models::llama::{Llama, KvEntry};
-use crate::gpu_manager::GPUManager;
 
 // ---------------------------------------------------------------------------
 // TP-distributed KV cache
@@ -116,277 +111,7 @@ pub enum ParallelStrategy {
     ExpertParallel,
 }
 
-// ---------------------------------------------------------------------------
-// ParallelModel
-// ---------------------------------------------------------------------------
 
-/// A wrapper around a model that handles parallel execution.
-pub struct ParallelModel<B: Backend> {
-    /// The underlying model (wrapped in Mutex because Burn models are !Sync)
-    model: Arc<Mutex<dyn Model<B>>>,
-
-    /// The parallelism strategy
-    strategy: ParallelStrategy,
-
-    /// The GPU manager
-    gpu_manager: Arc<GPUManager>,
-
-    /// The device IDs this model is running on
-    device_ids: Vec<usize>,
-}
-
-impl<B: Backend> ParallelModel<B> {
-    /// Create a new parallel model wrapper
-    pub fn new(
-        model: Arc<Mutex<dyn Model<B>>>,
-        strategy: ParallelStrategy,
-        gpu_manager: Arc<GPUManager>,
-        device_ids: Vec<usize>,
-    ) -> Self {
-        Self { model, strategy, gpu_manager, device_ids }
-    }
-
-    /// Forward pass with parallelism handling
-    pub async fn forward(&self, input: ModelInput<B>) -> Result<ModelOutput<B>, WorkerError> {
-        match self.strategy {
-            ParallelStrategy::Single => {
-                let model = self.model.lock().await;
-                model.forward(input)
-            }
-            ParallelStrategy::DataParallel => self.data_parallel_forward(input).await,
-            ParallelStrategy::TensorParallel => self.tensor_parallel_forward(input).await,
-            ParallelStrategy::PipelineParallel => self.pipeline_forward(input).await,
-            ParallelStrategy::ExpertParallel => self.expert_parallel_forward(input).await,
-        }
-    }
-
-    /// Generate text with parallelism handling.
-    ///
-    /// For tensor parallelism, this runs the full TP prefill + decode loop with
-    /// a distributed KV cache.  For pipeline parallelism and expert parallelism,
-    /// generation is not yet supported.  Single/DataParallel delegate to the
-    /// underlying model's generate method.
-    pub async fn generate(
-        &self,
-        prompt: &str,
-        max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        top_k: usize,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<String, WorkerError>> + Send>>, WorkerError> {
-        match self.strategy {
-            ParallelStrategy::TensorParallel => {
-                self.tensor_parallel_generate(
-                    prompt, max_tokens, temperature, top_p, top_k,
-                ).await
-            }
-            ParallelStrategy::PipelineParallel | ParallelStrategy::ExpertParallel => {
-                Err(WorkerError::Parallelism(
-                    "Autoregressive generation is not yet supported for pipeline/expert \
-                     parallelism. Use Single, DataParallel, or TensorParallel."
-                        .into(),
-                ))
-            }
-            _ => {
-                // Single / DataParallel — delegate to Model::generate (dummy TokenStream)
-                let model = self.model.lock().await;
-                let ts = model.generate(prompt, max_tokens, temperature, top_p, top_k)?;
-                // Wrap the TokenStream into a Pin<Box<dyn Stream>> for uniform return type
-                Ok(Box::pin(ts))
-            }
-        }
-    }
-
-    // --- private helpers ---
-
-    async fn data_parallel_forward(
-        &self,
-        input: ModelInput<B>,
-    ) -> Result<ModelOutput<B>, WorkerError> {
-        let model = self.model.lock().await;
-        model.forward(input)
-    }
-
-    /// Tensor-parallel forward.
-    ///
-    /// Downcasts the inner model to `Llama<B>` and delegates to
-    /// [`tensor_parallel_llama_forward`].  Falls back to the standard
-    /// single-GPU forward with a warning for non-Llama architectures.
-    async fn tensor_parallel_forward(
-        &self,
-        input: ModelInput<B>,
-    ) -> Result<ModelOutput<B>, WorkerError> {
-        let n_shards = self.device_ids.len().max(1);
-        let guard = self.model.lock().await;
-
-        if let Some(any) = guard.as_any() {
-            if let Some(llama) = any.downcast_ref::<Llama<B>>() {
-                return Ok(tensor_parallel_llama_forward(llama, input, 0, n_shards));
-            }
-        }
-
-        warn!(
-            "Tensor parallelism requested but model does not expose as_any(); \
-             falling back to single-GPU forward. \
-             Only Llama-family models currently support TP."
-        );
-        guard.forward(input)
-    }
-
-    /// Pipeline-parallel forward.
-    ///
-    /// Partitions transformer layers into stages and forwards activations
-    /// sequentially.  On a real multi-GPU system each stage would run on a
-    /// separate device; the current implementation runs all stages on the
-    /// same device.
-    async fn pipeline_forward(
-        &self,
-        input: ModelInput<B>,
-    ) -> Result<ModelOutput<B>, WorkerError> {
-        let num_stages = self.device_ids.len().max(1);
-        let guard = self.model.lock().await;
-
-        if let Some(any) = guard.as_any() {
-            if let Some(llama) = any.downcast_ref::<Llama<B>>() {
-                return Ok(pipeline_parallel_llama_forward(llama, input, num_stages));
-            }
-        }
-
-        warn!(
-            "Pipeline parallelism requested but model does not expose as_any(); \
-             falling back to single-GPU forward."
-        );
-        guard.forward(input)
-    }
-
-    /// Expert-parallel forward (stub).
-    async fn expert_parallel_forward(
-        &self,
-        _input: ModelInput<B>,
-    ) -> Result<ModelOutput<B>, WorkerError> {
-        Err(WorkerError::Parallelism(
-            "Expert parallelism (MoE) is not yet implemented. \
-             This requires a model with Mixture-of-Experts layers and \
-             an all-to-all token routing mechanism across devices."
-                .into(),
-        ))
-    }
-
-    /// TP autoregressive generation with distributed KV cache.
-    ///
-    /// Downcasts to `Llama<B>`, clones the model (cheap — Burn tensors are
-    /// refcounted), and runs the full prefill + decode loop in a single
-    /// `spawn_blocking` thread with KV cache sharded per-layer per-shard.
-    async fn tensor_parallel_generate(
-        &self,
-        prompt: &str,
-        max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        top_k: usize,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<String, WorkerError>> + Send>>, WorkerError> {
-        let n_shards = self.device_ids.len().max(1);
-        let guard = self.model.lock().await;
-
-        // Downcast to Llama and clone (refcounted tensors — cheap)
-        let llama: Llama<B> = match guard.as_any() {
-            Some(any) => match any.downcast_ref::<Llama<B>>() {
-                Some(l) => l.clone(),
-                None => return Err(WorkerError::Parallelism(
-                    "Only Llama-family models support TP generation.".into(),
-                )),
-            },
-            None => return Err(WorkerError::Parallelism(
-                "Model does not expose as_any() for TP downcast.".into(),
-            )),
-        };
-        drop(guard); // release lock before spawning
-
-        // Tokenize
-        let tokens = llama.tokenize_prompt(prompt)?;
-        let prompt_len = tokens.len();
-
-        let (tx, mut rx) =
-            tokio::sync::mpsc::channel::<Result<String, WorkerError>>(max_tokens + 2);
-
-        tokio::task::spawn_blocking(move || {
-            // ── PREFILL ──────────────────────────────────────────────────────
-            let input_f32: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
-            let device: &<B as burn::tensor::backend::Backend>::Device = &*llama.device;
-            let input = Tensor::<B, 1>::from_floats(input_f32.as_slice(), device)
-                .reshape([1, prompt_len]);
-            let (logits_vec, mut kv_cache) =
-                tensor_parallel_llama_prefill(&llama, input, n_shards);
-
-            // Sampling helper
-            let sample = |logits: &[f32]| -> u32 {
-                if temperature < 0.01 {
-                    logits.iter().enumerate()
-                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                        .map(|(i, _)| i as u32)
-                        .unwrap_or(0)
-                } else {
-                    top_k_top_p_sample(logits, temperature, top_p, top_k) as u32
-                }
-            };
-
-            // Delta text helper
-            let delta_text =
-                |tok_ids: &[u32], prev_len: &mut usize, tokenizer: &tokenizers::Tokenizer|
-                -> Result<String, WorkerError> {
-                    let text = tokenizer.decode(tok_ids, true)
-                        .map_err(|e| WorkerError::Internal(format!("Decode error: {}", e)))?;
-                    let delta = if text.len() > *prev_len {
-                        let mut start = *prev_len;
-                        while start < text.len() && !text.is_char_boundary(start) {
-                            start += 1;
-                        }
-                        if start < text.len() { text[start..].to_string() } else { String::new() }
-                    } else {
-                        String::new()
-                    };
-                    *prev_len = text.len();
-                    Ok(delta)
-                };
-
-            let eos_id: Option<u32> = llama.tokenizer.get_vocab(true).get("</s>").copied();
-
-            // ── FIRST TOKEN ──────────────────────────────────────────────────
-            let first_tok = sample(&logits_vec);
-            let mut all_tokens = tokens;
-            all_tokens.push(first_tok);
-            let mut prev_text_len = 0usize;
-            let _ = tx.blocking_send(delta_text(
-                &all_tokens[prompt_len..], &mut prev_text_len, &llama.tokenizer,
-            ));
-            if eos_id == Some(first_tok) { return; }
-
-            // ── DECODE LOOP ──────────────────────────────────────────────────
-            for _step in 1..max_tokens {
-                let cur_tok = *all_tokens.last().unwrap();
-                let start = all_tokens.len() - 1;
-                let logits = tensor_parallel_llama_decode_step(
-                    &llama, cur_tok, start, n_shards, &mut kv_cache,
-                );
-                let next_tok = sample(&logits);
-                all_tokens.push(next_tok);
-                let _ = tx.blocking_send(delta_text(
-                    &all_tokens[prompt_len..], &mut prev_text_len, &llama.tokenizer,
-                ));
-                if eos_id == Some(next_tok) { break; }
-            }
-        });
-
-        let stream = stream! {
-            while let Some(item) = rx.recv().await {
-                yield item;
-            }
-        };
-        Ok(Box::pin(stream))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -394,7 +119,7 @@ impl<B: Backend> ParallelModel<B> {
 /// ≤ the requested value (GQA correctness).
 fn clamp_shards(num_shards: usize, num_kv_heads: usize) -> usize {
     let mut n = num_shards.min(num_kv_heads).max(1);
-    while n > 1 && num_kv_heads % n != 0 {
+    while n > 1 && !num_kv_heads.is_multiple_of(n) {
         n -= 1;
     }
     if n != num_shards {
@@ -492,7 +217,7 @@ pub fn tensor_parallel_llama_forward<B: Backend>(
 
     let q_per_shard = config.num_attention_heads / num_shards;
     let kv_per_shard = config.num_kv_heads / num_shards;
-    let inter_per_shard = (inter + num_shards - 1) / num_shards;
+    let inter_per_shard = inter.div_ceil(num_shards);
     let global_n_rep = (config.num_attention_heads / config.num_kv_heads).max(1);
 
     let causal_bias = build_causal_bias::<B>(seq_len, &device);
@@ -605,7 +330,7 @@ pub fn tensor_parallel_llama_prefill<B: Backend>(
 
     let q_per_shard = config.num_attention_heads / num_shards;
     let kv_per_shard = config.num_kv_heads / num_shards;
-    let inter_per_shard = (inter + num_shards - 1) / num_shards;
+    let inter_per_shard = inter.div_ceil(num_shards);
     let global_n_rep = (config.num_attention_heads / config.num_kv_heads).max(1);
 
     let causal_bias = build_causal_bias::<B>(seq_len, &device);
@@ -730,7 +455,7 @@ pub fn tensor_parallel_llama_decode_step<B: Backend>(
 
     let q_per_shard = config.num_attention_heads / num_shards;
     let kv_per_shard = config.num_kv_heads / num_shards;
-    let inter_per_shard = (inter + num_shards - 1) / num_shards;
+    let inter_per_shard = inter.div_ceil(num_shards);
     let global_n_rep = (config.num_attention_heads / config.num_kv_heads).max(1);
 
     let input = Tensor::<B, 1>::from_floats([token_id as f32], device)
@@ -852,13 +577,13 @@ pub fn pipeline_parallel_llama_forward<B: Backend>(
 ) -> Tensor<B, 3> {
     let num_layers = model.layers.len();
     let num_stages = num_stages.max(1).min(num_layers);
-    let layers_per_stage = (num_layers + num_stages - 1) / num_stages;
+    let layers_per_stage = num_layers.div_ceil(num_stages);
 
     let [_, seq_len] = input_ids.dims();
     let causal_bias = crate::models::common::build_causal_bias::<B>(seq_len, &model.device);
     let mut x = model.embed_tokens.forward(input_ids.int());
 
-    for (_stage_idx, chunk) in model.layers.chunks(layers_per_stage).enumerate() {
+    for chunk in model.layers.chunks(layers_per_stage) {
         for layer in chunk {
             x = layer.forward(x, &model.rope, 0, causal_bias.as_ref());
         }
@@ -870,21 +595,4 @@ pub fn pipeline_parallel_llama_forward<B: Backend>(
     model.lm_head.forward(x)
 }
 
-// ---------------------------------------------------------------------------
-// create_parallel_model helper
-// ---------------------------------------------------------------------------
 
-/// Wrap a loaded model with the requested parallelism strategy.
-pub async fn create_parallel_model<B: Backend>(
-    model: Arc<Mutex<dyn Model<B>>>,
-    strategy: ParallelStrategy,
-    gpu_manager: Arc<GPUManager>,
-    device_ids: Vec<usize>,
-) -> Result<ParallelModel<B>, WorkerError> {
-    if device_ids.is_empty() {
-        return Err(WorkerError::Configuration(
-            "No devices specified for parallel model".into(),
-        ));
-    }
-    Ok(ParallelModel::new(model, strategy, gpu_manager, device_ids))
-}

@@ -12,53 +12,9 @@ pub mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{info, warn, error, debug, instrument};
 use std::sync::Mutex;
-use burn::tensor::{Tensor, backend::Backend};
+use tracing::debug;
 use crate::error::WorkerError;
-
-/// Type alias for model output (logits: [batch, seq, vocab])
-pub type ModelOutput<B> = Tensor<B, 3>;
-
-/// Type alias for model input (token IDs: [batch, seq])
-pub type ModelInput<B> = Tensor<B, 2>;
-
-/// Trait that all models must implement.
-///
-/// Methods are synchronous because inference is GPU-bound, not I/O-bound.
-/// The surrounding runtime handles async scheduling.
-pub trait Model<B: Backend>: Send + 'static {
-    /// Get the model name
-    fn name(&self) -> &str;
-
-    /// Get the model configuration
-    fn config(&self) -> ModelConfig;
-
-    /// Forward pass through the model
-    fn forward(&self, input: ModelInput<B>) -> Result<ModelOutput<B>, WorkerError>;
-
-    /// Generate text from a prompt  
-    fn generate(
-        &self,
-        prompt: &str,
-        max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        top_k: usize,
-    ) -> Result<TokenStream, WorkerError>;
-
-    /// Get memory usage in bytes
-    fn memory_used(&self) -> usize;
-
-    /// Return a type-erased reference to enable downcasting to concrete types.
-    ///
-    /// Override to return `Some(self)` in architectures that support tensor
-    /// parallelism. The default `None` causes `ParallelModel` to fall back to
-    /// the standard single-GPU forward pass with a warning.
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        None
-    }
-}
 
 /// Configuration common to all models
 #[derive(Debug, Clone)]
@@ -94,12 +50,15 @@ pub struct ModelConfig {
     pub rope_theta: f32,
 
     /// Whether model uses MoE
+    #[allow(dead_code)]
     pub is_moe: bool,
 
     /// Number of experts (for MoE models)
+    #[allow(dead_code)]
     pub num_experts: Option<usize>,
 
     /// Number of experts per token (for MoE models)
+    #[allow(dead_code)]
     pub num_experts_per_tok: Option<usize>,
 }
 
@@ -112,6 +71,9 @@ pub struct ModelConfig {
 use futures::Stream;
 use std::pin::Pin;
 
+/// Pinned, heap-allocated, `Send`-able stream of generated token chunks.
+pub type TextStream = Pin<Box<dyn Stream<Item = Result<String, WorkerError>> + Send>>;
+
 /// Trait for type-erased text generation
 pub trait TextGeneration: Send {
     /// Generate text stream
@@ -122,7 +84,7 @@ pub trait TextGeneration: Send {
         temperature: f32,
         top_p: f32,
         top_k: usize,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<String, WorkerError>> + Send>>, WorkerError>;
+    ) -> Result<TextStream, WorkerError>;
 }
 
 /// A loaded model instance with metadata for lifecycle management.
@@ -205,11 +167,6 @@ impl ModelInstance {
         self.inference_count.load(Ordering::Relaxed)
     }
 
-    /// Increment inference count
-    pub fn record_inference(&self) {
-        self.inference_count.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Generate text (delegates to underlying model)
     pub async fn generate(
         &self,
@@ -218,7 +175,7 @@ impl ModelInstance {
         temperature: f32,
         top_p: f32,
         top_k: usize,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<String, WorkerError>> + Send>>, WorkerError> {
+    ) -> Result<TextStream, WorkerError> {
         if let Some(model) = &self.model {
             let stream = {
                 debug!("ModelInstance::generate starting for {} - waiting for Mutex", self.name);

@@ -4,7 +4,6 @@
 //! and device operations. Uses Burn's wgpu backend by default for
 //! automatic GPU detection across NVIDIA, AMD, and Intel.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,22 +15,6 @@ use std::process::Command;
 
 use crate::cluster::GpuInfo;
 use crate::error::WorkerError;
-
-/// The active backend type, selected at compile time via features.
-///
-/// Default is Wgpu which auto-detects GPU vendor via Vulkan/DX12/Metal.
-/// Users can opt into native CUDA or ROCm for maximum performance.
-#[cfg(feature = "wgpu")]
-pub type ActiveBackend = burn::backend::Wgpu;
-
-#[cfg(all(feature = "cuda", not(feature = "wgpu")))]
-pub type ActiveBackend = burn::backend::Cuda;
-
-#[cfg(all(feature = "rocm", not(feature = "wgpu"), not(feature = "cuda")))]
-pub type ActiveBackend = burn::backend::Rocm;
-
-#[cfg(all(feature = "ndarray", not(feature = "wgpu"), not(feature = "cuda"), not(feature = "rocm")))]
-pub type ActiveBackend = burn::backend::NdArray;
 
 /// GPU device information
 #[derive(Debug, Clone)]
@@ -60,29 +43,18 @@ pub struct GPUDevice {
     /// Device capabilities
     pub capabilities: Vec<String>,
 
-    /// Whether device supports peer-to-peer access
-    pub supports_p2p: bool,
 }
 
 /// GPU memory allocation tracking
 struct MemoryAllocation {
-    /// Size in bytes
-    size: u64,
-
     /// Allocation timestamp
     _timestamp: std::time::Instant,
-
-    /// Owner (model name or request ID)
-    owner: String,
 }
 
 /// GPU Manager — handles device detection and memory tracking
 pub struct GPUManager {
     /// Available GPU devices
     devices: Vec<GPUDevice>,
-
-    /// Device index mapping (original GPU ID → index in devices vec)
-    device_map: HashMap<usize, usize>,
 
     /// Memory allocations per device
     allocations: Arc<DashMap<usize, Vec<MemoryAllocation>>>,
@@ -106,7 +78,6 @@ impl GPUManager {
         info!("Initializing GPU manager with devices: {:?}", gpu_ids);
 
         let mut devices = Vec::new();
-        let mut device_map = HashMap::new();
         let mut memory_locks = Vec::new();
 
         // Detect available devices
@@ -143,7 +114,6 @@ impl GPUManager {
             );
 
             devices.push(device);
-            device_map.insert(gpu_id, idx);
             memory_locks.push(Arc::new(Semaphore::new(1)));
         }
 
@@ -154,7 +124,6 @@ impl GPUManager {
         let num_devices = devices.len();
         Ok(Self {
             devices,
-            device_map,
             allocations: Arc::new(DashMap::new()),
             used_bytes: Arc::new((0..num_devices).map(|_| AtomicU64::new(0)).collect()),
             memory_locks,
@@ -221,7 +190,6 @@ impl GPUManager {
                 temperature: 0.0,
                 power_usage: 0,
                 capabilities: vec!["fp32".to_string()],
-                supports_p2p: false,
             });
         }
 
@@ -235,7 +203,6 @@ impl GPUManager {
                 temperature: 0.0,
                 power_usage: 0,
                 capabilities: vec!["fp32".to_string()],
-                supports_p2p: false,
             });
         }
 
@@ -301,26 +268,6 @@ impl GPUManager {
         None
     }
 
-    /// Try to detect the GPU name from the environment
-    fn detect_gpu_name() -> String {
-        // On Windows, we can try to read GPU info from environment or WMI
-        // For now, report based on active backend
-        #[cfg(feature = "wgpu")]
-        {
-            return "GPU (wgpu auto-detected)".to_string();
-        }
-        #[cfg(feature = "cuda")]
-        {
-            return "NVIDIA GPU (CUDA)".to_string();
-        }
-        #[cfg(feature = "rocm")]
-        {
-            return "AMD GPU (ROCm)".to_string();
-        }
-        #[allow(unreachable_code)]
-        "Unknown GPU".to_string()
-    }
-
     /// Estimate total GPU memory
     /// Since wgpu cannot query VRAM size across all vendors easily yet,
     /// we allow overriding it via environment variable, defaulting to 8GB.
@@ -336,18 +283,6 @@ impl GPUManager {
     /// Get number of GPU devices
     pub fn device_count(&self) -> usize {
         self.devices.len()
-    }
-
-    /// Get device by internal index
-    pub fn get_device(&self, idx: usize) -> Option<&GPUDevice> {
-        self.devices.get(idx)
-    }
-
-    /// Get device by original GPU ID
-    pub fn get_device_by_original_id(&self, original_id: usize) -> Option<&GPUDevice> {
-        self.device_map
-            .get(&original_id)
-            .and_then(|&idx| self.devices.get(idx))
     }
 
     /// Get all GPU info for status reporting (gRPC)
@@ -390,7 +325,6 @@ impl GPUManager {
         &self,
         device_id: usize,
         size: u64,
-        owner: String,
     ) -> Result<(), WorkerError> {
         let _permit = self.memory_locks[device_id]
             .acquire()
@@ -408,9 +342,7 @@ impl GPUManager {
 
         let mut allocations = self.allocations.entry(device_id).or_default();
         allocations.push(MemoryAllocation {
-            size,
             _timestamp: std::time::Instant::now(),
-            owner,
         });
         if let Some(counter) = self.used_bytes.get(device_id) {
             counter.fetch_add(size, Ordering::Relaxed);
@@ -418,48 +350,6 @@ impl GPUManager {
 
         debug!("Allocated {} bytes on GPU {}", size, device_id);
         Ok(())
-    }
-
-    /// Free memory allocated to an owner, updating the atomic running sum.
-    pub async fn free_memory(&self, owner: &str) {
-        for mut entry in self.allocations.iter_mut() {
-            let device_id = *entry.key();
-            let allocations = entry.value_mut();
-            let freed: u64 = allocations.iter()
-                .filter(|a| a.owner == owner)
-                .map(|a| a.size)
-                .sum();
-            allocations.retain(|alloc| alloc.owner != owner);
-            if freed > 0 {
-                if let Some(counter) = self.used_bytes.get(device_id) {
-                    counter.fetch_sub(freed, Ordering::Relaxed);
-                }
-                debug!("Freed {} bytes for {} on GPU {}", freed, owner, device_id);
-            }
-        }
-    }
-
-    /// Get memory usage statistics for a device: (total, available, num_allocations)
-    pub async fn get_memory_stats(&self, device_id: usize) -> (u64, u64, usize) {
-        let device = match self.devices.get(device_id) {
-            Some(d) => d,
-            None => return (0, 0, 0),
-        };
-
-        let allocated: u64 = self
-            .allocations
-            .get(&device_id)
-            .map(|alloc| alloc.value().iter().map(|a| a.size).sum())
-            .unwrap_or(0);
-
-        let available = device.available_memory.saturating_sub(allocated);
-        let count = self
-            .allocations
-            .get(&device_id)
-            .map(|alloc| alloc.value().len())
-            .unwrap_or(0);
-
-        (device.total_memory, available, count)
     }
 
     /// Check if all GPUs are healthy

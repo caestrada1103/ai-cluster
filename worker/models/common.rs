@@ -3,7 +3,6 @@
 //! Re-exported via `pub use common::*` in `mod.rs`.
 
 use burn::module::{Module, Param, ParamId};
-use burn::nn;
 use burn::tensor::{backend::Backend, Tensor};
 
 // ---------------------------------------------------------------------------
@@ -81,6 +80,7 @@ impl<B: Backend> RotaryEmbedding<B> {
     /// Apply rotary embedding to query and key tensors.
     ///
     /// Expects `q` and `k` of shape `[batch, heads, seq_len, head_dim]`.
+    #[allow(clippy::single_range_in_vec_init)]
     pub fn apply(
         &self,
         q: Tensor<B, 4>,
@@ -224,6 +224,7 @@ pub fn top_k_top_p_sample(logits: &[f32], temperature: f32, top_p: f32, top_k: u
 ///
 /// Returns `None` for `seq_len ≤ 1` (single token — no masking needed).
 /// Call this once at the model level and pass the result to each layer.
+#[allow(dead_code)]
 pub fn build_causal_bias<B: Backend>(seq_len: usize, device: &B::Device) -> Option<Tensor<B, 4>> {
     if seq_len <= 1 {
         return None;

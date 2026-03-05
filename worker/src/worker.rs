@@ -75,34 +75,7 @@ impl WorkerService {
         env!("CARGO_PKG_VERSION")
     }
 
-    /// Get number of active requests
-    pub fn active_request_count(&self) -> usize {
-        self.active_requests.len()
-    }
 
-    /// Get loaded model names
-    pub async fn loaded_models(&self) -> Vec<String> {
-        let models = self.loaded_models.read().await;
-        models.keys().cloned().collect()
-    }
-
-    /// Check if worker is healthy
-    pub async fn is_healthy(&self) -> bool {
-        self.gpu_manager.is_healthy().await
-    }
-
-    /// Update metrics from loaded models
-    pub async fn update_metrics(&self) {
-        let models = self.loaded_models.read().await;
-        self.metrics.set_loaded_models(models.len() as i64);
-
-        for (name, model) in models.iter() {
-            self.metrics.set_model_memory(
-                name,
-                model.memory_used() as i64,
-            );
-        }
-    }
 }
 
 #[tonic::async_trait]
@@ -362,8 +335,8 @@ impl Worker for WorkerService {
             gpus: gpu_infos,
             loaded_models,
             cpu_utilization: 0.0,
-            memory_available: memory_available as u64,
-            memory_total: memory_total as u64,
+            memory_available,
+            memory_total,
             active_requests: active_requests as u32,
             queued_requests: 0,
         }))

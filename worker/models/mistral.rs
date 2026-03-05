@@ -3,14 +3,15 @@
 //! Mistral uses Sliding Window Attention (SWA) as its key differentiator
 //! from the standard Llama architecture.
 
+#![allow(dead_code)]
+
 use burn::{
     module::{Module, Ignored},
     nn::{Linear, LinearConfig, Embedding, EmbeddingConfig},
     tensor::{backend::Backend, Tensor},
 };
-use super::{Model, ModelConfig, ModelOutput, ModelInput, TokenStream};
+use super::ModelConfig;
 use super::common::{RMSNorm, RotaryEmbedding, swiglu};
-use crate::error::WorkerError;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -339,31 +340,3 @@ impl<B: Backend> Mistral<B> {
     }
 }
 
-impl<B: Backend> Model<B> for Mistral<B> {
-    fn name(&self) -> &str {
-        "mistral"
-    }
-
-    fn config(&self) -> ModelConfig {
-        self.config.to_model_config()
-    }
-
-    fn forward(&self, input: ModelInput<B>) -> Result<ModelOutput<B>, WorkerError> {
-        Ok(self.forward_pass(input, 0))
-    }
-
-    fn generate(
-        &self,
-        _prompt: &str,
-        max_tokens: usize,
-        _temperature: f32,
-        _top_p: f32,
-        _top_k: usize,
-    ) -> Result<TokenStream, WorkerError> {
-        Ok(TokenStream::new(max_tokens))
-    }
-
-    fn memory_used(&self) -> usize {
-        self.memory_usage()
-    }
-}

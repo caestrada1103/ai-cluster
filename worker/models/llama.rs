@@ -3,19 +3,18 @@
 //! Implements Meta's Llama architecture with grouped-query attention,
 //! RMS normalization, and SwiGLU activation.
 
+#![allow(dead_code)]
+
 use burn::{
     module::{Module, Ignored},
     nn::{Linear, LinearConfig, Embedding, EmbeddingConfig},
     tensor::{backend::Backend, Tensor},
 };
-use super::{Model, ModelConfig, ModelOutput, ModelInput, TokenStream, TextGeneration};
+use super::TextGeneration;
 use super::common::{RMSNorm, RotaryEmbedding, swiglu, repeat_kv};
 use crate::error::WorkerError;
-use tracing;
 use tokenizers::Tokenizer;
 use async_stream::stream;
-use futures::Stream;
-use std::pin::Pin;
 use std::path::Path;
 
 /// Per-layer KV cache entry: (keys, values) shaped [1, n_kv_heads, seq_so_far, head_dim]
@@ -296,75 +295,6 @@ pub struct LlamaConfig {
     pub rope_theta: f32,
 }
 
-impl LlamaConfig {
-    /// Create configuration for Llama 3 8B
-    pub fn llama3_8b() -> Self {
-        Self {
-            hidden_size: 4096,
-            num_layers: 32,
-            num_attention_heads: 32,
-            num_kv_heads: 8,
-            head_dim: 128,
-            intermediate_size: 14336,
-            vocab_size: 128256,
-            max_seq_len: 8192,
-            rms_norm_eps: 1e-5,
-            rope_theta: 500000.0,
-        }
-    }
-
-    /// Create configuration for Llama 3 70B
-    pub fn llama3_70b() -> Self {
-        Self {
-            hidden_size: 8192,
-            num_layers: 80,
-            num_attention_heads: 64,
-            num_kv_heads: 8,
-            head_dim: 128,
-            intermediate_size: 28672,
-            vocab_size: 128256,
-            max_seq_len: 8192,
-            rms_norm_eps: 1e-5,
-            rope_theta: 500000.0,
-        }
-    }
-
-    /// Create configuration for Llama 2 7B
-    pub fn llama2_7b() -> Self {
-        Self {
-            hidden_size: 4096,
-            num_layers: 32,
-            num_attention_heads: 32,
-            num_kv_heads: 32,
-            head_dim: 128,
-            intermediate_size: 11008,
-            vocab_size: 32000,
-            max_seq_len: 4096,
-            rms_norm_eps: 1e-5,
-            rope_theta: 10000.0,
-        }
-    }
-
-    /// Convert to generic ModelConfig
-    pub fn to_model_config(&self) -> ModelConfig {
-        ModelConfig {
-            architecture: "llama".to_string(),
-            num_layers: self.num_layers,
-            hidden_size: self.hidden_size,
-            num_attention_heads: self.num_attention_heads,
-            num_kv_heads: self.num_kv_heads,
-            vocab_size: self.vocab_size,
-            max_seq_len: self.max_seq_len,
-            intermediate_size: self.intermediate_size,
-            rms_norm_eps: self.rms_norm_eps,
-            rope_theta: self.rope_theta,
-            is_moe: false,
-            num_experts: None,
-            num_experts_per_tok: None,
-        }
-    }
-}
-
 impl<B: Backend> Llama<B> {
     /// Create a new Llama model
     pub fn new(config: &LlamaConfig, device: &B::Device, tokenizer_path: &Path) -> Result<Self, WorkerError> {
@@ -413,37 +343,6 @@ impl<B: Backend> Llama<B> {
             tokenizer: Ignored(tokenizer),
             device: Ignored(device.clone()),
         })
-    }
-
-    /// Forward pass through the model.
-    ///
-    /// Builds the causal bias once and threads it through all layers,
-    /// avoiding an O(seq²) allocation per layer.
-    pub fn forward_pass(
-        &self,
-        input_ids: Tensor<B, 2>,
-        start_pos: usize,
-    ) -> Tensor<B, 3> {
-        let [_, seq_len] = input_ids.dims();
-        let causal_bias = super::common::build_causal_bias::<B>(seq_len, &*self.device);
-        let mut x = self.embed_tokens.forward(input_ids.int());
-
-        for layer in &self.layers {
-            x = layer.forward(x, &self.rope, start_pos, causal_bias.as_ref());
-        }
-
-        let x = self.norm.forward(x);
-        self.lm_head.forward(x)
-    }
-
-    /// Estimate memory usage in bytes (FP16)
-    pub fn memory_usage(&self) -> usize {
-        let c = &self.config;
-        let embed = c.vocab_size * c.hidden_size;
-        let attn = c.num_layers * 4 * c.hidden_size * c.hidden_size;
-        let ffn = c.num_layers * 3 * c.hidden_size * c.intermediate_size;
-        let norm = (c.num_layers * 2 + 1) * c.hidden_size;
-        (embed + attn + ffn) * 2 + norm * 2
     }
 
     /// Prefill: run the full forward pass on the prompt, return last-position logits
@@ -615,38 +514,6 @@ impl<B: Backend> Llama<B> {
     }
 }
 
-impl<B: Backend> Model<B> for Llama<B> {
-    fn name(&self) -> &str {
-        "llama"
-    }
-
-    fn config(&self) -> ModelConfig {
-        self.config.to_model_config()
-    }
-
-    fn forward(&self, input: ModelInput<B>) -> Result<ModelOutput<B>, WorkerError> {
-        Ok(self.forward_pass(input, 0))
-    }
-
-    fn generate(
-        &self,
-        _prompt: &str,
-        max_tokens: usize,
-        _temperature: f32,
-        _top_p: f32,
-        _top_k: usize,
-    ) -> Result<TokenStream, WorkerError> {
-        Ok(TokenStream::new(max_tokens))
-    }
-
-    fn memory_used(&self) -> usize {
-        self.memory_usage()
-    }
-
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
-    }
-}
 impl<B: Backend> TextGeneration for Llama<B> {
     fn generate(
         &self,
@@ -655,7 +522,7 @@ impl<B: Backend> TextGeneration for Llama<B> {
         temperature: f32,
         top_p: f32,
         top_k: usize,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<String, WorkerError>> + Send>>, WorkerError> {
+    ) -> Result<super::TextStream, WorkerError> {
         let tokens = self.tokenize_prompt(prompt)?;
         let prompt_len = tokens.len();
 
@@ -671,7 +538,7 @@ impl<B: Backend> TextGeneration for Llama<B> {
         tokio::task::spawn_blocking(move || {
             // ── PREFILL ──────────────────────────────────────────────────────────────
             let input_f32: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
-            let device: &<B as burn::tensor::backend::Backend>::Device = &*model.device;
+            let device: &<B as burn::tensor::backend::Backend>::Device = &model.device;
             let input = Tensor::<B, 1>::from_floats(input_f32.as_slice(), device)
                 .reshape([1, prompt_len]);
             let (logits_vec, mut kv_cache) = model.prefill(input);

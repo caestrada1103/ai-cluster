@@ -35,10 +35,15 @@ pub struct ModelLoaderConfig {
     pub cache_dir: PathBuf,
     pub download_dir: PathBuf,
     pub max_concurrent_loads: usize,
+    #[allow(dead_code)]
     pub load_timeout_secs: u64,
+    #[allow(dead_code)]
     pub verify_checksums: bool,
+    #[allow(dead_code)]
     pub enable_mmap: bool,
+    #[allow(dead_code)]
     pub pin_memory: bool,
+    #[allow(dead_code)]
     pub prefetch_size_gb: f32,
 }
 
@@ -59,7 +64,6 @@ impl Default for ModelLoaderConfig {
 
 /// Model loader
 pub struct ModelLoader {
-    config: ModelLoaderConfig,
     gpu_manager: Arc<GPUManager>,
     loaded_models: Arc<DashMap<String, ModelInstance>>,
     load_semaphore: Arc<Semaphore>,
@@ -86,7 +90,6 @@ impl ModelLoader {
         std::fs::create_dir_all(&config.download_dir)?;
 
         Ok(Self {
-            config: config.clone(),
             gpu_manager,
             loaded_models: Arc::new(DashMap::new()),
             load_semaphore: Arc::new(Semaphore::new(config.max_concurrent_loads)),
@@ -127,7 +130,6 @@ impl ModelLoader {
             self.gpu_manager.allocate_memory(
                 gpu_id as usize,
                 memory_used as u64,
-                format!("model:{}", model_name),
             ).await?;
         }
 
@@ -140,10 +142,10 @@ impl ModelLoader {
         };
 
         // Load weights
-        let mut weights = self.load_safetensors(&model_name, &device).await?;
+        let mut weights = self.load_safetensors(model_name, &device).await?;
 
         // Get model directory (tokenizer.json lives here)
-        let model_path = self.get_model_path(&model_name).await?;
+        let model_path = self.get_model_path(model_name).await?;
         // Ensure tokenizer.json is downloaded
         if let Some(api) = &self.hf_api {
             let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
@@ -251,8 +253,7 @@ impl ModelLoader {
                 Ok::<_, WorkerError>(out)
             })
             .await
-            .map_err(|e| WorkerError::Internal(format!("spawn_blocking join error: {e}")))?
-            .map_err(|e| e)?;
+            .map_err(|e| WorkerError::Internal(format!("spawn_blocking join error: {e}")))??;
 
             // Tensor creation stays in async context (WgpuDevice reference not moved)
             for (name, floats) in parsed {
@@ -313,29 +314,6 @@ impl ModelLoader {
         }
     }
     
-    pub async fn unload_model(&self, model_name: &str) -> Result<(), WorkerError> {
-        self.loaded_models.remove(model_name);
-        Ok(())
-    }
-    
-    pub fn get_model_info(&self, model_name: &str) -> Option<serde_json::Value> {
-         self.loaded_models.get(model_name).map(|entry| {
-            let instance = entry.value();
-            serde_json::json!({
-                "name": model_name,
-                "gpu_ids": instance.gpu_ids(),
-                "memory_used_mb": instance.memory_used() / 1024 / 1024,
-                "inference_count": instance.inference_count(),
-            })
-        })
-    }
-    
-    pub fn list_models(&self) -> Vec<String> {
-        self.loaded_models.iter().map(|entry| entry.key().clone()).collect()
-    }
-    pub fn get_model(&self, model_name: &str) -> Option<ModelInstance> {
-        self.loaded_models.get(model_name).map(|entry| entry.value().clone())
-    }
 }
 
 /// Helper to transpose Linear weights (HF [out, in] -> Burn [in, out])
@@ -357,11 +335,7 @@ fn load_linear(
     
     let b = if bias {
         let b_name = format!("{}.bias", name);
-        if let Some(b_flat) = weights.remove(&b_name) {
-            Some(b_flat) // Bias is [out], Burn expects [out]
-        } else {
-            None
-        }
+        weights.remove(&b_name)
     } else {
         None
     };
