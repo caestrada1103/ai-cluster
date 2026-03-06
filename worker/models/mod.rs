@@ -6,7 +6,12 @@
 pub mod deepseek;
 pub mod llama;
 pub mod mistral;
+pub mod qwen;
 pub mod common;
+
+/// Re-export shared KV cache types used by llama, qwen, and deepseek.
+#[allow(unused_imports)]
+pub use llama::{KvEntry, KvCache};
 
 
 
