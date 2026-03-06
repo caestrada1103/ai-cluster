@@ -15,6 +15,7 @@ class ModelFamily(str, Enum):
     MISTRAL = "mistral"
     PHI = "phi"
     GEMMA = "gemma"
+    QWEN = "qwen"
 
 
 class Quantization(str, Enum):
@@ -237,6 +238,54 @@ class ModelRegistry:
             model_url="https://huggingface.co/microsoft/phi-2",
         )
         
+        # Qwen3-Coder-32B
+        cls.MODELS["qwen3-coder-32b"] = ModelConfig(
+            name="qwen3-coder-32b",
+            family=ModelFamily.QWEN,
+            parameters="32B",
+            min_memory_gb=65,
+            recommended_gpus=2,
+            max_gpus=4,
+            num_layers=64,
+            hidden_size=5120,
+            num_attention_heads=40,
+            num_kv_heads=8,
+            vocab_size=151936,
+            max_seq_len=131072,
+            intermediate_size=27648,
+            supports_quantization=[Quantization.FP16, Quantization.INT8, Quantization.INT4],
+            supports_parallelism=[ParallelismStrategy.SINGLE, ParallelismStrategy.TENSOR],
+            description="Qwen3-Coder 32B — top open-source coding model (SWE-Bench 70.6%), Claude Sonnet tier",
+            model_url="https://huggingface.co/Qwen/Qwen3-Coder-32B",
+        )
+
+        # DeepSeek V3
+        cls.MODELS["deepseek-v3"] = ModelConfig(
+            name="deepseek-v3",
+            family=ModelFamily.DEEPSEEK,
+            parameters="671B",
+            min_memory_gb=600,
+            recommended_gpus=8,
+            max_gpus=16,
+            num_layers=61,
+            hidden_size=7168,
+            num_attention_heads=128,
+            num_kv_heads=128,
+            vocab_size=129280,
+            max_seq_len=163840,
+            intermediate_size=18432,
+            is_moe=True,
+            num_experts=256,
+            supports_quantization=[Quantization.FP16, Quantization.INT8, Quantization.INT4],
+            supports_parallelism=[
+                ParallelismStrategy.SINGLE,
+                ParallelismStrategy.TENSOR,
+                ParallelismStrategy.PIPELINE,
+            ],
+            description="DeepSeek V3 — 671B MoE (37B active params), Claude Opus tier (SWE-Bench 73.1%)",
+            model_url="https://huggingface.co/deepseek-ai/DeepSeek-V3",
+        )
+
         logger.info(f"Initialized model registry with {len(cls.MODELS)} models")
 
     @classmethod

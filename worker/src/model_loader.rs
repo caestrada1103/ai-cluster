@@ -24,6 +24,12 @@ use crate::gpu_manager::GPUManager;
 use crate::models::{
     ModelConfig, ModelInstance, TextGeneration,
     llama::{Llama, LlamaConfig, LlamaRecord, LlamaLayerRecord, LlamaAttentionRecord, LlamaMLPRecord},
+    qwen::{Qwen, QwenConfig, QwenRecord, QwenLayerRecord, QwenAttentionRecord, QwenMLPRecord},
+    deepseek::{
+        DeepSeek, DeepSeekConfig,
+        DeepSeekRecord, DeepSeekLayerRecord, DeepSeekAttentionRecord,
+        DeepSeekMoERecord, ExpertRecord,
+    },
     common::{RMSNormRecord, RotaryEmbeddingRecord, RotaryEmbedding},
 };
 use crate::backend::WorkerBackend;
@@ -169,15 +175,52 @@ impl ModelLoader {
                     rms_norm_eps: config.rms_norm_eps,
                     rope_theta: config.rope_theta,
                 };
-                
+
                 info!("Mapping weights to LlamaRecord...");
                 let record = create_llama_record(&mut weights, &llama_config, &device)?;
                 info!("Record created. Initializing Llama...");
-                
+
                 let model = Llama::new(&llama_config, &device, &model_path)?.load_record(record);
                 Arc::new(Mutex::new(model))
             }
-            _ => return Err(WorkerError::ModelLoad(format!("Unsupported architecture: {}", config.architecture))),
+            "qwen" => {
+                let qwen_config = QwenConfig {
+                    hidden_size: config.hidden_size,
+                    num_layers: config.num_layers,
+                    num_attention_heads: config.num_attention_heads,
+                    num_kv_heads: config.num_kv_heads,
+                    head_dim: config.hidden_size / config.num_attention_heads,
+                    intermediate_size: config.intermediate_size,
+                    vocab_size: config.vocab_size,
+                    max_seq_len: config.max_seq_len,
+                    rms_norm_eps: config.rms_norm_eps,
+                    rope_theta: config.rope_theta,
+                };
+
+                info!("Mapping weights to QwenRecord...");
+                let record = create_qwen_record(&mut weights, &qwen_config, &device)?;
+                info!("Record created. Initializing Qwen...");
+
+                let model = Qwen::new(&qwen_config, &device, &model_path)?.load_record(record);
+                Arc::new(Mutex::new(model))
+            }
+            "deepseek" => {
+                let ds_config = if model_name.to_lowercase().contains("v3") {
+                    DeepSeekConfig::deepseek_v3()
+                } else if model_name.to_lowercase().contains("67b") {
+                    DeepSeekConfig::deepseek_67b()
+                } else {
+                    DeepSeekConfig::deepseek_7b()
+                };
+
+                info!("Mapping weights to DeepSeekRecord...");
+                let record = create_deepseek_record(&mut weights, &ds_config, &device)?;
+                info!("Record created. Initializing DeepSeek...");
+
+                let model = DeepSeek::new(ds_config, &device, &model_path)?.load_record(record);
+                Arc::new(Mutex::new(model))
+            }
+            other => return Err(WorkerError::ModelLoad(format!("Unsupported architecture: {}", other))),
         };
 
         let instance = ModelInstance::new(
@@ -282,9 +325,23 @@ impl ModelLoader {
         let s = tokio::fs::read_to_string(&config_path).await
             .map_err(|e| WorkerError::ModelLoad(format!("Failed to read config: {}", e)))?;
         let json: serde_json::Value = serde_json::from_str(&s)?;
-        let arch = json["architectures"][0].as_str().unwrap_or("llama").to_lowercase();
+        let arch_raw = json["architectures"][0].as_str().unwrap_or("llama").to_lowercase();
+        let architecture = if arch_raw.contains("llama") {
+            "llama".to_string()
+        } else if arch_raw.contains("qwen") {
+            "qwen".to_string()
+        } else if arch_raw.contains("deepseek") {
+            "deepseek".to_string()
+        } else {
+            arch_raw
+        };
+        let num_experts = json["num_experts"].as_u64().map(|v| v as usize);
+        let num_experts_per_tok = json["num_experts_per_token"].as_u64()
+            .or_else(|| json["num_experts_per_tok"].as_u64())
+            .map(|v| v as usize);
+        let is_moe = num_experts.is_some();
         Ok(ModelConfig {
-            architecture: if arch.contains("llama") { "llama".to_string() } else { arch },
+            architecture,
             num_layers: json["num_hidden_layers"].as_u64().unwrap_or(0) as usize,
             hidden_size: json["hidden_size"].as_u64().unwrap_or(0) as usize,
             num_attention_heads: json["num_attention_heads"].as_u64().unwrap_or(0) as usize,
@@ -294,7 +351,9 @@ impl ModelLoader {
             intermediate_size: json["intermediate_size"].as_u64().unwrap_or(0) as usize,
             rms_norm_eps: json["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
             rope_theta: json["rope_theta"].as_f64().unwrap_or(10000.0) as f32,
-            is_moe: false, num_experts: None, num_experts_per_tok: None,
+            is_moe,
+            num_experts,
+            num_experts_per_tok,
         })
     }
 
@@ -369,6 +428,143 @@ fn load_norm(
     // Wait, check `RMSNorm` struct again.
     // Step 1439: `pub eps: f64`. `#[module(skip)]`.
     // So `RMSNormRecord` only has `weight`.
+}
+
+fn create_qwen_record(
+    weights: &mut HashMap<String, Tensor<WorkerBackend, 1>>,
+    config: &QwenConfig,
+    device: &WgpuDevice,
+) -> Result<QwenRecord<WorkerBackend>, WorkerError> {
+    let embed = load_embedding(weights, "model.embed_tokens", config.vocab_size, config.hidden_size)?;
+    let norm = load_norm(weights, "model.norm", config.hidden_size)?;
+    let lm_head = load_linear(weights, "lm_head", config.hidden_size, config.vocab_size, false)?;
+
+    let mut layers = Vec::new();
+    for i in 0..config.num_layers {
+        let prefix = format!("model.layers.{}", i);
+
+        let q = load_linear(weights, &format!("{}.self_attn.q_proj", prefix),
+            config.hidden_size, config.num_attention_heads * config.head_dim, false)?;
+        let k = load_linear(weights, &format!("{}.self_attn.k_proj", prefix),
+            config.hidden_size, config.num_kv_heads * config.head_dim, false)?;
+        let v = load_linear(weights, &format!("{}.self_attn.v_proj", prefix),
+            config.hidden_size, config.num_kv_heads * config.head_dim, false)?;
+        let o = load_linear(weights, &format!("{}.self_attn.o_proj", prefix),
+            config.num_attention_heads * config.head_dim, config.hidden_size, false)?;
+
+        let attention = QwenAttentionRecord {
+            q_proj: q, k_proj: k, v_proj: v, o_proj: o,
+            num_heads: ConstantRecord, num_kv_heads: ConstantRecord, head_dim: ConstantRecord,
+        };
+
+        let gate = load_linear(weights, &format!("{}.mlp.gate_proj", prefix),
+            config.hidden_size, config.intermediate_size, false)?;
+        let up = load_linear(weights, &format!("{}.mlp.up_proj", prefix),
+            config.hidden_size, config.intermediate_size, false)?;
+        let down = load_linear(weights, &format!("{}.mlp.down_proj", prefix),
+            config.intermediate_size, config.hidden_size, false)?;
+
+        let mlp = QwenMLPRecord { gate_proj: gate, up_proj: up, down_proj: down };
+
+        let in_norm = load_norm(weights, &format!("{}.input_layernorm", prefix), config.hidden_size)?;
+        let post_norm = load_norm(weights, &format!("{}.post_attention_layernorm", prefix), config.hidden_size)?;
+
+        layers.push(QwenLayerRecord {
+            attention, mlp, input_layernorm: in_norm, post_attention_layernorm: post_norm,
+        });
+    }
+
+    let _rope_mod: RotaryEmbedding<WorkerBackend> =
+        RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_theta, device);
+    let rope = RotaryEmbeddingRecord { cos: ConstantRecord, sin: ConstantRecord };
+
+    Ok(QwenRecord {
+        embed_tokens: embed,
+        layers,
+        norm,
+        lm_head,
+        config: ConstantRecord,
+        rope,
+        tokenizer: ConstantRecord,
+        device: ConstantRecord,
+    })
+}
+
+fn create_deepseek_record(
+    weights: &mut HashMap<String, Tensor<WorkerBackend, 1>>,
+    config: &DeepSeekConfig,
+    device: &WgpuDevice,
+) -> Result<DeepSeekRecord<WorkerBackend>, WorkerError> {
+    let embed = load_embedding(weights, "model.embed_tokens", config.vocab_size, config.hidden_size)?;
+    let norm = load_norm(weights, "model.norm", config.hidden_size)?;
+    let lm_head = load_linear(weights, "lm_head", config.hidden_size, config.vocab_size, false)?;
+
+    let q_out = config.num_attention_heads * config.head_dim;
+    let kv_out = config.num_kv_heads * config.head_dim;
+
+    let mut layers = Vec::new();
+    for i in 0..config.num_layers {
+        let prefix = format!("model.layers.{}", i);
+
+        let q = load_linear(weights, &format!("{}.self_attn.q_proj", prefix),
+            config.hidden_size, q_out, false)?;
+        let k = load_linear(weights, &format!("{}.self_attn.k_proj", prefix),
+            config.hidden_size, kv_out, false)?;
+        let v = load_linear(weights, &format!("{}.self_attn.v_proj", prefix),
+            config.hidden_size, kv_out, false)?;
+        let o = load_linear(weights, &format!("{}.self_attn.o_proj", prefix),
+            q_out, config.hidden_size, false)?;
+
+        let attention = DeepSeekAttentionRecord {
+            q_proj: q, k_proj: k, v_proj: v, o_proj: o,
+            num_heads: ConstantRecord, num_kv_heads: ConstantRecord, head_dim: ConstantRecord,
+        };
+
+        // Routing gate: [hidden_size → num_experts]
+        let gate_w = load_linear(weights, &format!("{}.mlp.gate", prefix),
+            config.hidden_size, config.num_experts, false)?;
+
+        // Load all routed experts
+        let mut experts = Vec::with_capacity(config.num_experts);
+        for j in 0..config.num_experts {
+            let ep = format!("{}.mlp.experts.{}", prefix, j);
+            let eg = load_linear(weights, &format!("{}.gate_proj", ep),
+                config.hidden_size, config.intermediate_size, false)?;
+            let eu = load_linear(weights, &format!("{}.up_proj", ep),
+                config.hidden_size, config.intermediate_size, false)?;
+            let ed = load_linear(weights, &format!("{}.down_proj", ep),
+                config.intermediate_size, config.hidden_size, false)?;
+            experts.push(ExpertRecord { gate_proj: eg, up_proj: eu, down_proj: ed });
+        }
+
+        let moe = DeepSeekMoERecord {
+            experts,
+            gate: gate_w,
+            num_experts_per_tok: ConstantRecord,
+        };
+
+        let in_norm = load_norm(weights, &format!("{}.input_layernorm", prefix), config.hidden_size)?;
+        let post_norm = load_norm(weights, &format!("{}.post_attention_layernorm", prefix), config.hidden_size)?;
+
+        layers.push(DeepSeekLayerRecord {
+            attention, moe, input_layernorm: in_norm, post_attention_layernorm: post_norm,
+        });
+    }
+
+    let _rope_mod: RotaryEmbedding<WorkerBackend> =
+        RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_theta, device);
+    let rope = RotaryEmbeddingRecord { cos: ConstantRecord, sin: ConstantRecord };
+
+    Ok(DeepSeekRecord {
+        embed_tokens: embed,
+        layers,
+        norm,
+        lm_head,
+        config: ConstantRecord,
+        context_device: ConstantRecord,
+        rope,
+        tokenizer: ConstantRecord,
+    })
 }
 
 fn create_llama_record(

@@ -12,7 +12,12 @@ use burn::{
 };
 use super::ModelConfig;
 use super::common::{RMSNorm, RotaryEmbedding, swiglu, repeat_kv};
+use super::llama::{KvEntry, KvCache};
+use super::TextGeneration;
 use crate::error::WorkerError;
+use tokenizers::Tokenizer;
+use async_stream::stream;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Expert Activation
@@ -248,6 +253,87 @@ impl<B: Backend> DeepSeekAttention<B> {
 
         self.o_proj.forward(output)
     }
+
+    /// Prefill forward: returns attention output and the compact (pre-GQA) KV entry.
+    pub fn forward_prefill(
+        &self,
+        x: Tensor<B, 3>,
+        rope: &RotaryEmbedding<B>,
+        start_pos: usize,
+        causal_bias: Option<&Tensor<B, 4>>,
+    ) -> (Tensor<B, 3>, KvEntry<B>) {
+        let [batch, seq_len, _] = x.dims();
+
+        let q = self.q_proj.forward(x.clone())
+            .reshape([batch, seq_len, self.num_heads, self.head_dim])
+            .swap_dims(1, 2);
+        let k = self.k_proj.forward(x.clone())
+            .reshape([batch, seq_len, self.num_kv_heads, self.head_dim])
+            .swap_dims(1, 2);
+        let v = self.v_proj.forward(x)
+            .reshape([batch, seq_len, self.num_kv_heads, self.head_dim])
+            .swap_dims(1, 2);
+
+        let (q, k) = rope.apply(q, k, start_pos);
+        let kv_entry = (k.clone(), v.clone());
+
+        let n_rep = self.num_heads / self.num_kv_heads;
+        let k_full = repeat_kv(k, n_rep);
+        let v_full = repeat_kv(v, n_rep);
+
+        let scale = (self.head_dim as f64).sqrt();
+        let scores = q.matmul(k_full.swap_dims(2, 3)).div_scalar(scale);
+        let scores = match causal_bias {
+            Some(bias) => scores + bias.clone(),
+            None => scores,
+        };
+        let attn = burn::tensor::activation::softmax(scores, 3);
+        let output = attn.matmul(v_full)
+            .swap_dims(1, 2)
+            .reshape([batch, seq_len, self.num_heads * self.head_dim]);
+
+        (self.o_proj.forward(output), kv_entry)
+    }
+
+    /// Single-token decode: appends new K/V to cache and attends over full cached sequence.
+    pub fn forward_decode(
+        &self,
+        hidden: Tensor<B, 3>,          // [1, 1, hidden]
+        rope: &RotaryEmbedding<B>,
+        start_pos: usize,
+        kv: &mut KvEntry<B>,
+    ) -> Tensor<B, 3> {
+        let q = self.q_proj.forward(hidden.clone())
+            .reshape([1, 1, self.num_heads, self.head_dim])
+            .swap_dims(1, 2);
+        let new_k = self.k_proj.forward(hidden.clone())
+            .reshape([1, 1, self.num_kv_heads, self.head_dim])
+            .swap_dims(1, 2);
+        let new_v = self.v_proj.forward(hidden)
+            .reshape([1, 1, self.num_kv_heads, self.head_dim])
+            .swap_dims(1, 2);
+
+        let (q, new_k) = rope.apply(q, new_k, start_pos);
+
+        let k = Tensor::cat(vec![kv.0.clone(), new_k], 2);
+        let v = Tensor::cat(vec![kv.1.clone(), new_v], 2);
+        *kv = (k.clone(), v.clone());
+
+        let n_rep = self.num_heads / self.num_kv_heads;
+        let k_full = repeat_kv(k, n_rep);
+        let v_full = repeat_kv(v, n_rep);
+
+        let scale = (self.head_dim as f64).sqrt();
+        let attn = burn::tensor::activation::softmax(
+            q.matmul(k_full.swap_dims(2, 3)).div_scalar(scale),
+            3,
+        );
+        self.o_proj.forward(
+            attn.matmul(v_full)
+                .swap_dims(1, 2)
+                .reshape([1, 1, self.num_heads * self.head_dim]),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +381,44 @@ impl<B: Backend> DeepSeekLayer<B> {
         let x = self.moe.forward(x);
         x + residual
     }
+
+    /// Prefill forward: returns hidden state and the layer's KV entry.
+    pub fn forward_prefill(
+        &self,
+        x: Tensor<B, 3>,
+        rope: &RotaryEmbedding<B>,
+        start_pos: usize,
+        causal_bias: Option<&Tensor<B, 4>>,
+    ) -> (Tensor<B, 3>, KvEntry<B>) {
+        let residual = x.clone();
+        let h = self.input_layernorm.forward(x);
+        let (attn_out, kv) = self.attention.forward_prefill(h, rope, start_pos, causal_bias);
+        let x = attn_out + residual;
+
+        let residual = x.clone();
+        let h = self.post_attention_layernorm.forward(x);
+        let x = self.moe.forward(h);
+        (x + residual, kv)
+    }
+
+    /// Decode-step forward: single token, extends KV cache in-place.
+    pub fn forward_decode(
+        &self,
+        x: Tensor<B, 3>,
+        rope: &RotaryEmbedding<B>,
+        start_pos: usize,
+        kv: &mut KvEntry<B>,
+    ) -> Tensor<B, 3> {
+        let residual = x.clone();
+        let h = self.input_layernorm.forward(x);
+        let h = self.attention.forward_decode(h, rope, start_pos, kv);
+        let h = h + residual;
+
+        let residual = h.clone();
+        let h = self.post_attention_layernorm.forward(h);
+        let h = self.moe.forward(h);
+        h + residual
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -304,13 +428,15 @@ impl<B: Backend> DeepSeekLayer<B> {
 /// Complete DeepSeek model
 #[derive(Module, Debug)]
 pub struct DeepSeek<B: Backend> {
-    embed_tokens: Embedding<B>,
-    layers: Vec<DeepSeekLayer<B>>,
-    norm: RMSNorm<B>,
-    lm_head: Linear<B>,
-    config: Ignored<DeepSeekConfig>,
-    context_device: Ignored<B::Device>,
-    rope: RotaryEmbedding<B>,
+    pub embed_tokens: Embedding<B>,
+    pub layers: Vec<DeepSeekLayer<B>>,
+    pub norm: RMSNorm<B>,
+    pub lm_head: Linear<B>,
+    pub config: Ignored<DeepSeekConfig>,
+    pub context_device: Ignored<B::Device>,
+    pub rope: RotaryEmbedding<B>,
+    #[module(ignore)]
+    pub tokenizer: Ignored<Tokenizer>,
 }
 
 /// DeepSeek configuration
@@ -346,6 +472,24 @@ impl DeepSeekConfig {
             rope_theta: 10000.0,
             num_experts: 64,
             num_experts_per_tok: 6,
+        }
+    }
+
+    /// Create configuration for DeepSeek V3 (671B, 37B active params).
+    pub fn deepseek_v3() -> Self {
+        Self {
+            hidden_size: 7168,
+            num_layers: 61,
+            num_attention_heads: 128,
+            num_kv_heads: 128,
+            head_dim: 56, // 7168 / 128
+            intermediate_size: 18432,
+            vocab_size: 129280,
+            max_seq_len: 163840,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            num_experts: 256,
+            num_experts_per_tok: 8,
         }
     }
 
@@ -392,28 +536,28 @@ impl<B: Backend> DeepSeek<B> {
     pub fn new(
         config: DeepSeekConfig,
         device: &B::Device,
+        tokenizer_path: &Path,
     ) -> Result<Self, WorkerError> {
         let hidden_size = config.hidden_size;
         let num_layers = config.num_layers;
-        
-        let embed_tokens = EmbeddingConfig::new(config.vocab_size, hidden_size)
-            .init(device);
-            
-        let layers = (0..num_layers)
-            .map(|_| DeepSeekLayer::new(&config, device))
-            .collect();
-            
+
+        let embed_tokens = EmbeddingConfig::new(config.vocab_size, hidden_size).init(device);
+        let layers = (0..num_layers).map(|_| DeepSeekLayer::new(&config, device)).collect();
         let norm = RMSNorm::new(hidden_size, config.rms_norm_eps as f64, device);
         let lm_head = LinearConfig::new(hidden_size, config.vocab_size)
             .with_bias(false)
             .init(device);
+        let rope = RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_theta, device);
 
-        let rope = RotaryEmbedding::new(
-            config.head_dim,
-            config.max_seq_len,
-            config.rope_theta,
-            device,
-        );
+        let tok_file = tokenizer_path.join("tokenizer.json");
+        eprintln!("[INFO] Loading DeepSeek tokenizer from: {:?}", tok_file);
+        let tokenizer = Tokenizer::from_file(&tok_file)
+            .map_err(|e| {
+                eprintln!("[WARN] Failed to load tokenizer from {:?}: {}. Trying HF pretrained...", tok_file, e);
+                e
+            })
+            .or_else(|_| Tokenizer::from_pretrained("deepseek-ai/deepseek-llm-7b-base", None))
+            .map_err(|e| WorkerError::ModelLoad(format!("Failed to load DeepSeek tokenizer: {}", e)))?;
 
         Ok(Self {
             embed_tokens,
@@ -423,23 +567,125 @@ impl<B: Backend> DeepSeek<B> {
             config: Ignored(config),
             context_device: Ignored(device.clone()),
             rope,
+            tokenizer: Ignored(tokenizer),
         })
     }
 
-    /// Forward pass
+    /// Forward pass (no KV cache — for standalone use)
     pub fn forward_pass(
         &self,
         input_ids: Tensor<B, 2>,
         start_pos: usize,
     ) -> Tensor<B, 3> {
         let mut x = self.embed_tokens.forward(input_ids.int());
-
         for layer in &self.layers {
             x = layer.forward(x, &self.rope, start_pos);
         }
-
         let x = self.norm.forward(x);
         self.lm_head.forward(x)
+    }
+
+    /// Full-sequence prefill: returns last-position logits (CPU) and populated KV cache.
+    pub fn prefill(&self, input_ids: Tensor<B, 2>) -> (Vec<f32>, KvCache<B>) {
+        let [_, seq_len] = input_ids.dims();
+        let device = input_ids.device();
+        let vocab = self.config.vocab_size;
+
+        let causal_bias: Option<Tensor<B, 4>> = if seq_len > 1 {
+            let mut data = vec![-1e9_f32; seq_len * seq_len];
+            for i in 0..seq_len {
+                for j in 0..=i {
+                    data[i * seq_len + j] = 0.0;
+                }
+            }
+            Some(Tensor::<B, 1>::from_floats(data.as_slice(), &device).reshape([1, 1, seq_len, seq_len]))
+        } else {
+            None
+        };
+
+        let mut x = self.embed_tokens.forward(input_ids.int());
+        let mut kv_cache: KvCache<B> = Vec::with_capacity(self.layers.len());
+
+        for layer in &self.layers {
+            let (out, kv) = layer.forward_prefill(x, &self.rope, 0, causal_bias.as_ref());
+            kv_cache.push(kv);
+            x = out;
+        }
+
+        let x = self.norm.forward(x);
+        let logits = self.lm_head.forward(x);
+        let [_, s, v] = logits.dims();
+        let last = logits.slice([0..1, s - 1..s, 0..v]).reshape([vocab]);
+        let logits_vec: Vec<f32> = last.into_data().to_vec().unwrap_or_else(|e| {
+            tracing::error!("deepseek prefill: failed to pull logits from GPU: {e:?}");
+            vec![0.0; vocab]
+        });
+
+        (logits_vec, kv_cache)
+    }
+
+    /// Single-token decode step using the KV cache.
+    pub fn decode_step(&self, token_id: u32, start_pos: usize, kv_cache: &mut KvCache<B>) -> Vec<f32> {
+        let device = &*self.context_device;
+        let vocab = self.config.vocab_size;
+
+        let input = Tensor::<B, 1>::from_floats([token_id as f32], device).reshape([1, 1]);
+        let mut x = self.embed_tokens.forward(input.int());
+
+        for (layer, kv) in self.layers.iter().zip(kv_cache.iter_mut()) {
+            x = layer.forward_decode(x, &self.rope, start_pos, kv);
+        }
+
+        let x = self.norm.forward(x);
+        let logits = self.lm_head.forward(x);
+        logits.reshape([vocab]).into_data().to_vec().unwrap_or_else(|e| {
+            tracing::error!("deepseek decode_step: failed to pull logits from GPU: {e:?}");
+            vec![0.0; vocab]
+        })
+    }
+
+    /// Tokenize a prompt, handling DeepSeek special tokens.
+    pub fn tokenize_prompt(&self, prompt: &str) -> Result<Vec<u32>, WorkerError> {
+        let special_tokens = ["</s>", "<s>", "<|User|>", "<|Assistant|>", "<|EOT|>"];
+        let mut tokens = Vec::new();
+        let mut current_pos = 0;
+
+        while current_pos < prompt.len() {
+            let mut best_match: Option<&str> = None;
+            let mut min_idx = prompt.len();
+
+            for st in &special_tokens {
+                if let Some(idx) = prompt[current_pos..].find(st) {
+                    let abs_idx = current_pos + idx;
+                    if abs_idx < min_idx {
+                        min_idx = abs_idx;
+                        best_match = Some(st);
+                    }
+                }
+            }
+
+            if min_idx > current_pos {
+                let text_segment = &prompt[current_pos..min_idx];
+                let add_special = current_pos == 0;
+                let encoding = self.tokenizer.encode(text_segment, add_special)
+                    .map_err(|e| WorkerError::Internal(format!("DeepSeek tokenizer error: {}", e)))?;
+                tokens.extend_from_slice(encoding.get_ids());
+            }
+
+            if let Some(st) = best_match {
+                if let Some(id) = self.tokenizer.token_to_id(st) {
+                    tokens.push(id);
+                } else {
+                    let encoding = self.tokenizer.encode(st, false)
+                        .map_err(|e| WorkerError::Internal(format!("DeepSeek tokenizer error (special): {}", e)))?;
+                    tokens.extend_from_slice(encoding.get_ids());
+                }
+                current_pos = min_idx + st.len();
+            } else {
+                break;
+            }
+        }
+        Ok(tokens)
     }
 
     /// Estimate memory usage in bytes (FP16)
@@ -451,6 +697,93 @@ impl<B: Backend> DeepSeek<B> {
         let norm = (c.num_layers * 2 + 1) * c.hidden_size;
         let routing = c.num_layers * c.hidden_size * c.num_experts;
         (embed + attn + expert_ffn + norm + routing) * 2
+    }
+}
+
+impl<B: Backend> TextGeneration for DeepSeek<B> {
+    fn generate(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+    ) -> Result<super::TextStream, WorkerError> {
+        let tokens = self.tokenize_prompt(prompt)?;
+        let prompt_len = tokens.len();
+        let model = self.clone();
+
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<String, WorkerError>>(max_tokens + 2);
+
+        tokio::task::spawn_blocking(move || {
+            // ── PREFILL ──────────────────────────────────────────────────────
+            let input_f32: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
+            let device: &<B as burn::tensor::backend::Backend>::Device = &model.context_device;
+            let input = Tensor::<B, 1>::from_floats(input_f32.as_slice(), device)
+                .reshape([1, prompt_len]);
+            let (logits_vec, mut kv_cache) = model.prefill(input);
+
+            let sample = |logits: &[f32]| -> u32 {
+                if temperature < 0.01 {
+                    logits.iter().enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(i, _)| i as u32)
+                        .unwrap_or(0)
+                } else {
+                    super::common::top_k_top_p_sample(logits, temperature, top_p, top_k) as u32
+                }
+            };
+
+            let delta_text = |tok_ids: &[u32], prev_len: &mut usize, tok: &Tokenizer| -> Result<String, WorkerError> {
+                let text = tok.decode(tok_ids, true)
+                    .map_err(|e| WorkerError::Internal(format!("Decode error: {}", e)))?;
+                let delta = if text.len() > *prev_len {
+                    let mut start = *prev_len;
+                    while start < text.len() && !text.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    if start < text.len() { text[start..].to_string() } else { String::new() }
+                } else {
+                    String::new()
+                };
+                *prev_len = text.len();
+                Ok(delta)
+            };
+
+            let eos_id: Option<u32> = model.tokenizer.token_to_id("<|EOT|>")
+                .or_else(|| model.tokenizer.token_to_id("</s>"));
+
+            // ── FIRST TOKEN (from prefill logits) ────────────────────────────
+            let first_tok = sample(&logits_vec);
+            let mut all_tokens = tokens;
+            all_tokens.push(first_tok);
+            let mut prev_text_len = 0usize;
+            let _ = tx.blocking_send(delta_text(
+                &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
+            ));
+            if eos_id == Some(first_tok) { return; }
+
+            // ── DECODE LOOP ──────────────────────────────────────────────────
+            for _step in 1..max_tokens {
+                let cur_tok  = *all_tokens.last().unwrap();
+                let start    = all_tokens.len() - 1;
+                let logits   = model.decode_step(cur_tok, start, &mut kv_cache);
+                let next_tok = sample(&logits);
+                all_tokens.push(next_tok);
+                let _ = tx.blocking_send(delta_text(
+                    &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
+                ));
+                if eos_id == Some(next_tok) { break; }
+            }
+        });
+
+        let stream = stream! {
+            while let Some(item) = rx.recv().await {
+                yield item;
+            }
+        };
+        Ok(Box::pin(stream))
     }
 }
 

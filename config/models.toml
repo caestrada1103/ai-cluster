@@ -388,3 +388,75 @@ default = "fp16"
 [models."TinyLlama/TinyLlama-1.1B-Chat-v1.0".hf]
 repo_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 filename = "model.safetensors"
+
+# Qwen Models
+# ===========
+
+[models.qwen3-coder-32b]
+family = "qwen"
+description = "Qwen3-Coder 32B — top open-source coding model (SWE-Bench 70.6%), Claude Sonnet tier"
+parameters = "32B"
+min_memory_gb = 65
+recommended_gpus = 2
+max_gpus = 4
+
+[models.qwen3-coder-32b.architecture]
+num_layers = 64
+hidden_size = 5120
+num_attention_heads = 40
+num_kv_heads = 8
+vocab_size = 151936
+max_seq_len = 131072
+intermediate_size = 27648
+rms_norm_eps = 1e-6
+rope_theta = 1000000.0
+is_moe = false
+
+[models.qwen3-coder-32b.hf]
+repo_id = "Qwen/Qwen3-Coder-32B"
+filename = "model.safetensors.index.json"
+
+[models.qwen3-coder-32b.quantization]
+supported = ["fp16", "int8", "int4"]
+default = "fp16"
+
+[models.qwen3-coder-32b.parallelism]
+supported = ["single", "tensor"]
+default = "single"
+
+# DeepSeek V3
+# ===========
+
+[models.deepseek-v3]
+family = "deepseek"
+description = "DeepSeek V3 — 671B MoE (37B active params), Claude Opus tier (SWE-Bench 73.1%)"
+parameters = "671B"
+min_memory_gb = 600
+recommended_gpus = 8
+max_gpus = 16
+
+[models.deepseek-v3.architecture]
+num_layers = 61
+hidden_size = 7168
+num_attention_heads = 128
+num_kv_heads = 128
+vocab_size = 129280
+max_seq_len = 163840
+intermediate_size = 18432
+rms_norm_eps = 1e-6
+rope_theta = 10000.0
+is_moe = true
+num_experts = 256
+num_experts_per_tok = 8
+
+[models.deepseek-v3.hf]
+repo_id = "deepseek-ai/DeepSeek-V3"
+filename = "model.safetensors.index.json"
+
+[models.deepseek-v3.quantization]
+supported = ["fp16", "int8", "int4"]
+default = "fp16"
+
+[models.deepseek-v3.parallelism]
+supported = ["single", "tensor", "pipeline"]
+default = "tensor"
