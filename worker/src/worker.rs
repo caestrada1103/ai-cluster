@@ -48,6 +48,9 @@ pub struct WorkerService {
 
     /// Metrics
     metrics: Metrics,
+
+    /// Bounds concurrent inference requests (RESOURCE_EXHAUSTED beyond this).
+    infer_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl WorkerService {
@@ -58,6 +61,7 @@ impl WorkerService {
         model_loader: Arc<ModelLoader>,
         config: WorkerConfig,
     ) -> Self {
+        let infer_semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_requests));
         Self {
             worker_id,
             gpu_manager,
@@ -67,6 +71,7 @@ impl WorkerService {
             start_time: Instant::now(),
             config,
             metrics: Metrics::new(),
+            infer_semaphore,
         }
     }
 
@@ -76,6 +81,19 @@ impl WorkerService {
     }
 
 
+}
+
+/// Removes the request from the active map when dropped — even if the client
+/// disconnects mid-stream and the response stream is dropped.
+struct ActiveGuard {
+    map: Arc<DashMap<String, Instant>>,
+    id: String,
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.map.remove(&self.id);
+    }
 }
 
 #[tonic::async_trait]
@@ -103,9 +121,18 @@ impl Worker for WorkerService {
             }
         }
 
-        // Validate GPU IDs
+        // Validate GPU IDs — reject out-of-range ids from remote input up front.
+        let device_count = self.gpu_manager.device_count();
+        for &id in &req.gpu_ids {
+            if id < 0 || (id as usize) >= device_count {
+                return Err(Status::invalid_argument(format!(
+                    "gpu_id {} out of range: this worker manages {} device(s)",
+                    id, device_count
+                )));
+            }
+        }
         let gpu_ids: Vec<u32> = if req.gpu_ids.is_empty() {
-            (0..self.gpu_manager.device_count() as u32).collect()
+            (0..device_count as u32).collect()
         } else {
             req.gpu_ids.iter().map(|&id| id as u32).collect()
         };
@@ -171,8 +198,23 @@ impl Worker for WorkerService {
             request_id, req.model_name, req.prompt.len()
         );
 
+        // Concurrency limit — reject instead of queueing unboundedly.
+        let permit = match self.infer_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                return Err(Status::resource_exhausted(format!(
+                    "worker at max_concurrent_requests={}",
+                    self.config.max_concurrent_requests
+                )));
+            }
+        };
+
         // Track active request
         self.active_requests.insert(request_id.clone(), Instant::now());
+        let active_guard = ActiveGuard {
+            map: self.active_requests.clone(),
+            id: request_id.clone(),
+        };
 
         // Get model
         debug!("Inference request {}: waiting for loaded_models read lock", request_id);
@@ -185,8 +227,6 @@ impl Worker for WorkerService {
         let model = match model {
             Some(m) => m,
             None => {
-                debug!("Inference request {}: removing from active_requests mapping", request_id);
-                self.active_requests.remove(&request_id);
                 return Err(Status::not_found(format!("Model {} not loaded", req.model_name)));
             }
         };
@@ -195,12 +235,13 @@ impl Worker for WorkerService {
         let timeout_duration = std::time::Duration::from_secs(self.config.request_timeout_secs);
 
         let metrics = self.metrics.clone();
-        let active_requests = self.active_requests.clone();
         let model_name = req.model_name.clone();
         let req_id = request_id.clone();
 
         // Create response stream
         let stream = try_stream! {
+            let _permit = permit;           // released when the stream is dropped/finished
+            let _active_guard = active_guard; // removes active_requests entry on drop
             let start_time = Instant::now();
             let mut tokens_generated: u32 = 0;
 
@@ -287,9 +328,6 @@ impl Worker for WorkerService {
                     };
                 }
             }
-
-            // Clean up
-            active_requests.remove(&req_id);
         };
 
         Ok(Response::new(Box::pin(stream)))
