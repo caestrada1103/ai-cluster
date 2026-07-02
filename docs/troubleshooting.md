@@ -39,11 +39,20 @@ rocm-smi                      # AMD
 
 ## Model load fails
 
-- `Unsupported architecture: X` — the worker loads `llama`, `qwen`, `deepseek`
-  only. Mistral/Phi/Gemma/Mixtral registry entries are planned placeholders.
-- `Qwen3 checkpoints are not supported yet` — use a Qwen2.5 checkpoint.
-- `quantization ... is not implemented` — request `"quantization": "none"`
-  (weights load as FP32; quantized inference is planned).
+- `Unsupported architecture: X` — this is the **Burn engine** loader, which
+  only loads `llama`, `qwen`, `deepseek` safetensors checkpoints.
+  Mistral/Phi/Gemma/Mixtral registry entries are planned placeholders there.
+  If you need a wider range of architectures or a quantized model, use a
+  registry entry with `engine = "llamacpp"` instead — GGUF architecture
+  support comes from upstream llama.cpp, not this per-family loader (worker
+  must be built with `--features llamacpp`; see
+  [deployment.md](deployment.md)).
+- `Qwen3 checkpoints are not supported yet` — use a Qwen2.5 checkpoint (Burn engine only).
+- `quantization ... is not implemented` — this is the Burn engine's
+  load-time `quantization` field; request `"quantization": "none"` (Burn
+  always loads FP32). To actually run a quantized model, pick a GGUF
+  registry entry (`engine = "llamacpp"`) instead — quantization there comes
+  from the GGUF file, not this field.
 - 401/403 from HuggingFace — set `HF_TOKEN` in `.env` (gated repos like Llama 3).
 - `Out of memory on GPU N` — unload something first:
   `curl -X DELETE http://localhost:8000/v1/models/<name>` — or check

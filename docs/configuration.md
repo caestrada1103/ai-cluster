@@ -73,10 +73,53 @@ request_timeout_secs = 120
 
 ## Model registry: config/models.toml
 
-Real keys per model (everything else is ignored):
+### GGUF / llama.cpp models (recommended)
+
+This is the primary, recommended way to configure a model for the project's
+actual goal — running inference on consumer GPUs (~8–16 GB VRAM, NVIDIA or
+AMD), including idle cards, using a quantized checkpoint. Set
+`engine = "llamacpp"` and point `[models.<key>.gguf]` at a pre-quantized GGUF
+file on Hugging Face; no `[.architecture]` block is needed since llama.cpp
+reads architecture from the GGUF's own metadata. Requires the worker binary
+to be built with `--features llamacpp` (see [deployment.md](deployment.md)).
 
 ```toml
-[models.my-model]                # registry key used in API calls
+[models."qwen2.5-7b-instruct-gguf"]      # registry key used in API calls
+family = "qwen"
+description = "Qwen2.5 7B Instruct — Q4_K_M GGUF, fits an 8 GB consumer GPU"
+parameters = "7B"
+min_memory_gb = 6
+recommended_gpus = 1
+max_gpus = 1
+engine = "llamacpp"
+
+[models."qwen2.5-7b-instruct-gguf".gguf]
+repo_id = "Qwen/Qwen2.5-7B-Instruct-GGUF"    # HF repo containing the GGUF file
+file = "qwen2.5-7b-instruct-q4_k_m.gguf"     # exact filename; already quantized
+n_gpu_layers = -1                            # -1 = offload all layers to the GPU
+n_ctx = 8192
+```
+
+Quantization here is a property of the GGUF file itself (Q4_K_M/Q5_K_M/Q8_0/…
+— whatever the file was exported as), not a separate config knob. Splitting
+one model across multiple consumer GPUs is upstream llama.cpp functionality
+that isn't yet exposed through the worker wrapper (today it loads one GGUF
+model per worker process); `recommended_gpus`/`max_gpus` on larger entries
+describe the target shape once that lands. See real examples (including a
+multi-GPU-target one) in `config/models.toml`.
+
+### Burn / safetensors models (FP32 reference engine)
+
+`engine` defaults to `"burn"` when omitted, and only applies to the worker's
+default cargo build (no `--features llamacpp` needed). The Burn engine loads
+full-precision safetensors and needs an `[.architecture]` block; it does not
+quantize (`quantization != "none"` is rejected) and runs on a single GPU per
+worker. Only `llama`, `qwen`, and `deepseek` architectures are loadable by
+the worker today; `mistral`/`phi`/`gemma`/`mixtral` entries are planned
+placeholders.
+
+```toml
+[models.my-model]
 family = "llama"                 # llama | qwen | deepseek | mistral | phi | gemma
 description = "…"
 parameters = "8B"
@@ -97,7 +140,7 @@ rope_theta = 500000.0
 is_moe = false
 
 [models.my-model.quantization]
-supported = ["none"]             # quantized inference is planned
+supported = ["none"]             # Burn engine is FP32-only; not applicable to GGUF models above
 default = "none"
 
 [models.my-model.parallelism]
@@ -107,9 +150,6 @@ default = "auto"
 [models.my-model.hf]
 repo_id = "org/real-hf-repo"     # what the worker downloads (model_path)
 ```
-
-Only `llama`, `qwen`, and `deepseek` architectures are loadable by the worker
-today; `mistral`/`phi`/`gemma`/`mixtral` entries are planned placeholders.
 
 ## Monitoring configs
 

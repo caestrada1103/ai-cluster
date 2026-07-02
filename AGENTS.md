@@ -6,7 +6,7 @@ This file provides guidance to AI coding agents (Claude Code, Cursor, Copilot, e
 
 AICluster is a distributed LLM inference platform with two core components:
 - **Coordinator** (`coordinator/`) — Python FastAPI service providing an OpenAI-compatible REST API, worker discovery, load balancing, and model registry.
-- **Worker** (`worker/`) — Rust service using the Burn deep learning framework that runs GPU inference and exposes a gRPC endpoint.
+- **Worker** (`worker/`) — Rust service that runs GPU inference through two engines and exposes a gRPC endpoint: **llama.cpp/GGUF** (primary/recommended engine for consumer GPUs — native quantization, e.g. Q4_K_M/Q5_K_M/Q8_0; opt-in via the `llamacpp` cargo feature) and **Burn** (FP32 reference/experimental engine, safetensors; `wgpu` is the **default** cargo build feature — llama.cpp is not compiled unless requested).
 
 Clients talk REST to the coordinator; the coordinator talks gRPC (protobuf) to workers. Protocol definitions live in `proto/cluster.proto` and generated bindings are in `coordinator/proto/` and built by `worker/build.rs`.
 
@@ -27,13 +27,14 @@ uvicorn coordinator.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ### Worker (Rust)
+`wgpu` (Burn engine, FP32) is the **default** cargo feature; add `llamacpp` for the **recommended** GGUF/quantized-inference engine on consumer GPUs.
 ```bash
 cd worker
-cargo build --release --features wgpu    # Universal — Vulkan/DX12/Metal, auto-detects AMD/NVIDIA/Intel (default)
+cargo build --release --features wgpu    # Universal — Vulkan/DX12/Metal, auto-detects AMD/NVIDIA/Intel (default; Burn engine, FP32)
 cargo build --release --features cuda    # NVIDIA base kernels (runtime backend type is still Wgpu — native wiring planned)
 cargo build --release --features rocm    # AMD base kernels (runtime backend type is still Wgpu — native wiring planned)
 cargo build --release --features metal   # macOS — Metal via wgpu
-# llama.cpp engine (GGUF models) — combine with a Burn backend feature:
+# llama.cpp engine (GGUF models, recommended for consumer-GPU quantized inference) — combine with a Burn backend feature:
 cargo build --release --features wgpu,llamacpp                  # llama.cpp on CPU
 cargo build --release --features wgpu,llamacpp,llamacpp-vulkan  # llama.cpp Vulkan offload
 cargo build --release --features cuda,llamacpp,llamacpp-cuda    # llama.cpp CUDA offload
@@ -77,7 +78,7 @@ cargo clippy -p ai-worker --features wgpu -- -D warnings
 ## Architecture
 
 ```
-Client (REST) → Coordinator (FastAPI) → Workers (Rust/Burn) → GPU
+Client (REST) → Coordinator (FastAPI) → Workers (Rust: llama.cpp + Burn) → GPU
                       │
               Prometheus / Grafana
 ```
@@ -96,8 +97,8 @@ Client (REST) → Coordinator (FastAPI) → Workers (Rust/Burn) → GPU
 - `main.rs` — CLI entry point (clap), tokio runtime, gRPC server startup
 - `worker.rs` — gRPC service handlers
 - `gpu_manager.rs` — GPU detection and VRAM management
-- `model_loader.rs` — Safetensors loading as FP32 (quantization ≠ NONE is rejected; quantized inference planned); resolves HF repo via `LoadModelRequest.model_path`
-- `llamacpp_engine.rs` — llama.cpp engine for GGUF models (feature `llamacpp`, crate `llama-cpp-2 =0.1.150`); implements `TextGeneration`
+- `model_loader.rs` — Burn engine: safetensors loading as FP32 (quantization ≠ NONE is rejected; quantized inference for this path is planned — already available today via the llama.cpp engine below); resolves HF repo via `LoadModelRequest.model_path`
+- `llamacpp_engine.rs` — **llama.cpp engine (primary/recommended for consumer GPUs)** for GGUF models (feature `llamacpp`, crate `llama-cpp-2 =0.1.150`); native quantization (Q4_K_M/Q5_K_M/Q8_0/…); implements `TextGeneration`
 - `backend.rs` — `WorkerBackend` type alias (Wgpu; cuda/rocm features compile burn's native kernels but runtime selection is not wired — planned)
 - `config.rs` — Worker config struct, reads `worker.toml`
 - `error.rs` — Shared error types (`thiserror`)
@@ -113,7 +114,12 @@ Client (REST) → Coordinator (FastAPI) → Workers (Rust/Burn) → GPU
 
 ## Key Development Patterns
 
-### Adding a new model
+### Adding a new GGUF model (llama.cpp engine, recommended)
+1. Add an entry to `config/models.toml` with `engine = "llamacpp"` and a `[models.X.gguf]` block (`repo_id`, `file`, `n_gpu_layers`, `n_ctx`) — no `[models.X.architecture]` block needed (read from GGUF metadata) and no conversion step required.
+2. Build the worker with the engine enabled: `cargo build --release --features wgpu,llamacpp` (add `llamacpp-vulkan`/`llamacpp-cuda` for GPU offload).
+3. Load via API: `POST /v1/models/load {"model_name": "your-model"}`
+
+### Adding a new Burn/safetensors model (reference engine)
 1. Convert weights: `python scripts/convert_model.py <hf-repo> --output ./models/`
 2. Add entry to `config/models.toml` (architecture, memory, HF repo ID, quantization flags)
 3. Load via API: `POST /v1/models/load {"model_name": "your-model"}`
@@ -140,7 +146,7 @@ Client (REST) → Coordinator (FastAPI) → Workers (Rust/Burn) → GPU
 ## CI / GitHub Actions
 
 `.github/workflows/ci.yml` runs on every push/PR to `master` and `feature` branches:
-- **Rust job**: `cargo check`, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --features wgpu`
+- **Rust job**: `cargo check --features wgpu`, `cargo check --features llamacpp` (compiles the llama.cpp engine via cmake + libclang), `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --features wgpu`
 - **Python job**: `ruff check`, `black --check`, `mypy` (strict; pydantic plugin; `coordinator/proto/` excluded), `pytest coordinator/`
 
 ## Worker Model Architecture

@@ -67,11 +67,21 @@ OpenAI-style list with cluster extensions:
 }
 ```
 
+`supports_quantization` always reads `["none"]` today, including for
+GGUF/llama.cpp-engine models — it describes the `quantization` request field
+below (a Burn-engine load-time knob), not whether the model file itself is
+quantized. A registry entry with `engine = "llamacpp"` runs a GGUF file
+that's already quantized (e.g. Q4_K_M) regardless of this field; see
+[configuration.md](configuration.md).
+
 ### POST /v1/models/load
 
 Request: `{"model_name": "<registry key or HF repo id>", "worker_id": null, "quantization": "none"}`
-— only `"none"` loads today (other values 422/are rejected by workers; quantized
-inference is planned).
+— the `quantization` field only accepts `"none"` today (other values are
+422/rejected by workers). It applies to the Burn engine's FP32 loader only;
+it is not how GGUF models get quantized — for those, quantization comes from
+the GGUF file picked in the registry entry (`engine = "llamacpp"`), and this
+field stays `"none"` regardless.
 Response: `{"status": "loaded"|"failed", "model_name": "...", "worker_id": "...", "memory_used_gb": null, "message": null}`
 
 ### DELETE /v1/models/{model_name}

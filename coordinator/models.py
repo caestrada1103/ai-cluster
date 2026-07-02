@@ -1,4 +1,14 @@
-"""Model registry and configuration."""
+"""Model registry and configuration.
+
+AICluster's goal is running LLM inference on consumer GPUs (gaming-PC cards,
+~8-16 GB VRAM each, including idle ones) across both NVIDIA and AMD hardware.
+The llama.cpp/GGUF engine (``engine="llamacpp"``) is the recommended, primary
+path for that: it natively quantizes models (Q4_K_M/Q5_K_M/Q8_0/...) so they
+fit in limited consumer VRAM, and runs on NVIDIA (CUDA/Vulkan) and AMD
+(ROCm/Vulkan). The Burn engine (``engine="burn"``, the dataclass default) is
+the experimental/reference path: it loads weights as FP32 only (no
+quantization) and runs a model on a single GPU per worker.
+"""
 
 import logging
 from dataclasses import dataclass, field
@@ -126,7 +136,14 @@ class ModelConfig:
 
 
 class ModelRegistry:
-    """Registry of all available models."""
+    """Registry of all available models.
+
+    Featured/recommended: the ``*-gguf`` entries below (``engine="llamacpp"``)
+    are the primary path for AICluster's consumer-GPU goal — quantized models
+    that fit in 8-16 GB of VRAM, on NVIDIA or AMD. The remaining entries use
+    the Burn engine (``engine="burn"``, the dataclass default), an
+    experimental/reference path that loads FP32 weights on a single GPU.
+    """
 
     # Predefined model configurations
     MODELS: Dict[str, ModelConfig] = {}
@@ -136,6 +153,167 @@ class ModelRegistry:
         """Initialize the model registry with default models."""
         # Note: In a production environment, this could be empty and
         # only populated via load_from_config.
+
+        # GGUF / llama.cpp models (PRIMARY — quantized, consumer NVIDIA+AMD)
+        # ====================================================================
+        # Recommended path for AICluster's actual goal: running a quantized
+        # model on consumer GPUs (~8-16 GB VRAM gaming cards, including idle
+        # ones) on NVIDIA (CUDA/Vulkan) or AMD (ROCm/Vulkan). Served by the
+        # worker's llama.cpp engine (worker built with --features llamacpp).
+        # These entries mirror config/models.toml so the two sources never
+        # diverge; architecture fields are unused for this engine (real
+        # values come from GGUF metadata at load time), so they are zeroed.
+        cls.MODELS["qwen2.5-0.5b-gguf"] = ModelConfig(
+            name="qwen2.5-0.5b-gguf",
+            family=ModelFamily.QWEN,
+            parameters="0.5B",
+            min_memory_gb=1,
+            recommended_gpus=1,
+            max_gpus=1,
+            num_layers=0,
+            hidden_size=0,
+            num_attention_heads=0,
+            vocab_size=0,
+            max_seq_len=4096,
+            intermediate_size=0,
+            supports_quantization=[Quantization.NONE],
+            supports_parallelism=[ParallelismStrategy.SINGLE],
+            description=(
+                "Qwen2.5 0.5B Instruct — Q4_K_M GGUF served by the llama.cpp engine "
+                "(smoke-test model)"
+            ),
+            model_url="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+            engine="llamacpp",
+            gguf_repo_id="Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+            gguf_file="qwen2.5-0.5b-instruct-q4_k_m.gguf",
+            gguf_n_gpu_layers=-1,
+            gguf_n_ctx=4096,
+        )
+
+        cls.MODELS["qwen2.5-7b-instruct-gguf"] = ModelConfig(
+            name="qwen2.5-7b-instruct-gguf",
+            family=ModelFamily.QWEN,
+            parameters="7B",
+            min_memory_gb=6,
+            recommended_gpus=1,
+            max_gpus=1,
+            num_layers=0,
+            hidden_size=0,
+            num_attention_heads=0,
+            vocab_size=0,
+            max_seq_len=8192,
+            intermediate_size=0,
+            supports_quantization=[Quantization.NONE],
+            supports_parallelism=[ParallelismStrategy.SINGLE],
+            description="Qwen2.5 7B Instruct — Q4_K_M GGUF, fits an 8 GB consumer GPU",
+            model_url="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF",
+            engine="llamacpp",
+            gguf_repo_id="Qwen/Qwen2.5-7B-Instruct-GGUF",
+            gguf_file="qwen2.5-7b-instruct-q4_k_m.gguf",
+            gguf_n_gpu_layers=-1,
+            gguf_n_ctx=8192,
+        )
+
+        cls.MODELS["qwen2.5-coder-7b-gguf"] = ModelConfig(
+            name="qwen2.5-coder-7b-gguf",
+            family=ModelFamily.QWEN,
+            parameters="7B",
+            min_memory_gb=6,
+            recommended_gpus=1,
+            max_gpus=1,
+            num_layers=0,
+            hidden_size=0,
+            num_attention_heads=0,
+            vocab_size=0,
+            max_seq_len=8192,
+            intermediate_size=0,
+            supports_quantization=[Quantization.NONE],
+            supports_parallelism=[ParallelismStrategy.SINGLE],
+            description="Qwen2.5-Coder 7B Instruct — Q4_K_M GGUF, fits an 8 GB consumer GPU",
+            model_url="https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+            engine="llamacpp",
+            gguf_repo_id="Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+            gguf_file="qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+            gguf_n_gpu_layers=-1,
+            gguf_n_ctx=8192,
+        )
+
+        cls.MODELS["llama3.1-8b-instruct-gguf"] = ModelConfig(
+            name="llama3.1-8b-instruct-gguf",
+            family=ModelFamily.LLAMA,
+            parameters="8B",
+            min_memory_gb=7,
+            recommended_gpus=1,
+            max_gpus=1,
+            num_layers=0,
+            hidden_size=0,
+            num_attention_heads=0,
+            vocab_size=0,
+            max_seq_len=8192,
+            intermediate_size=0,
+            supports_quantization=[Quantization.NONE],
+            supports_parallelism=[ParallelismStrategy.SINGLE],
+            description="Meta Llama 3.1 8B Instruct — Q4_K_M GGUF, fits an 8 GB consumer GPU",
+            model_url="https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+            engine="llamacpp",
+            gguf_repo_id="bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+            gguf_file="Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+            gguf_n_gpu_layers=-1,
+            gguf_n_ctx=8192,
+        )
+
+        cls.MODELS["qwen2.5-14b-instruct-gguf"] = ModelConfig(
+            name="qwen2.5-14b-instruct-gguf",
+            family=ModelFamily.QWEN,
+            parameters="14B",
+            min_memory_gb=12,
+            recommended_gpus=1,
+            max_gpus=1,
+            num_layers=0,
+            hidden_size=0,
+            num_attention_heads=0,
+            vocab_size=0,
+            max_seq_len=8192,
+            intermediate_size=0,
+            supports_quantization=[Quantization.NONE],
+            supports_parallelism=[ParallelismStrategy.SINGLE],
+            description="Qwen2.5 14B Instruct — Q4_K_M GGUF, fits a 12-16 GB consumer GPU",
+            model_url="https://huggingface.co/Qwen/Qwen2.5-14B-Instruct-GGUF",
+            engine="llamacpp",
+            gguf_repo_id="Qwen/Qwen2.5-14B-Instruct-GGUF",
+            gguf_file="qwen2.5-14b-instruct-q4_k_m.gguf",
+            gguf_n_gpu_layers=-1,
+            gguf_n_ctx=8192,
+        )
+
+        # Multi-GPU split via llama.cpp is the upcoming worker feature; this is
+        # the "quantized model split across two consumer GPUs" showcase entry.
+        cls.MODELS["qwen2.5-coder-32b-gguf"] = ModelConfig(
+            name="qwen2.5-coder-32b-gguf",
+            family=ModelFamily.QWEN,
+            parameters="32B",
+            min_memory_gb=20,
+            recommended_gpus=2,
+            max_gpus=4,
+            num_layers=0,
+            hidden_size=0,
+            num_attention_heads=0,
+            vocab_size=0,
+            max_seq_len=8192,
+            intermediate_size=0,
+            supports_quantization=[Quantization.NONE],
+            supports_parallelism=[ParallelismStrategy.SINGLE],
+            description="Qwen2.5-Coder 32B Instruct — Q4_K_M GGUF, split across 2 consumer GPUs",
+            model_url="https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+            engine="llamacpp",
+            gguf_repo_id="Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+            gguf_file="qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+            gguf_n_gpu_layers=-1,
+            gguf_n_ctx=8192,
+        )
+
+        # Burn models (experimental — FP32 reference engine, single GPU)
+        # ====================================================================
 
         # DeepSeek models
         cls.MODELS["deepseek-7b"] = ModelConfig(

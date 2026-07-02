@@ -13,12 +13,136 @@ warm_up_prompts = [
     "What is AI?"
 ]
 
+# GGUF / llama.cpp (PRIMARY — quantized, consumer NVIDIA+AMD)
+# =============================================================
+# AICluster's actual goal is running LLM inference on consumer GPUs (gaming-PC
+# cards, ~8-16 GB VRAM each, including idle ones) across BOTH NVIDIA and AMD —
+# a quantized model that fits in limited VRAM and/or one model split across
+# several consumer GPUs. The llama.cpp/GGUF engine is what makes that
+# possible: native quantization (Q4_K_M/Q5_K_M/Q8_0/...) instead of the Burn
+# engine's FP32-only loader. Served by the worker's llama.cpp engine (worker
+# built with `--features llamacpp` [+ `llamacpp-vulkan` | `llamacpp-cuda`]);
+# runs on NVIDIA via CUDA/Vulkan and AMD via ROCm/Vulkan. Architecture
+# parameters come from GGUF metadata, so no [.architecture] block is needed
+# here. `engine` defaults to "burn" for every other model in this file — these
+# entries opt in with `engine = "llamacpp"`.
+#
+# NOTE: llama.cpp is an opt-in cargo feature, not the default build (the
+# default cargo build still compiles the Burn/wgpu path only).
+#
+# NOTE: exact GGUF filenames below should be confirmed against the HF repo
+# before download — quant naming/casing varies by uploader.
+
+[models."qwen2.5-0.5b-gguf"]
+family = "qwen"
+description = "Qwen2.5 0.5B Instruct — Q4_K_M GGUF served by the llama.cpp engine (smoke-test model)"
+parameters = "0.5B"
+min_memory_gb = 1
+recommended_gpus = 1
+max_gpus = 1
+engine = "llamacpp"
+
+[models."qwen2.5-0.5b-gguf".gguf]
+repo_id = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+file = "qwen2.5-0.5b-instruct-q4_k_m.gguf"  # ~469 MiB download
+n_gpu_layers = -1  # -1 = offload all layers to the GPU
+n_ctx = 4096
+
+[models."qwen2.5-7b-instruct-gguf"]
+family = "qwen"
+description = "Qwen2.5 7B Instruct — Q4_K_M GGUF, fits an 8 GB consumer GPU"
+parameters = "7B"
+min_memory_gb = 6
+recommended_gpus = 1
+max_gpus = 1
+engine = "llamacpp"
+
+[models."qwen2.5-7b-instruct-gguf".gguf]
+repo_id = "Qwen/Qwen2.5-7B-Instruct-GGUF"
+file = "qwen2.5-7b-instruct-q4_k_m.gguf"
+n_gpu_layers = -1  # -1 = offload all layers to the GPU
+n_ctx = 8192
+
+[models."qwen2.5-coder-7b-gguf"]
+family = "qwen"
+description = "Qwen2.5-Coder 7B Instruct — Q4_K_M GGUF, fits an 8 GB consumer GPU"
+parameters = "7B"
+min_memory_gb = 6
+recommended_gpus = 1
+max_gpus = 1
+engine = "llamacpp"
+
+[models."qwen2.5-coder-7b-gguf".gguf]
+repo_id = "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
+file = "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+n_gpu_layers = -1  # -1 = offload all layers to the GPU
+n_ctx = 8192
+
+[models."llama3.1-8b-instruct-gguf"]
+family = "llama"
+description = "Meta Llama 3.1 8B Instruct — Q4_K_M GGUF, fits an 8 GB consumer GPU"
+parameters = "8B"
+min_memory_gb = 7
+recommended_gpus = 1
+max_gpus = 1
+engine = "llamacpp"
+
+[models."llama3.1-8b-instruct-gguf".gguf]
+repo_id = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
+file = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+n_gpu_layers = -1  # -1 = offload all layers to the GPU
+n_ctx = 8192
+
+[models."qwen2.5-14b-instruct-gguf"]
+family = "qwen"
+description = "Qwen2.5 14B Instruct — Q4_K_M GGUF, fits a 12-16 GB consumer GPU"
+parameters = "14B"
+min_memory_gb = 12
+recommended_gpus = 1
+max_gpus = 1
+engine = "llamacpp"
+
+[models."qwen2.5-14b-instruct-gguf".gguf]
+repo_id = "Qwen/Qwen2.5-14B-Instruct-GGUF"
+file = "qwen2.5-14b-instruct-q4_k_m.gguf"
+n_gpu_layers = -1  # -1 = offload all layers to the GPU
+n_ctx = 8192
+
+# The "split a quantized model across two consumer GPUs" showcase. Multi-GPU
+# tensor/layer split for the llama.cpp engine is the upcoming worker feature
+# (today the worker loads one GGUF model per worker process); recommended_gpus
+# / max_gpus describe the target deployment shape once that lands.
+[models."qwen2.5-coder-32b-gguf"]
+family = "qwen"
+description = "Qwen2.5-Coder 32B Instruct — Q4_K_M GGUF, split across 2 consumer GPUs"
+parameters = "32B"
+min_memory_gb = 20
+recommended_gpus = 2
+max_gpus = 4
+engine = "llamacpp"
+
+[models."qwen2.5-coder-32b-gguf".gguf]
+repo_id = "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF"
+file = "qwen2.5-coder-32b-instruct-q4_k_m.gguf"
+n_gpu_layers = -1  # -1 = offload all layers to the GPU
+n_ctx = 8192
+
+# Burn / safetensors Models (experimental — FP32 reference engine)
+# ===================================================================
+# `engine` defaults to "burn" for the models below (worker built with default
+# cargo features, no --features llamacpp required). Burn loads weights as
+# FP32 — it does not quantize (quantization != "none" is rejected) — and runs
+# a model on a single GPU per worker; tensor/pipeline parallelism exists in
+# worker/src/parallelism.rs but is not wired to inference yet. Treat this as
+# the experimental / reference path — the GGUF/llama.cpp section above is the
+# primary, recommended engine for the project's consumer-GPU goal.
+
 # DeepSeek Models
 # ===============
 
 [models.deepseek-7b]
 family = "deepseek"
-description = "DeepSeek LLM 7B Base (dense, Llama-style)"
+description = "DeepSeek LLM 7B Base (dense, Llama-style) (Burn FP32 reference engine — single GPU, no quantization)"
 parameters = "7B"
 min_memory_gb = 16
 recommended_gpus = 1
@@ -57,7 +181,7 @@ filename = "model.safetensors"
 
 [models.deepseek-67b]
 family = "deepseek"
-description = "DeepSeek LLM 67B Base (dense, GQA)"
+description = "DeepSeek LLM 67B Base (dense, GQA) (Burn FP32 reference engine — single GPU, no quantization)"
 parameters = "67B"
 min_memory_gb = 140
 recommended_gpus = 4
@@ -98,7 +222,7 @@ filename = "model.safetensors.index.json"
 
 [models.llama3-8b]
 family = "llama"
-description = "Meta Llama 3 8B Instruct"
+description = "Meta Llama 3 8B Instruct (Burn FP32 reference engine — single GPU, no quantization)"
 parameters = "8B"
 min_memory_gb = 16
 recommended_gpus = 1
@@ -136,7 +260,7 @@ filename = "model-00001-of-00002.safetensors"
 
 [models.llama3-70b]
 family = "llama"
-description = "Meta Llama 3 70B Instruct"
+description = "Meta Llama 3 70B Instruct (Burn FP32 reference engine — single GPU, no quantization)"
 parameters = "70B"
 min_memory_gb = 140
 recommended_gpus = 4
@@ -177,7 +301,7 @@ filename = "model-00001-of-00030.safetensors"
 
 [models.mistral-7b]
 family = "mistral"
-description = "Mistral 7B v0.1 (planned — worker loader does not support Mistral yet)"
+description = "Mistral 7B v0.1 (planned — worker loader does not support Mistral yet) (Burn FP32 reference engine — single GPU, no quantization)"
 parameters = "7B"
 min_memory_gb = 14
 recommended_gpus = 1
@@ -220,7 +344,7 @@ filename = "model.safetensors"
 # NOT LOADABLE YET: worker model_loader supports llama / qwen / deepseek architectures only.
 [models.phi-2]
 family = "phi"
-description = "Microsoft Phi-2 (2.7B) (planned — worker loader supports llama/qwen/deepseek only)"
+description = "Microsoft Phi-2 (2.7B) (planned — worker loader supports llama/qwen/deepseek only) (Burn FP32 reference engine — single GPU, no quantization)"
 parameters = "2.7B"
 min_memory_gb = 6
 recommended_gpus = 1
@@ -261,7 +385,7 @@ filename = "model.safetensors"
 # NOT LOADABLE YET: worker model_loader supports llama / qwen / deepseek architectures only.
 [models.gemma-2b]
 family = "gemma"
-description = "Google Gemma 2B (planned — worker loader supports llama/qwen/deepseek only)"
+description = "Google Gemma 2B (planned — worker loader supports llama/qwen/deepseek only) (Burn FP32 reference engine — single GPU, no quantization)"
 parameters = "2B"
 min_memory_gb = 4
 recommended_gpus = 1
@@ -296,7 +420,7 @@ filename = "model.safetensors"
 # NOT LOADABLE YET: worker model_loader supports llama / qwen / deepseek architectures only.
 [models.gemma-7b]
 family = "gemma"
-description = "Google Gemma 7B (planned — worker loader supports llama/qwen/deepseek only)"
+description = "Google Gemma 7B (planned — worker loader supports llama/qwen/deepseek only) (Burn FP32 reference engine — single GPU, no quantization)"
 parameters = "7B"
 min_memory_gb = 14
 recommended_gpus = 1
@@ -329,7 +453,7 @@ filename = "model.safetensors"
 # NOT LOADABLE YET: worker model_loader supports llama / qwen / deepseek architectures only.
 [models.mixtral-8x7b]
 family = "mistral"
-description = "Mistral Mixtral 8x7B MoE (planned — worker loader supports llama/qwen/deepseek only)"
+description = "Mistral Mixtral 8x7B MoE (planned — worker loader supports llama/qwen/deepseek only) (Burn FP32 reference engine — single GPU, no quantization)"
 parameters = "46.7B"
 min_memory_gb = 90
 recommended_gpus = 2
@@ -372,7 +496,7 @@ filename = "model-00001-of-00019.safetensors"
 
 [models."TinyLlama/TinyLlama-1.1B-Chat-v1.0"]
 family = "llama"
-description = "TinyLlama 1.1B Chat v1.0"
+description = "TinyLlama 1.1B Chat v1.0 (Burn FP32 reference engine — single GPU, no quantization)"
 parameters = "1.1B"
 min_memory_gb = 2
 recommended_gpus = 1
@@ -403,7 +527,7 @@ filename = "model.safetensors"
 
 [models.qwen3-coder-32b]
 family = "qwen"
-description = "Qwen2.5-Coder 32B Instruct — strong open-source coding model"
+description = "Qwen2.5-Coder 32B Instruct — strong open-source coding model (Burn FP32 reference engine — single GPU, no quantization)"
 parameters = "32B"
 min_memory_gb = 65
 recommended_gpus = 2
@@ -439,7 +563,7 @@ default = "single"
 
 [models.deepseek-v3]
 family = "deepseek"
-description = "DeepSeek V3 — 671B MoE (37B active params), Claude Opus tier (SWE-Bench 73.1%)"
+description = "DeepSeek V3 — 671B MoE (37B active params), Claude Opus tier (SWE-Bench 73.1%) (Burn FP32 reference engine — single GPU, no quantization)"
 parameters = "671B"
 min_memory_gb = 600
 recommended_gpus = 8
@@ -471,24 +595,3 @@ default = "none"
 [models.deepseek-v3.parallelism]
 supported = ["single", "tensor", "pipeline"]
 default = "tensor"
-
-# GGUF / llama.cpp Models
-# =======================
-# Served by the worker's llama.cpp engine (worker built with --features llamacpp).
-# Architecture parameters come from GGUF metadata, so no [.architecture] block
-# is needed. `engine` defaults to "burn" for every other model in this file.
-
-[models."qwen2.5-0.5b-gguf"]
-family = "qwen"
-description = "Qwen2.5 0.5B Instruct — Q4_K_M GGUF served by the llama.cpp engine"
-parameters = "0.5B"
-min_memory_gb = 1
-recommended_gpus = 1
-max_gpus = 1
-engine = "llamacpp"
-
-[models."qwen2.5-0.5b-gguf".gguf]
-repo_id = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
-file = "qwen2.5-0.5b-instruct-q4_k_m.gguf"  # ~469 MiB download
-n_gpu_layers = -1  # -1 = offload all layers to the GPU
-n_ctx = 4096

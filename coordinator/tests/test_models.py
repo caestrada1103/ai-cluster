@@ -357,3 +357,84 @@ def test_real_models_toml_gguf_entry_loads() -> None:
     assert cfg.engine == "llamacpp"
     assert cfg.gguf_repo_id == "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
     assert cfg.gguf_file == "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+
+
+# ---------------------------------------------------------------------------
+# GGUF/llama.cpp is the featured, primary engine — hardcoded registry coverage
+# ---------------------------------------------------------------------------
+
+# model_name -> (gguf_repo_id, gguf_file, gguf_n_ctx)
+_FEATURED_GGUF_MODELS = {
+    "qwen2.5-0.5b-gguf": (
+        "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        4096,
+    ),
+    "qwen2.5-7b-instruct-gguf": (
+        "Qwen/Qwen2.5-7B-Instruct-GGUF",
+        "qwen2.5-7b-instruct-q4_k_m.gguf",
+        8192,
+    ),
+    "qwen2.5-coder-7b-gguf": (
+        "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+        "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+        8192,
+    ),
+    "llama3.1-8b-instruct-gguf": (
+        "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+        "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        8192,
+    ),
+    "qwen2.5-14b-instruct-gguf": (
+        "Qwen/Qwen2.5-14B-Instruct-GGUF",
+        "qwen2.5-14b-instruct-q4_k_m.gguf",
+        8192,
+    ),
+    "qwen2.5-coder-32b-gguf": (
+        "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+        "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+        8192,
+    ),
+}
+
+
+@pytest.mark.parametrize("model_name", sorted(_FEATURED_GGUF_MODELS))
+def test_featured_gguf_model_registered_out_of_the_box(model_name: str) -> None:
+    """The hardcoded registry (no models.toml load needed) already ships the
+    featured GGUF/llama.cpp models — the primary engine for consumer GPUs."""
+    repo_id, file, n_ctx = _FEATURED_GGUF_MODELS[model_name]
+    cfg = ModelRegistry.get_model(model_name)
+    assert cfg is not None, model_name
+    assert cfg.engine == "llamacpp"
+    assert cfg.gguf_repo_id == repo_id
+    assert cfg.gguf_file == file
+    assert cfg.gguf_n_gpu_layers == -1
+    assert cfg.gguf_n_ctx == n_ctx
+    assert cfg.supports_quantization == [Quantization.NONE]
+
+
+def test_qwen_coder_32b_gguf_is_the_multi_gpu_showcase() -> None:
+    cfg = ModelRegistry.get_model("qwen2.5-coder-32b-gguf")
+    assert cfg is not None
+    assert cfg.recommended_gpus == 2
+    assert cfg.max_gpus == 4
+
+
+def test_hardcoded_gguf_models_match_models_toml() -> None:
+    """coordinator/models.py and config/models.toml must never diverge for the
+    featured GGUF models — both are read as sources of truth in different
+    deployment modes (hardcoded default vs. config-file override)."""
+    models_toml = Path(__file__).resolve().parents[2] / "config" / "models.toml"
+    toml_data = toml.load(models_toml)["models"]
+    for model_name in _FEATURED_GGUF_MODELS:
+        hardcoded = ModelRegistry.get_model(model_name)
+        assert hardcoded is not None, model_name
+        toml_entry = toml_data[model_name]
+        assert toml_entry["engine"] == "llamacpp"
+        assert hardcoded.gguf_repo_id == toml_entry["gguf"]["repo_id"]
+        assert hardcoded.gguf_file == toml_entry["gguf"]["file"]
+        assert hardcoded.gguf_n_gpu_layers == toml_entry["gguf"]["n_gpu_layers"]
+        assert hardcoded.gguf_n_ctx == toml_entry["gguf"]["n_ctx"]
+        assert hardcoded.min_memory_gb == pytest.approx(float(toml_entry["min_memory_gb"]))
+        assert hardcoded.recommended_gpus == toml_entry["recommended_gpus"]
+        assert hardcoded.max_gpus == toml_entry["max_gpus"]

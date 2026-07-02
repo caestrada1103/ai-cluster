@@ -101,8 +101,8 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
 ## Tech Stack
 
 - **Coordinator**: Python (FastAPI, gRPC)
-- **Worker**: Rust (Burn Framework, Tokio, Tonic)
-- **Inference Engines**: Burn 0.19 (safetensors, default) + llama.cpp via `llama-cpp-2 =0.1.150` (GGUF, opt-in `llamacpp` cargo feature)
+- **Worker**: Rust (Burn Framework + llama.cpp, Tokio, Tonic)
+- **Inference Engines**: **llama.cpp/GGUF** (`llama-cpp-2 =0.1.150`) — **recommended engine** for quantized inference on consumer NVIDIA/AMD GPUs (native Q4_K_M/Q5_K_M/Q8_0 quantization; opt-in via the `llamacpp` cargo feature) + **Burn 0.19** (safetensors, FP32, the **default** cargo build feature) — experimental/reference engine, no quantization yet
 - **Communication**: gRPC (Inter-service), REST API (Client-facing)
 - **GPU Acceleration**:
     - **AMD**: ROCm (HIP)
@@ -158,6 +158,15 @@ For detailed architecture information, see the [Architecture Guide](docs/archite
 ---
 
 ## Quick Start
+
+> **Recommended for consumer GPUs**: the steps below bring up the full stack
+> using the default Burn/wgpu build (FP32, single GPU per worker) so you can
+> get everything running quickly. For **quantized** models on consumer
+> NVIDIA/AMD GPUs (~8-16 GB VRAM) — the project's primary goal — build the
+> worker with the **llama.cpp/GGUF engine** instead (`--features llamacpp`
+> [+ `llamacpp-vulkan`/`llamacpp-cuda`]) and load a `[models.X.gguf]` entry;
+> see [Adding a GGUF model](#adding-a-gguf-model-llamacpp-engine-recommended)
+> below for the recommended end-to-end example.
 
 ### Method 1: Docker Compose
 
@@ -215,6 +224,9 @@ cd worker
 # For AMD: cargo run --release --features rocm
 # For NVIDIA: cargo run --release --features cuda
 cargo run --release --features cuda
+# Recommended for consumer GPUs — add the llama.cpp/GGUF engine for quantized models:
+#   cargo run --release --features wgpu,llamacpp,llamacpp-vulkan   (Vulkan offload, AMD or NVIDIA)
+#   cargo run --release --features cuda,llamacpp,llamacpp-cuda     (NVIDIA CUDA offload)
 
 # 5. Start the Coordinator locally
 # In the original python terminal:
@@ -255,7 +267,33 @@ curl -X POST http://localhost:8000/v1/completions \
 
 ## Supported Models
 
-AI Cluster supports a wide range of popular models:
+AI Cluster runs models through two inference engines: **llama.cpp/GGUF**
+(recommended — quantized, runs on consumer NVIDIA + AMD GPUs) and
+**Burn/safetensors** (experimental FP32 reference engine, single GPU per
+worker).
+
+### GGUF models via llama.cpp (recommended)
+
+This is the recommended way to run models on consumer-grade GPUs (~8-16 GB
+VRAM): weights are loaded **quantized** (Q4_K_M, Q5_K_M, Q8_0, …) so larger
+models fit in limited VRAM, and inference runs on both NVIDIA (CUDA/Vulkan)
+and AMD (ROCm/Vulkan). It's opt-in — build the worker with `--features
+llamacpp` (see [Adding a GGUF model](#adding-a-gguf-model-llamacpp-engine-recommended)
+below). Splitting one GGUF model across several consumer GPUs is on the
+worker roadmap; today one GGUF model loads per worker process.
+
+| Model | Status | Notes |
+|-------|--------|-------|
+| **Any GGUF checkpoint** (e.g. Qwen2.5, Llama 3.1, Qwen2.5-Coder, …) | ✅ Implemented (opt-in: build worker with `--features llamacpp` [+ `llamacpp-vulkan`/`llamacpp-cuda`]) | Native quantization: Q4_K_M, Q5_K_M, Q8_0, …; NVIDIA + AMD; multi-GPU split upcoming |
+
+### Burn / safetensors models (experimental FP32 reference)
+
+The Burn engine is the **default** cargo build feature (`--features
+wgpu|cuda|rocm`) and serves as the experimental / reference path: it loads
+full-precision **FP32** safetensors weights — it does not quantize (non-`none`
+quantization requests are rejected) — and runs a model on a **single GPU** per
+worker. Tensor/pipeline parallelism exist in `worker/src/parallelism.rs` but
+are not yet wired to inference.
 
 | Model Family | Sizes | Status | Notes |
 |--------------|-------|--------|-------|
@@ -263,13 +301,44 @@ AI Cluster supports a wide range of popular models:
 | **Qwen 2.5 Coder** | 32B | ✅ Implemented | GQA + RoPE + SwiGLU (Qwen3 not yet supported) |
 | **DeepSeek (dense)** | 7B, 67B | ✅ Implemented | loads via the Llama-layout path |
 | **DeepSeek (MoE/V3)** | 671B | 🔶 Model code present | V3 routing (sigmoid/MLA) not implemented |
-| **GGUF via llama.cpp** | Any GGUF (e.g. Qwen2.5 0.5B Instruct) | ✅ Implemented (opt-in: build worker with `--features llamacpp`) | GGUF-native quant: Q4_K_M, Q5_K_M, Q8_0, … |
 | **Mistral** | 7B | 🔶 Model code present, not wired to loader | no TextGeneration/tokenizer/KV cache yet |
 | **Mixtral** | 8x7B | 🔲 Planned | |
 | **Gemma** | 2B, 7B | 🔲 Planned | |
 | **Phi** | 2, 3-mini | 🔲 Planned | |
 
-### Adding Custom Models
+### Adding a GGUF model (llama.cpp engine, recommended)
+
+```toml
+# config/models.toml — no architecture block needed (read from GGUF metadata)
+[models."qwen2.5-0.5b-gguf"]
+family = "qwen"
+parameters = "0.5B"
+min_memory_gb = 1
+engine = "llamacpp"
+
+[models."qwen2.5-0.5b-gguf".gguf]
+repo_id = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+file = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+n_gpu_layers = -1  # -1 = all layers on GPU
+n_ctx = 4096
+```
+
+The worker must be built with the engine enabled: `cargo build --release --features wgpu,llamacpp` (add `llamacpp-vulkan` or `llamacpp-cuda` for GPU offload), or `docker build -f docker/Dockerfile.worker --build-arg WORKER_FEATURES="llamacpp,llamacpp-vulkan" .`. Then load and run it like any other model:
+
+```bash
+curl -X POST http://localhost:8000/v1/models/load \
+  -d '{"model_name": "qwen2.5-0.5b-gguf"}'
+
+curl -X POST http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen2.5-0.5b-gguf",
+    "prompt": "Hello, how are you?",
+    "max_tokens": 50
+  }'
+```
+
+### Adding a Burn/safetensors model (reference engine)
 
 ```python
 # 1. Convert your model
@@ -290,25 +359,6 @@ hidden_size = 4096
 curl -X POST http://localhost:8000/v1/models/load \
   -d '{"model_name": "your-model"}'
 ```
-
-### Adding a GGUF model (llama.cpp engine)
-
-```toml
-# config/models.toml — no architecture block needed (read from GGUF metadata)
-[models."qwen2.5-0.5b-gguf"]
-family = "qwen"
-parameters = "0.5B"
-min_memory_gb = 1
-engine = "llamacpp"
-
-[models."qwen2.5-0.5b-gguf".gguf]
-repo_id = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
-file = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
-n_gpu_layers = -1  # -1 = all layers on GPU
-n_ctx = 4096
-```
-
-The worker must be built with the engine enabled: `cargo build --release --features wgpu,llamacpp` (add `llamacpp-vulkan` or `llamacpp-cuda` for GPU offload), or `docker build -f docker/Dockerfile.worker --build-arg WORKER_FEATURES="llamacpp,llamacpp-vulkan" .`
 
 ---
 
@@ -349,7 +399,8 @@ Once fully implemented, these optimizations are projected to provide the followi
 - **Paged KV Cache**: 50-70% memory reduction
 - **Flash Attention**: 2-4x faster attention
 - **Speculative Decoding**: 2-3x faster generation
-- **Quantization**: 75% memory reduction with INT8 (Currently available)
+
+**Quantization** isn't on this roadmap list — it's available **today**, but only via the **llama.cpp/GGUF engine** (Q4_K_M, Q5_K_M, Q8_0, …; opt-in `--features llamacpp`), which typically cuts memory ~50-75% vs. full precision depending on the quant level. The default Burn/safetensors path still loads weights as FP32 and rejects non-`none` quantization requests (see [Features](#features)).
 
 ---
 

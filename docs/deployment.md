@@ -1,5 +1,13 @@
 # Deployment Guide
 
+The project's target scenario is a single machine with one or more consumer
+NVIDIA/AMD GPUs (~8–16 GB VRAM), including cards that would otherwise sit
+idle, running a quantized GGUF model through the **llama.cpp engine**
+(`--features llamacpp`). That engine is **opt-in**, not the default cargo
+build — every command below shows how to add it. Multi-machine clusters
+(section 3) are supported but are the "also scales to" case, not the
+everyday deployment.
+
 ## 1. Docker Compose (recommended)
 
 ```bash
@@ -35,6 +43,29 @@ One parameterized `docker/Dockerfile.worker`:
 See the commented blocks in `docker-compose.yml` for copy-paste service definitions.
 Cargo features are `wgpu` (default) / `rocm` / `cuda` — there is no `hip` feature.
 
+#### Enabling the llama.cpp/GGUF engine (recommended for consumer GPUs)
+
+The default image builds the Burn/wgpu path only. To also compile the
+llama.cpp engine — the one that actually loads quantized GGUF models — add
+the `WORKER_FEATURES` build arg:
+
+```yaml
+# docker-compose.yml worker service, build.args:
+build:
+  context: .
+  dockerfile: docker/Dockerfile.worker
+  args:
+    WORKER_FEATURES: "llamacpp,llamacpp-vulkan"   # Vulkan offload, NVIDIA or AMD
+    # or, on a CUDA base image:
+    # BACKEND: cuda
+    # WORKER_FEATURES: "llamacpp,llamacpp-cuda"
+```
+
+`llamacpp-vulkan`/`llamacpp-cuda` select llama.cpp's own GPU kernels;
+`llamacpp` alone still runs (CPU-only GGUF inference). See
+[docs/configuration.md](configuration.md) for pointing a registry entry at
+a GGUF file once the worker is built this way.
+
 ### Multi-GPU hosts
 
 Run one worker service per GPU (see the `worker-gpu-N` commented blocks):
@@ -55,9 +86,18 @@ uvicorn coordinator.main:app --host 0.0.0.0 --port 8000
 
 # Worker (second terminal)
 cd worker
-cargo build --release --features wgpu     # or: rocm / cuda
+cargo build --release --features wgpu     # Burn engine only (default; FP32, no quantization)
+# Recommended for consumer GPUs — also compile the llama.cpp/GGUF engine:
+cargo build --release --features wgpu,llamacpp                  # llama.cpp on CPU
+cargo build --release --features wgpu,llamacpp,llamacpp-vulkan  # llama.cpp Vulkan offload (NVIDIA or AMD)
+cargo build --release --features cuda,llamacpp,llamacpp-cuda    # llama.cpp CUDA offload (NVIDIA)
 ./target/release/ai-worker --port 50051 --gpu-ids 0
 ```
+
+`wgpu` is the default Burn backend feature (`rocm`/`cuda` are the native
+Burn alternatives); `llamacpp` is always opt-in on top of one of those. See
+[AGENTS.md](../AGENTS.md) for the full feature matrix and
+[configuration.md](configuration.md) for pointing a model at a GGUF file.
 
 Point the coordinator at workers with
 `COORDINATOR_STATIC_WORKERS=localhost:50051` (comma-separated for more), or
