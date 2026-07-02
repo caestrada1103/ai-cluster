@@ -51,15 +51,15 @@ struct Args {
     #[clap(long, env = "WORKER_ID")]
     worker_id: Option<String>,
 
-    /// gRPC server port
-    #[clap(short, long, default_value = "50051", env = "GRPC_PORT")]
-    port: u16,
+    /// gRPC server port (falls back to config file, then 50051)
+    #[clap(short, long, env = "GRPC_PORT")]
+    port: Option<u16>,
 
-    /// Metrics server port
-    #[clap(long, default_value = "9091", env = "METRICS_PORT")]
-    metrics_port: u16,
+    /// Metrics server port (falls back to config file, then 9091)
+    #[clap(long, env = "METRICS_PORT")]
+    metrics_port: Option<u16>,
 
-    /// GPU IDs to use (comma-separated, e.g., "0,1,2")
+    /// GPU IDs to use (comma-separated, e.g., "0,1,2"; falls back to config file)
     #[clap(long, env = "GPU_IDS")]
     gpu_ids: Option<String>,
 
@@ -89,7 +89,7 @@ fn main() -> Result<(), WorkerError> {
     info!("Starting AI Worker v{}", env!("CARGO_PKG_VERSION"));
     info!("Configuration: {:?}", config);
 
-    // Parse GPU IDs
+    // Parse GPU IDs — CLI/env wins, then config file, then [0]
     let gpu_ids = args.gpu_ids
         .as_ref()
         .map(|s| {
@@ -99,7 +99,7 @@ fn main() -> Result<(), WorkerError> {
         })
         .transpose()
         .map_err(|e| WorkerError::Configuration(format!("Invalid GPU IDs: {}", e)))?
-        .unwrap_or_else(|| vec![0]);
+        .unwrap_or_else(|| config.gpu_ids.clone());
 
     info!("Using GPUs: {:?}", gpu_ids);
 
@@ -160,7 +160,7 @@ fn create_runtime() -> Result<Runtime, WorkerError> {
 async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Result<(), WorkerError> {
     // Initialize GPU manager
     info!("Initializing GPU Manager...");
-    let gpu_manager = Arc::new(gpu_manager::GPUManager::new(&config.gpu_ids).await?);
+    let gpu_manager = Arc::new(gpu_manager::GPUManager::new(&gpu_ids).await?);
     
     #[cfg(feature = "wgpu")]
     {
@@ -185,17 +185,22 @@ async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Re
         cache_dir: config.model_cache_dir.clone(),
         download_dir: config.download_dir.clone(),
         max_concurrent_loads: config.max_concurrent_loads,
-        load_timeout_secs: 300,
-        verify_checksums: true,
-        enable_mmap: true,
-        pin_memory: false,
-        prefetch_size_gb: 2.0,
+        hf_token: config.hf_token.clone(),
+        hf_cache_dir: config.hf_cache_dir.clone(),
     };
     let model_loader = Arc::new(ModelLoader::new(loader_config, gpu_manager.clone())?);
 
+    // Effective values: CLI/env > config file > default
+    let grpc_port = args.port.unwrap_or(config.grpc_port);
+    let metrics_port = args.metrics_port.unwrap_or(config.metrics_port);
+    let worker_id = args
+        .worker_id
+        .or_else(|| config.worker_id.clone())
+        .unwrap_or_else(|| format!("worker-{}", gpu_ids[0]));
+
     // Create worker service
     let worker_service = WorkerService::new(
-        args.worker_id.unwrap_or_else(|| format!("worker-{}", gpu_ids[0])),
+        worker_id,
         gpu_manager.clone(),
         model_loader,
         config,
@@ -203,7 +208,7 @@ async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Re
 
     // Start metrics server
     let metrics_server = MetricsServer::new(
-        args.metrics_port,
+        metrics_port,
         gpu_manager.clone(),
     );
     tokio::spawn(async move {
@@ -211,10 +216,10 @@ async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Re
             error!("Metrics server error: {}", e);
         }
     });
-    info!("Metrics server listening on port {}", args.metrics_port);
+    info!("Metrics server listening on port {}", metrics_port);
 
     // Build gRPC server
-    let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], grpc_port));
     info!("gRPC server listening on {}", addr);
 
     // Health service

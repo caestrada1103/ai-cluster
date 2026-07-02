@@ -41,16 +41,10 @@ pub struct ModelLoaderConfig {
     pub cache_dir: PathBuf,
     pub download_dir: PathBuf,
     pub max_concurrent_loads: usize,
-    #[allow(dead_code)]
-    pub load_timeout_secs: u64,
-    #[allow(dead_code)]
-    pub verify_checksums: bool,
-    #[allow(dead_code)]
-    pub enable_mmap: bool,
-    #[allow(dead_code)]
-    pub pin_memory: bool,
-    #[allow(dead_code)]
-    pub prefetch_size_gb: f32,
+    /// HuggingFace token for gated repos. Env var HF_TOKEN wins over this.
+    pub hf_token: Option<String>,
+    /// Override for the HF hub cache directory (defaults to cache_dir).
+    pub hf_cache_dir: Option<PathBuf>,
 }
 
 impl Default for ModelLoaderConfig {
@@ -59,11 +53,8 @@ impl Default for ModelLoaderConfig {
             cache_dir: PathBuf::from("./models"),
             download_dir: PathBuf::from("./data/downloads"),
             max_concurrent_loads: 2,
-            load_timeout_secs: 300,
-            verify_checksums: true,
-            enable_mmap: true,
-            pin_memory: true,
-            prefetch_size_gb: 2.0,
+            hf_token: None,
+            hf_cache_dir: None,
         }
     }
 }
@@ -82,12 +73,15 @@ impl ModelLoader {
         config: ModelLoaderConfig,
         gpu_manager: Arc<GPUManager>,
     ) -> Result<Self, WorkerError> {
+        let cache_dir = config.hf_cache_dir.clone().unwrap_or_else(|| config.cache_dir.clone());
         let mut builder = hf_hub::api::tokio::ApiBuilder::new()
             .with_endpoint("https://huggingface.co".to_string())
-            .with_cache_dir(config.cache_dir.clone());
-            
-        if let Ok(token) = std::env::var("HF_TOKEN") {
-             builder = builder.with_token(Some(token));
+            .with_cache_dir(cache_dir);
+
+        // Env var wins; TOML hf_token is the fallback for gated repos.
+        let token = std::env::var("HF_TOKEN").ok().or_else(|| config.hf_token.clone());
+        if let Some(token) = token {
+            builder = builder.with_token(Some(token));
         }
 
         let hf_api = builder.build().ok();
