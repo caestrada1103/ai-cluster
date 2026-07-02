@@ -185,10 +185,10 @@ async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Re
         cache_dir: config.model_cache_dir.clone(),
         download_dir: config.download_dir.clone(),
         max_concurrent_loads: config.max_concurrent_loads,
-        load_timeout_secs: config.load_timeout_secs,
-        verify_checksums: config.verify_checksums,
-        enable_mmap: config.enable_mmap,
-        pin_memory: config.pin_memory,
+        load_timeout_secs: 300,
+        verify_checksums: true,
+        enable_mmap: true,
+        pin_memory: false,
         prefetch_size_gb: 2.0,
     };
     let model_loader = Arc::new(ModelLoader::new(loader_config, gpu_manager.clone())?);

@@ -11,7 +11,7 @@ use crate::error::WorkerError;
 
 /// Configuration for the AI worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WorkerConfig {
     /// Optional human-readable worker identifier.
     pub worker_id: Option<String>,
@@ -34,20 +34,8 @@ pub struct WorkerConfig {
     /// Maximum number of models that can be loaded concurrently.
     pub max_concurrent_loads: usize,
 
-    /// Timeout (seconds) for a single model load operation.
-    pub load_timeout_secs: u64,
-
     /// Timeout (seconds) for a single inference request.
     pub request_timeout_secs: u64,
-
-    /// Whether to verify file checksums after download.
-    pub verify_checksums: bool,
-
-    /// Use memory-mapped I/O when reading weight files.
-    pub enable_mmap: bool,
-
-    /// Pin host memory for faster GPU transfers.
-    pub pin_memory: bool,
 
     /// Maximum number of concurrent inference requests per model.
     pub max_concurrent_requests: usize,
@@ -69,11 +57,7 @@ impl Default for WorkerConfig {
             model_cache_dir: PathBuf::from("models"),
             download_dir: PathBuf::from("downloads"),
             max_concurrent_loads: 2,
-            load_timeout_secs: 300,
             request_timeout_secs: 60,
-            verify_checksums: true,
-            enable_mmap: true,
-            pin_memory: false,
             max_concurrent_requests: 32,
             hf_token: None,
             hf_cache_dir: None,
@@ -128,7 +112,7 @@ mod tests {
         assert_eq!(config.grpc_port, 50051);
         assert_eq!(config.metrics_port, 9091);
         assert_eq!(config.gpu_ids, vec![0]);
-        assert!(config.verify_checksums);
+        assert_eq!(config.max_concurrent_requests, 32);
     }
 
     #[test]
@@ -136,5 +120,24 @@ mod tests {
         // Should return defaults when file doesn't exist
         let config = WorkerConfig::from_file("nonexistent.toml").unwrap();
         assert_eq!(config.grpc_port, 50051);
+    }
+
+    #[test]
+    fn test_shipped_config_parses_with_non_default_values() {
+        // The file Docker ships MUST parse into real (non-default) values.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../config/worker.toml");
+        let config = WorkerConfig::from_file(path).unwrap();
+        // 600 differs from the removed default on purpose — proves parsing works.
+        assert_eq!(config.request_timeout_secs, 120);
+        assert_eq!(config.grpc_port, 50051);
+    }
+
+    #[test]
+    fn test_unknown_keys_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("bad.toml");
+        std::fs::write(&p, "[grpc]\nport = 50051\n").unwrap();
+        let err = WorkerConfig::from_file(p.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("Failed to parse config"));
     }
 }
