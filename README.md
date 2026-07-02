@@ -102,6 +102,7 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
 
 - **Coordinator**: Python (FastAPI, gRPC)
 - **Worker**: Rust (Burn Framework, Tokio, Tonic)
+- **Inference Engines**: Burn 0.19 (safetensors, default) + llama.cpp via `llama-cpp-2 =0.1.150` (GGUF, opt-in `llamacpp` cargo feature)
 - **Communication**: gRPC (Inter-service), REST API (Client-facing)
 - **GPU Acceleration**:
     - **AMD**: ROCm (HIP)
@@ -262,6 +263,7 @@ AI Cluster supports a wide range of popular models:
 | **Qwen 2.5 Coder** | 32B | ✅ Implemented | GQA + RoPE + SwiGLU (Qwen3 not yet supported) |
 | **DeepSeek (dense)** | 7B, 67B | ✅ Implemented | loads via the Llama-layout path |
 | **DeepSeek (MoE/V3)** | 671B | 🔶 Model code present | V3 routing (sigmoid/MLA) not implemented |
+| **GGUF via llama.cpp** | Any GGUF (e.g. Qwen2.5 0.5B Instruct) | ✅ Implemented (opt-in: build worker with `--features llamacpp`) | GGUF-native quant: Q4_K_M, Q5_K_M, Q8_0, … |
 | **Mistral** | 7B | 🔶 Model code present, not wired to loader | no TextGeneration/tokenizer/KV cache yet |
 | **Mixtral** | 8x7B | 🔲 Planned | |
 | **Gemma** | 2B, 7B | 🔲 Planned | |
@@ -288,6 +290,25 @@ hidden_size = 4096
 curl -X POST http://localhost:8000/v1/models/load \
   -d '{"model_name": "your-model"}'
 ```
+
+### Adding a GGUF model (llama.cpp engine)
+
+```toml
+# config/models.toml — no architecture block needed (read from GGUF metadata)
+[models."qwen2.5-0.5b-gguf"]
+family = "qwen"
+parameters = "0.5B"
+min_memory_gb = 1
+engine = "llamacpp"
+
+[models."qwen2.5-0.5b-gguf".gguf]
+repo_id = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+file = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+n_gpu_layers = -1  # -1 = all layers on GPU
+n_ctx = 4096
+```
+
+The worker must be built with the engine enabled: `cargo build --release --features wgpu,llamacpp` (add `llamacpp-vulkan` or `llamacpp-cuda` for GPU offload), or `docker build -f docker/Dockerfile.worker --build-arg WORKER_FEATURES="llamacpp,llamacpp-vulkan" .`
 
 ---
 

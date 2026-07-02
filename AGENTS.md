@@ -33,6 +33,10 @@ cargo build --release --features wgpu    # Universal — Vulkan/DX12/Metal, auto
 cargo build --release --features cuda    # NVIDIA base kernels (runtime backend type is still Wgpu — native wiring planned)
 cargo build --release --features rocm    # AMD base kernels (runtime backend type is still Wgpu — native wiring planned)
 cargo build --release --features metal   # macOS — Metal via wgpu
+# llama.cpp engine (GGUF models) — combine with a Burn backend feature:
+cargo build --release --features wgpu,llamacpp                  # llama.cpp on CPU
+cargo build --release --features wgpu,llamacpp,llamacpp-vulkan  # llama.cpp Vulkan offload
+cargo build --release --features cuda,llamacpp,llamacpp-cuda    # llama.cpp CUDA offload
 ./target/release/ai-worker --port 50051
 ```
 > There is no CPU-only/ndarray build; a GPU (or Vulkan software rasterizer) is required.
@@ -42,6 +46,10 @@ cargo build --release --features metal   # macOS — Metal via wgpu
 # Rust worker tests (must pass a backend feature — CI uses wgpu)
 cd worker && cargo test --features wgpu
 cargo test --features wgpu config::tests::test_name   # single test by path
+# llama.cpp engine (compiles llama.cpp via cmake; needs cmake + libclang)
+cargo check --features llamacpp
+cargo test --features llamacpp llamacpp_engine                  # unit tests
+cargo test --features llamacpp -- --ignored llamacpp            # e2e (network, ~1 MiB GGUF)
 
 # Python unit tests (run from repo root)
 pytest coordinator/
@@ -89,6 +97,7 @@ Client (REST) → Coordinator (FastAPI) → Workers (Rust/Burn) → GPU
 - `worker.rs` — gRPC service handlers
 - `gpu_manager.rs` — GPU detection and VRAM management
 - `model_loader.rs` — Safetensors loading as FP32 (quantization ≠ NONE is rejected; quantized inference planned); resolves HF repo via `LoadModelRequest.model_path`
+- `llamacpp_engine.rs` — llama.cpp engine for GGUF models (feature `llamacpp`, crate `llama-cpp-2 =0.1.150`); implements `TextGeneration`
 - `backend.rs` — `WorkerBackend` type alias (Wgpu; cuda/rocm features compile burn's native kernels but runtime selection is not wired — planned)
 - `config.rs` — Worker config struct, reads `worker.toml`
 - `error.rs` — Shared error types (`thiserror`)
@@ -96,8 +105,8 @@ Client (REST) → Coordinator (FastAPI) → Workers (Rust/Burn) → GPU
 - `parallelism.rs` — Tensor/pipeline/expert parallelism core functions; `AllReduce<B>` trait; standalone TP/PP functions compile and are correct but not yet wired to the gRPC service layer
 
 **Configuration files** (`config/`):
-- `worker.toml` — flat worker settings (ports, gpu_ids, concurrency, HF token fallback; unknown keys rejected)
-- `models.toml` — Model registry: architectures, memory requirements, HuggingFace repo ids
+- `worker.toml` — flat worker settings (ports, gpu_ids, concurrency, HF token fallback, llamacpp thread/gpu-layer defaults; unknown keys rejected)
+- `models.toml` — Model registry: architectures, memory requirements, HuggingFace repo ids, per-model `engine` ("burn" | "llamacpp") + `[models.X.gguf]` source
 - `prometheus.yml` — Prometheus scrape targets
 - `alerts.yml` — Prometheus alert rules (written against the real metric names)
 (The coordinator has no config file — `COORDINATOR_*` env vars only.)
@@ -149,6 +158,8 @@ Client (REST) → Coordinator (FastAPI) → Workers (Rust/Burn) → GPU
 **`mistral.rs`**: Sliding window causal mask; query `i` attends to `[max(0,i-window+1), i]`.
 
 **`model_loader.rs`**: Async safetensors load; spawn_blocking for dtype conversion (all weights land as FP32). Architectures: `"llama"`, `"qwen"`, `"deepseek"` (detected via `config.json` `"architectures"`). Downloads use `LoadModelRequest.model_path` (HF repo id resolved by the coordinator) with `model_name` as the registry key. Per-model loading lock + GPU reservation rollback on failure; `unload()` releases reservations. `create_deepseek_record()` loads `N` experts from `model.layers.{i}.mlp.experts.{j}.*` when present.
+
+**`llamacpp_engine.rs`** (feature `llamacpp`): `LlamaCppEngine::load(path, n_gpu_layers, n_ctx, n_threads)`; shared `Arc<LlamaModel>`, per-call `LlamaContext` inside one `spawn_blocking` + mpsc (same streaming shape as `llama.rs`); sampler chain from request temperature/top_k/top_p (greedy < 0.01), seedable from `InferenceRequest.seed`; EOS from GGUF metadata. Routing: the coordinator sends `engine`/`gguf_repo_id`/`gguf_file`/`n_gpu_layers`/`n_ctx` in the existing `ModelConfig.metadata` map (zero proto change); `model_loader.rs::gguf_spec_from_metadata` parses it and `load_llamacpp_model` downloads the GGUF via hf-hub, reporting the file size as memory.
 
 **`gpu_manager.rs`**: O(1) memory tracking via `AtomicU64` with tagged `allocate_memory`/`free_memory`; telemetry (util/temp/power) refreshed from `nvidia-smi` at scrape/health time (3s timeout); CPU adapters dropped whenever a real GPU exists.
 
