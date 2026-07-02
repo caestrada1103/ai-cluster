@@ -468,6 +468,9 @@ class ClusterCoordinator:
                     vocab_size=model_config.vocab_size,
                     max_position_embeddings=model_config.max_seq_len,
                     intermediate_size=model_config.intermediate_size,
+                    # Engine routing (empty for burn models): the worker reads
+                    # these string keys to select the llama.cpp GGUF path.
+                    metadata=model_config.grpc_metadata(),
                 )
                 gpu_ids = [g.id for g in worker.gpus[: model_config.recommended_gpus]]
                 if not gpu_ids and worker.gpus:
