@@ -14,10 +14,10 @@ We welcome contributions to AI Cluster! Whether it's fixing bugs, improving docu
 ## Development Workflow
 
 ### Coordinator (Python)
-The coordinator is built with FastAPI.
+The coordinator is built with FastAPI. Run it from the REPO ROOT (running
+`uvicorn main:app` from inside `coordinator/` breaks package imports):
 ```bash
-cd coordinator
-uvicorn main:app --reload
+uvicorn coordinator.main:app --reload
 ```
 
 ### Worker (Rust)
@@ -29,9 +29,15 @@ cargo test
 ```
 
 ### Protocol Buffers
-If you modify `.proto` files, regenerate the bindings:
+If you modify `proto/cluster.proto`, regenerate BOTH bindings:
 ```bash
-./scripts/generate_protos.sh
+# Python (run from repo root, then keep the package-qualified import):
+python -m grpc_tools.protoc -I./proto \
+  --python_out=./coordinator/proto --grpc_python_out=./coordinator/proto \
+  ./proto/cluster.proto
+sed -i 's/^import cluster_pb2 as cluster__pb2$/import coordinator.proto.cluster_pb2 as cluster__pb2/' \
+  coordinator/proto/cluster_pb2_grpc.py
+# Rust: automatic via worker/build.rs on the next cargo build
 ```
 
 ## Pull Request Process
@@ -71,7 +77,7 @@ python tests/interactive_chat.py
 
 ## Code Style
 
-*   **Python**: We follow PEP 8. Use `black` and `isort`.
+*   **Python**: `black --line-length 100`, `ruff` (imports covered by ruff's I-rules), `mypy` strict.
 *   **Rust**: Follow standard Rust style. Use `cargo fmt` and `cargo clippy`.
 
 ## Reporting Issues
@@ -81,9 +87,3 @@ Please use the GitHub Issue Tracker to report bugs or request features. Provide 
 ## License
 
 By contributing, you agree that your contributions will be licensed under the Apache License 2.0.
-
-### Contributor License Agreement (CLA)
-
-To accept your contributions, we require you to sign our Contributor License Agreement (CLA). This ensures that we have the necessary rights to use your contribution and can safely distribute the project under the current license.
-
-A bot will prompt you to sign the CLA when you open a Pull Request. We cannot merge any PRs without a signed CLA.
