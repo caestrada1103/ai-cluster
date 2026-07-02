@@ -82,6 +82,7 @@ class ModelConverter:
         cache_dir: Optional[Path] = None,
         token: Optional[str] = None,
         revision: str = "main",
+        trust_remote_code: bool = False,
     ):
         self.model_id = model_id
         self.output_dir = Path(output_dir)
@@ -91,10 +92,11 @@ class ModelConverter:
         self.cache_dir = Path(cache_dir) if cache_dir else Path.home() / ".cache" / "huggingface"
         self.token = token
         self.revision = revision
-        
+        self.trust_remote_code = trust_remote_code
+
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Model info
         self.model_name = model_id.replace("/", "-")
         self.family = self._detect_family()
@@ -114,7 +116,7 @@ class ModelConverter:
         try:
             config = AutoConfig.from_pretrained(
                 self.model_id,
-                trust_remote_code=True,
+                trust_remote_code=self.trust_remote_code,
                 token=self.token,
                 revision=self.revision,
             )
@@ -152,7 +154,7 @@ class ModelConverter:
         # Load config
         self.config = AutoConfig.from_pretrained(
             self.model_id,
-            trust_remote_code=True,
+            trust_remote_code=self.trust_remote_code,
             token=self.token,
             revision=self.revision,
         )
@@ -168,7 +170,7 @@ class ModelConverter:
             config=self.config,
             torch_dtype=dtype,
             device_map="cpu",
-            trust_remote_code=True,
+            trust_remote_code=self.trust_remote_code,
             token=self.token,
             revision=self.revision,
             low_cpu_mem_usage=True,
@@ -177,7 +179,7 @@ class ModelConverter:
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_id,
-            trust_remote_code=True,
+            trust_remote_code=self.trust_remote_code,
             token=self.token,
             revision=self.revision,
         )
@@ -250,12 +252,15 @@ class ModelConverter:
                 # Quantize
                 quantized = (grouped / scales).round().clamp(-8, 7).to(torch.int8)
                 
-                # Pack two int4 values into one int8
+                # Pack two int4 values into one int8 — store PACKED (N/2 elements).
+                # The original shape is recorded alongside; consumers unpack with it.
                 packed = (quantized[:, ::2] << 4) | (quantized[:, 1::2] & 0x0F)
-                
-                # Restore shape (approximately)
-                state_dict[name] = packed.reshape(-1)[:flat_param.numel()].reshape(original_shape)
+
+                state_dict[name] = packed.reshape(-1)
                 state_dict[f"{name}.scales"] = scales.reshape(-1)
+                state_dict[f"{name}.orig_shape"] = torch.tensor(
+                    list(original_shape), dtype=torch.int64
+                )
             else:
                 state_dict[name] = param
         
@@ -304,34 +309,41 @@ class ModelConverter:
     
     def save_sharded(self, weights: Dict[str, np.ndarray]) -> List[Path]:
         """Save weights in sharded format."""
-        shards = []
-        current_shard = {}
+        # Pass 1: split into shards in memory (no I/O) so we know the exact
+        # shard count before any filename is written — the "-of-NNNNN" suffix
+        # must be exact, not a pre-estimate.
+        shards_data: List[Dict[str, np.ndarray]] = []
+        current_shard: Dict[str, np.ndarray] = {}
         current_size = 0
-        
+
         # Sort weights by name for consistent sharding
         sorted_items = sorted(weights.items())
-        
+
         for name, array in sorted_items:
             size_bytes = array.nbytes
-            
+
             # Start new shard if current is full
-            if current_size + size_bytes > self.max_shard_size_gb * 1e9:
-                shard_path = self._save_shard(current_shard, len(shards))
-                shards.append(shard_path)
+            if current_shard and current_size + size_bytes > self.max_shard_size_gb * 1e9:
+                shards_data.append(current_shard)
                 current_shard = {}
                 current_size = 0
-            
+
             current_shard[name] = array
             current_size += size_bytes
-        
-        # Save last shard
+
+        # Last shard
         if current_shard:
-            shard_path = self._save_shard(current_shard, len(shards))
-            shards.append(shard_path)
-        
+            shards_data.append(current_shard)
+
+        # Pass 2: now that the exact count is known, write every shard file.
+        self.num_shards = len(shards_data)
+        shards = []
+        for shard_idx, shard in enumerate(shards_data):
+            shards.append(self._save_shard(shard, shard_idx))
+
         # Save index file
         self._save_index(shards, weights.keys())
-        
+
         return shards
     
     def _save_shard(self, shard: Dict[str, np.ndarray], shard_idx: int) -> Path:
@@ -377,7 +389,13 @@ class ModelConverter:
         """Save model configuration in Burn format."""
         config = {
             "model_type": self.family,
-            "architecture": self.model.config.architectures[0] if self.model.config.architectures else "Unknown",
+            # Worker's model_loader detects architecture via the "architectures" LIST
+            # (HF convention) — emit the same shape.
+            "architectures": (
+                list(self.model.config.architectures)
+                if self.model.config.architectures
+                else ["Unknown"]
+            ),
             "hidden_size": getattr(self.model.config, "hidden_size", None),
             "num_layers": getattr(self.model.config, "num_hidden_layers", 
                                  getattr(self.model.config, "num_layers", None)),
@@ -467,9 +485,8 @@ class ModelConverter:
         logger.info("Converting to Burn format...")
         burn_weights = self.convert_to_burn_format(quantized)
         
-        # Save weights
+        # Save weights (save_sharded computes the exact shard count itself)
         logger.info("Saving weights...")
-        self.num_shards = max(1, len(burn_weights) // 100)  # Rough estimate
         shards = self.save_sharded(burn_weights)
         
         # Save config and tokenizer
@@ -588,6 +605,7 @@ def main():
         cache_dir=args.cache_dir,
         token=args.token,
         revision=args.revision,
+        trust_remote_code=args.trust_remote_code,
     )
     
     # Run conversion
