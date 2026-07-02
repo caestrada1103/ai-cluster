@@ -70,13 +70,16 @@ class ModelConfig:
     config_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
     weights_path: Optional[str] = None
-    
+
+    # HuggingFace repo id used by workers to download weights (LoadModelRequest.model_path)
+    hf_repo_id: Optional[str] = None
+
     # Metadata
     description: str = ""
     paper_url: Optional[str] = None
     model_url: Optional[str] = None
     
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate configuration."""
         if self.is_moe and not self.num_experts:
             raise ValueError("MoE models must specify num_experts")
@@ -92,7 +95,7 @@ class ModelRegistry:
     MODELS: Dict[str, ModelConfig] = {}
     
     @classmethod
-    def initialize(cls):
+    def initialize(cls) -> None:
         """Initialize the model registry with default models."""
         # Note: In a production environment, this could be empty and 
         # only populated via load_from_config.
@@ -282,19 +285,25 @@ class ModelRegistry:
                 ParallelismStrategy.TENSOR,
                 ParallelismStrategy.PIPELINE,
             ],
-            description="DeepSeek V3 — 671B MoE (37B active params), Claude Opus tier (SWE-Bench 73.1%)",
+            description="DeepSeek V3 — 671B MoE (37B active), Claude Opus tier (SWE-Bench 73.1%)",
             model_url="https://huggingface.co/deepseek-ai/DeepSeek-V3",
         )
 
         logger.info(f"Initialized model registry with {len(cls.MODELS)} models")
 
     @classmethod
-    def load_from_dict(cls, config_dict: Dict[str, Any]):
+    def load_from_dict(cls, config_dict: Dict[str, Any]) -> None:
         """Load models from a configuration dictionary (e.g. from models.toml)."""
         if "models" not in config_dict:
             return
 
         defaults = config_dict.get("defaults", {})
+
+        def get_dict(data: Dict[str, Any], key: str) -> Dict[str, Any]:
+            val = data.get(key, {})
+            if isinstance(val, dict):
+                return val
+            return {"default": val}  # Fallback for flat values from defaults
 
         for name, data in config_dict["models"].items():
             try:
@@ -303,23 +312,18 @@ class ModelRegistry:
                 # For now, we just do a shallow copy of defaults and update with model data
                 final_data = defaults.copy()
                 final_data.update(data)
-                
-                # Extract components with robustness for string vs dict
-                def get_dict(key):
-                    val = final_data.get(key, {})
-                    if isinstance(val, dict):
-                        return val
-                    return {"default": val} # Fallback for flat values from defaults
 
-                arch = get_dict("architecture")
-                quants = get_dict("quantization")
-                parallel = get_dict("parallelism")
-                paths = get_dict("paths")
+                # Extract components with robustness for string vs dict
+                arch = get_dict(final_data, "architecture")
+                quants = get_dict(final_data, "quantization")
+                parallel = get_dict(final_data, "parallelism")
+                paths = get_dict(final_data, "paths")
+                hf = get_dict(final_data, "hf")
                 
                 # Determine supported quantizations
                 supported_quants = quants.get("supported")
                 if not supported_quants:
-                    default_q = quants.get("default", "fp16")
+                    default_q = quants.get("default", "none")
                     supported_quants = [default_q]
 
                 # Determine supported parallelism
@@ -333,7 +337,9 @@ class ModelRegistry:
                 try:
                     model_family = ModelFamily(raw_family)
                 except ValueError:
-                    logger.warning(f"Unknown model family '{raw_family}' for model {name}, defaulting to llama")
+                    logger.warning(
+                        f"Unknown model family '{raw_family}' for model {name}, defaulting to llama"
+                    )
                     model_family = ModelFamily.LLAMA
 
                 model = ModelConfig(
@@ -357,6 +363,7 @@ class ModelRegistry:
                     config_path=paths.get("config"),
                     tokenizer_path=paths.get("tokenizer"),
                     weights_path=paths.get("weights"),
+                    hf_repo_id=hf.get("repo_id"),
                     description=final_data.get("description", ""),
                 )
                 cls.MODELS[model_name] = model
