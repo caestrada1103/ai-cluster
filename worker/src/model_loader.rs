@@ -104,11 +104,15 @@ impl ModelLoader {
     pub async fn load_model(
         &self,
         model_name: &str,
+        repo_override: Option<&str>,
         model_config: Option<&crate::cluster::ModelConfig>,
         gpu_ids: &[u32],
         quantization: crate::cluster::Quantization,
         parallelism: crate::cluster::ParallelismStrategy,
     ) -> Result<ModelInstance, WorkerError> {
+        // model_name is the registry key (map key everywhere); repo_id is what we download.
+        let repo_id: &str = repo_override.filter(|s| !s.is_empty()).unwrap_or(model_name);
+
         if let Some(entry) = self.loaded_models.get(model_name) {
             info!("Model {} already loaded", model_name);
             return Ok(entry.value().clone());
@@ -140,7 +144,7 @@ impl ModelLoader {
         })?;
 
         info!("Loading model {}...", model_name);
-        let model_path = self.get_model_path(model_name).await?;
+        let model_path = self.get_model_path(repo_id).await?;
         let config = self.load_model_config(model_name, model_config, &model_path).await?;
 
         let memory_used = self.calculate_memory_usage(&config);
@@ -172,13 +176,13 @@ impl ModelLoader {
             };
 
             // Load weights
-            let mut weights = self.load_safetensors(model_name, &device).await?;
+            let mut weights = self.load_safetensors(repo_id, &device).await?;
 
             // Get model directory (tokenizer.json lives here)
-            let model_path = self.get_model_path(model_name).await?;
+            let model_path = self.get_model_path(repo_id).await?;
             // Ensure tokenizer.json is downloaded
             if let Some(api) = &self.hf_api {
-                let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
+                let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
                 let _ = repo.get("tokenizer.json").await
                     .map_err(|e| WorkerError::ModelLoad(format!("Failed to download tokenizer.json: {}", e)))?;
                 info!("Tokenizer downloaded to: {:?}", model_path);

@@ -141,8 +141,14 @@ impl Worker for WorkerService {
 
         // Load model
         let load_start = Instant::now();
+        let repo_override = if req.model_path.is_empty() {
+            None
+        } else {
+            Some(req.model_path.as_str())
+        };
         let result = self.model_loader.load_model(
             &req.model_name,
+            repo_override,
             req.config.as_ref(),
             &gpu_ids,
             req.quantization(),
