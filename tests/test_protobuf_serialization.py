@@ -1,6 +1,4 @@
-import sys
-sys.path.append("e:/PROYECTOS/AICluster/coordinator/proto")
-import cluster_pb2 as pb
+import coordinator.proto.cluster_pb2 as pb
 
 request = pb.LoadModelRequest(
     model_name="test",

@@ -1,23 +1,11 @@
-import sys
-import os
 import grpc
 import time
 
-# Add coordinator path (one level up from tests/)
-# Assuming this script is in ./tests/ and coordinator is in ./coordinator
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)
-coordinator_path = os.path.join(project_root, "coordinator")
-
-sys.path.append(coordinator_path)
-proto_path = os.path.join(coordinator_path, "proto")
-sys.path.append(proto_path)
-
 try:
-    import cluster_pb2
-    import cluster_pb2_grpc
+    import coordinator.proto.cluster_pb2 as cluster_pb2
+    import coordinator.proto.cluster_pb2_grpc as cluster_pb2_grpc
 except ImportError:
-    print(f"Error importing protos. Paths: {sys.path}")
+    print("Error importing protos. Run this script from the repo root.")
     raise
 
 def run():

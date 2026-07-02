@@ -1,6 +1,6 @@
 import grpc
-import cluster_pb2 as pb
-import cluster_pb2_grpc as pb_grpc
+import coordinator.proto.cluster_pb2 as pb
+import coordinator.proto.cluster_pb2_grpc as pb_grpc
 import asyncio
 
 async def test_worker_status():

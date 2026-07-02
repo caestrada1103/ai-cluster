@@ -3,8 +3,8 @@ import os
 import time
 import grpc
 
-import cluster_pb2
-import cluster_pb2_grpc
+import coordinator.proto.cluster_pb2 as cluster_pb2
+import coordinator.proto.cluster_pb2_grpc as cluster_pb2_grpc
 
 import argparse
 

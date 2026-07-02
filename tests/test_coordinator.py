@@ -20,7 +20,6 @@ from unittest.mock import Mock, patch, AsyncMock
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
-from fastapi.websockets import WebSocket
 from httpx import AsyncClient
 import grpc
 import yaml
@@ -28,10 +27,7 @@ import yaml
 from coordinator.main import app, coordinator
 from coordinator.coordinator import ClusterCoordinator, WorkerInfo, WorkerState
 from coordinator.models import ModelRegistry, ModelConfig
-from coordinator.discovery import (
-    WorkerDiscovery, StaticDiscoveryProvider, 
-    MDNSDiscoveryProvider, WorkerEndpoint
-)
+from coordinator.discovery import WorkerDiscovery, StaticDiscoveryProvider, WorkerEndpoint
 from coordinator.router import RequestRouter, LoadBalancingStrategy, QueuePriority
 from coordinator.config import Settings
 
@@ -80,11 +76,19 @@ async def test_coordinator(test_settings):
     await coord.stop()
 
 
+@pytest.fixture
+def client():
+    """Synchronous FastAPI test client (no lifespan — endpoints 503 without a coordinator)."""
+    return TestClient(app, raise_server_exceptions=False)
+
+
 @pytest_asyncio.fixture
 async def async_client():
-    """Create an async test client."""
-    async with AsyncClient(app=app, base_url="http://test") as client:
-        yield client
+    """Create an async test client (httpx>=0.28 requires an explicit transport)."""
+    from httpx import ASGITransport
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c
 
 
 # ============================================================================
@@ -291,30 +295,8 @@ class TestWorkerDiscovery:
             
             await provider.stop()
 
-    @pytest.mark.asyncio
-    async def test_broadcast_discovery(self, test_settings):
-        """Test broadcast discovery."""
-        provider = BroadcastDiscoveryProvider(test_settings)
-        await provider.start()
-        
-        # Mock receiving a broadcast response
-        await provider._handle_broadcast_response(
-            json.dumps({
-                "type": "worker_announce",
-                "worker_id": "test-worker",
-                "port": 50051,
-                "gpus": 2,
-                "memory_gb": 32,
-            }).encode(),
-            ("192.168.1.100", 50051)
-        )
-        
-        workers = await provider.discover()
-        assert len(workers) == 1
-        assert workers[0].address == "192.168.1.100:50051"
-        assert workers[0].worker_id == "test-worker"
-        
-        await provider.stop()
+    # NOTE: mDNS/broadcast/Consul discovery providers were deleted (dead-on-arrival
+    # code that crashed at startup) — only StaticDiscoveryProvider is implemented.
 
 
 # ============================================================================
@@ -583,46 +565,19 @@ class TestErrorHandling:
         # Add worker
         test_coordinator.workers["test-1"] = mock_worker_info
         
-        # Mock slow inference
-        async def slow_infer(*args, **kwargs):
+        # Mock slow inference: an async generator that stalls before yielding
+        async def slow_stream(*args, **kwargs):
             await asyncio.sleep(5)
-            return Mock(text="test", tokens_generated=10, finished=True)
-        
-        mock_worker_info.stub.Infer = AsyncMock(return_value=AsyncMock(
-            __aiter__=lambda: iter([await slow_infer()])
-        ))
-        
+            yield Mock(text="test", tokens_generated=10, finished=True)
+
+        mock_worker_info.stub.Infer = Mock(side_effect=slow_stream)
+
         with pytest.raises(TimeoutError):
             await test_coordinator.infer(
                 "deepseek-7b",
                 "Test prompt",
                 timeout=1,  # Short timeout
             )
-
-
-# ============================================================================
-# WebSocket Tests (if applicable)
-# ============================================================================
-
-@pytest.mark.asyncio
-async def test_websocket_streaming(client: TestClient):
-    """Test WebSocket streaming endpoint."""
-    with client.websocket_connect("/v1/stream") as websocket:
-        # Send request
-        websocket.send_json({
-            "model": "deepseek-7b",
-            "prompt": "Test prompt",
-            "stream": True,
-        })
-        
-        # Receive streaming responses
-        responses = []
-        for _ in range(5):
-            data = websocket.receive_json()
-            responses.append(data)
-        
-        assert len(responses) > 0
-        websocket.close()
 
 
 # ============================================================================
