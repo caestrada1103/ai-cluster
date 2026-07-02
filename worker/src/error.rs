@@ -57,9 +57,9 @@ pub enum WorkerError {
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 
-    /// Multi-GPU parallelism setup or execution error.
-    #[error("Parallelism error: {0}")]
-    Parallelism(String),
+    /// The request parameters are invalid (bad ranges, prompt too long, ...).
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
 
     /// Standard I/O error wrapper.
     #[error("IO error: {0}")]
@@ -99,6 +99,7 @@ impl From<WorkerError> for tonic::Status {
             WorkerError::Configuration(_) => {
                 tonic::Status::invalid_argument(err.to_string())
             }
+            WorkerError::InvalidRequest(_) => tonic::Status::invalid_argument(err.to_string()),
             _ => tonic::Status::internal(err.to_string()),
         }
     }

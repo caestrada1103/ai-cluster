@@ -446,6 +446,20 @@ impl<B: Backend> TextGeneration for Qwen<B> {
     ) -> Result<super::TextStream, WorkerError> {
         let tokens = self.tokenize_prompt(prompt)?;
         let prompt_len = tokens.len();
+
+        let max_seq_len = self.config.max_seq_len;
+        if prompt_len >= max_seq_len {
+            return Err(WorkerError::InvalidRequest(format!(
+                "prompt is {} tokens but the model's max_seq_len is {}",
+                prompt_len, max_seq_len
+            )));
+        }
+        // Clamp so prefill + decode can never index past the RoPE table.
+        let max_tokens = max_tokens.min(max_seq_len - prompt_len);
+        if max_tokens == 0 {
+            return Ok(Box::pin(futures::stream::empty()));
+        }
+
         let model = self.clone();
 
         let (tx, mut rx) =
@@ -500,9 +514,12 @@ impl<B: Backend> TextGeneration for Qwen<B> {
             let mut all_tokens = tokens;
             all_tokens.push(first_tok);
             let mut prev_text_len = 0usize;
-            let _ = tx.blocking_send(delta_text(
+            if tx.blocking_send(delta_text(
                 &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
-            ));
+            )).is_err() {
+                // Receiver dropped (client disconnected) — stop burning GPU.
+                return;
+            }
             if eos_ids.contains(&first_tok) { return; }
 
             // ── DECODE LOOP ──────────────────────────────────────────────────
@@ -512,9 +529,12 @@ impl<B: Backend> TextGeneration for Qwen<B> {
                 let logits   = model.decode_step(cur_tok, start, &mut kv_cache);
                 let next_tok = sample(&logits);
                 all_tokens.push(next_tok);
-                let _ = tx.blocking_send(delta_text(
+                if tx.blocking_send(delta_text(
                     &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
-                ));
+                )).is_err() {
+                    // Receiver dropped (client disconnected) — stop burning GPU.
+                    return;
+                }
                 if eos_ids.contains(&next_tok) { break; }
             }
         });

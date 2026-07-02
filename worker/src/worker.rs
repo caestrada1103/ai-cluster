@@ -227,7 +227,7 @@ impl Worker for WorkerService {
         let model = match model {
             Some(m) => m,
             None => {
-                return Err(Status::not_found(format!("Model {} not loaded", req.model_name)));
+                return Err(crate::error::WorkerError::ModelNotFound(req.model_name.clone()).into());
             }
         };
 
@@ -262,13 +262,19 @@ impl Worker for WorkerService {
 
             match inference_result {
                 Ok(Ok(mut token_stream)) => {
-                    // Stream tokens as they're generated
-                    while let Some(token) = token_stream.next().await {
-                        match token {
-                            Ok(text) => {
-                                tokens_generated += 1;
+                    let deadline = tokio::time::Instant::now() + timeout_duration;
+                    let mut stream_error = false;
+                    let mut timed_out = false;
 
-                                // Send chunk
+                    loop {
+                        match tokio::time::timeout_at(deadline, token_stream.next()).await {
+                            Err(_) => {
+                                timed_out = true;
+                                break;
+                            }
+                            Ok(None) => break,
+                            Ok(Some(Ok(text))) => {
+                                tokens_generated += 1;
                                 yield InferenceResponse {
                                     request_id: req_id.clone(),
                                     text,
@@ -278,12 +284,24 @@ impl Worker for WorkerService {
                                     processing_time_ms: start_time.elapsed().as_millis() as u64,
                                 };
                             }
-                            Err(e) => {
+                            Ok(Some(Err(e))) => {
                                 tracing::error!("Generation error: {}", e);
+                                stream_error = true;
                                 break;
                             }
                         }
                     }
+
+                    let finish_reason = if timed_out {
+                        tracing::warn!("Request {} timed out after {:?}", req_id, timeout_duration);
+                        FinishReason::Timeout
+                    } else if stream_error {
+                        FinishReason::Error
+                    } else if tokens_generated >= req.max_tokens {
+                        FinishReason::Length
+                    } else {
+                        FinishReason::Stop
+                    };
 
                     // Send final response
                     yield InferenceResponse {
@@ -291,7 +309,7 @@ impl Worker for WorkerService {
                         text: String::new(),
                         tokens_generated,
                         finished: true,
-                        finish_reason: FinishReason::Stop as i32,
+                        finish_reason: finish_reason as i32,
                         processing_time_ms: start_time.elapsed().as_millis() as u64,
                     };
 
@@ -304,8 +322,8 @@ impl Worker for WorkerService {
                     );
 
                     tracing::info!(
-                        "Request {} completed: {} tokens in {:?}",
-                        req_id, tokens_generated, elapsed
+                        "Request {} completed ({:?}): {} tokens in {:?}",
+                        req_id, finish_reason, tokens_generated, elapsed
                     );
                 }
                 Ok(Err(e)) => {
