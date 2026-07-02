@@ -72,9 +72,7 @@ WORKDIR /app
 # Copy from builder
 COPY --from=builder --chown=coordinator:coordinator /usr/local/lib/python3.14/site-packages/ /usr/local/lib/python3.14/site-packages/
 COPY --from=builder --chown=coordinator:coordinator /build/coordinator /app/coordinator
-COPY --chown=coordinator:coordinator config/coordinator.yaml /app/config/
 COPY --chown=coordinator:coordinator config/models.toml /app/config/
-COPY --chown=coordinator:coordinator config/logging.yaml /app/config/
 
 # Switch to non-root user
 USER coordinator
@@ -85,7 +83,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 
 # Expose ports
 EXPOSE 8000
-EXPOSE 9090
 
 # Set entrypoint
 ENTRYPOINT ["python", "-m", "uvicorn"]

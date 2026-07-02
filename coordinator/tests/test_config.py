@@ -20,9 +20,6 @@ def test_defaults() -> None:
     assert s.host == "0.0.0.0"
     assert s.port == 8000
     assert s.discovery_method == DiscoveryMethod.STATIC
-    assert s.enable_auth is False
-    assert s.enable_batching is True
-    assert s.max_batch_size == 32
     assert s.request_timeout == 300
 
 
@@ -136,3 +133,23 @@ def test_non_static_discovery_fails_fast_with_clear_error() -> None:
     settings = make_settings(discovery_method="mdns")
     with pytest.raises(ValueError, match="not implemented"):
         WorkerDiscovery(settings)
+
+
+def test_dead_settings_fields_removed() -> None:
+    s = make_settings()
+    for dead in (
+        "default_model",
+        "enable_batching",
+        "max_batch_size",
+        "batch_timeout_ms",
+        "enable_auth",
+        "api_keys",
+        "rate_limit_per_minute",
+        "log_level",
+        "log_format",
+        "enable_metrics",
+        "metrics_port",
+        "auto_load_models",
+        "model_cache_dir",
+    ):
+        assert not hasattr(s, dead), f"dead field still present: {dead}"

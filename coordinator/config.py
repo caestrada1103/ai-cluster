@@ -20,15 +20,6 @@ class DiscoveryMethod(str, Enum):
     CONSUL = "consul"
 
 
-class LogLevel(str, Enum):
-    """Logging levels."""
-
-    DEBUG = "debug"
-    INFO = "info"
-    WARNING = "warning"
-    ERROR = "error"
-
-
 class Settings(BaseSettings):
     """Application settings."""
 
@@ -44,7 +35,6 @@ class Settings(BaseSettings):
                 "discovery_method": "mdns",
                 "static_workers": ["192.168.1.10:50051"],
                 "health_check_interval": 30,
-                "default_model": "deepseek-7b",
             }
         },
     )
@@ -70,7 +60,6 @@ class Settings(BaseSettings):
     )
 
     # Request routing
-    default_model: str = Field("deepseek-7b", description="Default model for inference")
     request_timeout: int = Field(300, description="Request timeout (seconds)", ge=1)
     max_queue_size: int = Field(1000, description="Maximum queued requests", ge=1)
 
@@ -78,8 +67,6 @@ class Settings(BaseSettings):
     models_config: Path = Field(
         Path("config/models.toml"), description="Path to models configuration"
     )
-    model_cache_dir: Path = Field(Path("./models"), description="Directory for cached models")
-    auto_load_models: bool = Field(False, description="Automatically load models on startup")
 
     # CORS
     # NoDecode: pydantic-settings otherwise JSON-decodes any complex-typed env
@@ -110,30 +97,6 @@ class Settings(BaseSettings):
     affinity_ttl_seconds: float = Field(
         600.0, description="How long a session sticks to a worker (affinity strategy)", gt=0
     )
-
-    # Performance
-    enable_batching: bool = Field(True, description="Enable continuous batching")
-    max_batch_size: int = Field(32, description="Maximum batch size", ge=1, le=256)
-    batch_timeout_ms: int = Field(
-        50, description="Maximum wait time for batching (ms)", ge=1, le=1000
-    )
-
-    # Security
-    enable_auth: bool = Field(False, description="Enable API authentication")
-    api_keys: List[str] = Field(default_factory=list, description="Valid API keys")
-    rate_limit_per_minute: int = Field(
-        60, description="Rate limit per API key (requests/minute)", ge=1
-    )
-
-    # Logging
-    log_level: LogLevel = Field(LogLevel.INFO, description="Logging level")
-    log_format: str = Field(
-        "json", description="Log format (json or text)", pattern="^(json|text)$"
-    )
-
-    # Monitoring
-    enable_metrics: bool = Field(True, description="Enable Prometheus metrics")
-    metrics_port: int = Field(9090, description="Metrics port", ge=1, le=65535)
 
     @field_validator("static_workers", mode="before")
     @classmethod
