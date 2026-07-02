@@ -321,17 +321,9 @@ impl<B: Backend> Qwen<B> {
         let device = input_ids.device();
         let config = &*self.config;
 
-        let causal_bias: Option<Tensor<B, 4>> = if seq_len > 1 {
-            let mut data = vec![-1e9_f32; seq_len * seq_len];
-            for i in 0..seq_len {
-                for j in 0..=i {
-                    data[i * seq_len + j] = 0.0;
-                }
-            }
-            Some(Tensor::<B, 1>::from_floats(data.as_slice(), &device).reshape([1, 1, seq_len, seq_len]))
-        } else {
-            None
-        };
+        // Build additive causal bias once — [1, 1, seq, seq]; shared helper.
+        let causal_bias: Option<Tensor<B, 4>> =
+            super::common::build_causal_bias::<B>(seq_len, &device);
 
         let mut x = self.embed_tokens.forward(input_ids.int());
         let mut kv_cache: KvCache<B> = Vec::with_capacity(self.layers.len());

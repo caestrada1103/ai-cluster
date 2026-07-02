@@ -30,7 +30,7 @@ use crate::models::{
         DeepSeekRecord, DeepSeekLayerRecord, DeepSeekAttentionRecord,
         DeepSeekMoERecord, ExpertRecord,
     },
-    common::{RMSNormRecord, RotaryEmbeddingRecord, RotaryEmbedding},
+    common::{RMSNormRecord, RotaryEmbeddingRecord},
 };
 use crate::backend::WorkerBackend;
 use burn::backend::wgpu::WgpuDevice;
@@ -207,7 +207,7 @@ impl ModelLoader {
                     };
 
                     info!("Mapping weights to LlamaRecord...");
-                    let record = create_llama_record(&mut weights, &llama_config, &device)?;
+                    let record = create_llama_record(&mut weights, &llama_config)?;
                     info!("Record created. Initializing Llama...");
 
                     let model = Llama::new(&llama_config, &device, &model_path)?.load_record(record);
@@ -231,7 +231,7 @@ impl ModelLoader {
                     };
 
                     info!("Mapping weights to QwenRecord...");
-                    let record = create_qwen_record(&mut weights, &qwen_config, &device)?;
+                    let record = create_qwen_record(&mut weights, &qwen_config)?;
                     info!("Record created. Initializing Qwen...");
 
                     let model = Qwen::new(&qwen_config, &device, &model_path)?.load_record(record);
@@ -259,7 +259,7 @@ impl ModelLoader {
                             rms_norm_eps: config.rms_norm_eps,
                             rope_theta: config.rope_theta,
                         };
-                        let record = create_llama_record(&mut weights, &llama_config, &device)?;
+                        let record = create_llama_record(&mut weights, &llama_config)?;
                         let model = Llama::new(&llama_config, &device, &model_path)?.load_record(record);
                         Arc::new(Mutex::new(model))
                     } else {
@@ -279,7 +279,7 @@ impl ModelLoader {
                             num_experts_per_tok: config.num_experts_per_tok.unwrap_or(1),
                         };
                         info!("Mapping weights to DeepSeekRecord...");
-                        let record = create_deepseek_record(&mut weights, &ds_config, &device)?;
+                        let record = create_deepseek_record(&mut weights, &ds_config)?;
                         info!("Record created. Initializing DeepSeek...");
                         let model = DeepSeek::new(ds_config, &device, &model_path)?.load_record(record);
                         Arc::new(Mutex::new(model))
@@ -527,17 +527,11 @@ fn load_norm(
     let w_flat = weights.remove(&w_name).ok_or(WorkerError::ModelLoad(format!("Missing {}", w_name)))?;
     let w = w_flat; // 1D
     Ok(RMSNormRecord { weight: Param::initialized(ParamId::new(), w), eps: ConstantRecord })
-    // Check common.rs: RMSNorm has `eps: f64`. `#[module(skip)]`.
-    // So record does NOT have eps.
-    // Wait, check `RMSNorm` struct again.
-    // Step 1439: `pub eps: f64`. `#[module(skip)]`.
-    // So `RMSNormRecord` only has `weight`.
 }
 
 fn create_qwen_record(
     weights: &mut HashMap<String, Tensor<WorkerBackend, 1>>,
     config: &QwenConfig,
-    device: &WgpuDevice,
 ) -> Result<QwenRecord<WorkerBackend>, WorkerError> {
     let embed = load_embedding(weights, "model.embed_tokens", config.vocab_size, config.hidden_size)?;
     let norm = load_norm(weights, "model.norm", config.hidden_size)?;
@@ -579,8 +573,6 @@ fn create_qwen_record(
         });
     }
 
-    let _rope_mod: RotaryEmbedding<WorkerBackend> =
-        RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_theta, device);
     let rope = RotaryEmbeddingRecord { cos: ConstantRecord, sin: ConstantRecord };
 
     Ok(QwenRecord {
@@ -599,7 +591,6 @@ fn create_qwen_record(
 fn create_deepseek_record(
     weights: &mut HashMap<String, Tensor<WorkerBackend, 1>>,
     config: &DeepSeekConfig,
-    device: &WgpuDevice,
 ) -> Result<DeepSeekRecord<WorkerBackend>, WorkerError> {
     let embed = load_embedding(weights, "model.embed_tokens", config.vocab_size, config.hidden_size)?;
     let norm = load_norm(weights, "model.norm", config.hidden_size)?;
@@ -657,8 +648,6 @@ fn create_deepseek_record(
         });
     }
 
-    let _rope_mod: RotaryEmbedding<WorkerBackend> =
-        RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_theta, device);
     let rope = RotaryEmbeddingRecord { cos: ConstantRecord, sin: ConstantRecord };
 
     Ok(DeepSeekRecord {
@@ -675,9 +664,8 @@ fn create_deepseek_record(
 }
 
 fn create_llama_record(
-    weights: &mut HashMap<String, Tensor<WorkerBackend, 1>>, 
-    config: &LlamaConfig, 
-    device: &WgpuDevice
+    weights: &mut HashMap<String, Tensor<WorkerBackend, 1>>,
+    config: &LlamaConfig,
 ) -> Result<LlamaRecord<WorkerBackend>, WorkerError> {
     let embed = load_embedding(weights, "model.embed_tokens", config.vocab_size, config.hidden_size)?;
     let norm = load_norm(weights, "model.norm", config.hidden_size)?;
@@ -715,8 +703,6 @@ fn create_llama_record(
         });
     }
 
-    // Generate RoPE
-    let _rope_mod: RotaryEmbedding<WorkerBackend> = RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_theta, device);
     let rope = RotaryEmbeddingRecord {
         cos: ConstantRecord, sin: ConstantRecord,
     };

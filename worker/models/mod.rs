@@ -202,50 +202,10 @@ impl ModelInstance {
             }; // guard dropped here, stream is 'static
             Ok(stream)
         } else {
-             // Placeholder for now (should be error or dummy stream)
-             Ok(Box::pin(TokenStream::new(max_tokens)))
+            Err(WorkerError::Internal(format!(
+                "Model instance {} holds no runnable model",
+                self.name
+            )))
         }
-    }
-}
-
-/// Backend-agnostic token stream for generation.
-///
-/// This simplified version doesn't hold model references so it's
-/// trivially `Send + Sync + Unpin`.
-pub struct TokenStream {
-    /// Current position
-    position: usize,
-
-    /// Maximum tokens to generate
-    max_tokens: usize,
-}
-
-impl TokenStream {
-    /// Create a new token stream
-    pub fn new(max_tokens: usize) -> Self {
-        Self {
-            position: 0,
-            max_tokens,
-        }
-    }
-
-
-}
-
-impl futures::Stream for TokenStream {
-    type Item = Result<String, WorkerError>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        // SAFETY: TokenStream is Unpin (no self-referential fields)
-        let this = self.get_mut();
-        if this.position >= this.max_tokens {
-            return std::task::Poll::Ready(None);
-        }
-
-        this.position += 1;
-        std::task::Poll::Ready(Some(Ok(" generated".to_string())))
     }
 }

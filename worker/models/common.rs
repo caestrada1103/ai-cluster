@@ -45,9 +45,9 @@ impl<B: Backend> RMSNorm<B> {
 /// Precomputed rotary embeddings for efficient position encoding.
 #[derive(Module, Debug)]
 pub struct RotaryEmbedding<B: Backend> {
-    /// Cosine component: shape [max_seq_len, head_dim]
+    /// Cosine component: shape [max_seq_len, head_dim / 2] (HF Llama half-dim convention)
     pub cos: Tensor<B, 2>,
-    /// Sine component: shape [max_seq_len, head_dim]
+    /// Sine component: shape [max_seq_len, head_dim / 2] (HF Llama half-dim convention)
     pub sin: Tensor<B, 2>,
 }
 
@@ -239,7 +239,6 @@ pub fn top_k_top_p_sample(
 ///
 /// Returns `None` for `seq_len ≤ 1` (single token — no masking needed).
 /// Call this once at the model level and pass the result to each layer.
-#[allow(dead_code)]
 pub fn build_causal_bias<B: Backend>(seq_len: usize, device: &B::Device) -> Option<Tensor<B, 4>> {
     if seq_len <= 1 {
         return None;

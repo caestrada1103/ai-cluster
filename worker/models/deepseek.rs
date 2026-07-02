@@ -110,12 +110,11 @@ impl<B: Backend> DeepSeekMoE<B> {
         }
     }
 
-    /// Forward pass with sparse top-k expert routing.
-    ///
-    /// For each token, selects the `num_experts_per_tok` highest-probability
-    /// experts (top-k), normalizes their weights, and accumulates weighted
-    /// expert outputs. Experts with zero routing weight for all tokens in
-    /// the batch are skipped entirely, giving the ~k/N speedup vs dense routing.
+    /// Forward pass with sparse top-k expert routing (DeepSeek V1/V2-style
+    /// softmax scoring — V3's sigmoid + bias-corrected group routing is NOT
+    /// implemented). Experts unused by every token in the batch are skipped,
+    /// which only approaches a k/N speedup for single-token decode; prefill
+    /// still runs each selected expert over the full flattened batch.
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch, seq_len, hidden] = input.dims();
         let num_experts = self.experts.len();
@@ -218,40 +217,6 @@ impl<B: Backend> DeepSeekAttention<B> {
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
         }
-    }
-
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        rope: &RotaryEmbedding<B>,
-        start_pos: usize,
-    ) -> Tensor<B, 3> {
-        let [batch, seq_len, _] = x.dims();
-
-        let q = self.q_proj.forward(x.clone())
-            .reshape([batch, seq_len, self.num_heads, self.head_dim])
-            .swap_dims(1, 2);
-        let k = self.k_proj.forward(x.clone())
-            .reshape([batch, seq_len, self.num_kv_heads, self.head_dim])
-            .swap_dims(1, 2);
-        let v = self.v_proj.forward(x)
-            .reshape([batch, seq_len, self.num_kv_heads, self.head_dim])
-            .swap_dims(1, 2);
-
-        let (q, k) = rope.apply(q, k, start_pos);
-
-        let n_rep = self.num_heads / self.num_kv_heads;
-        let k = repeat_kv(k, n_rep);
-        let v = repeat_kv(v, n_rep);
-
-        let scale = (self.head_dim as f64).sqrt();
-        let attn = q.matmul(k.swap_dims(2, 3)).div_scalar(scale);
-        let attn = burn::tensor::activation::softmax(attn, 3);
-        let output = attn.matmul(v)
-            .swap_dims(1, 2)
-            .reshape([batch, seq_len, self.num_heads * self.head_dim]);
-
-        self.o_proj.forward(output)
     }
 
     /// Prefill forward: returns attention output and the compact (pre-GQA) KV entry.
@@ -363,23 +328,6 @@ impl<B: Backend> DeepSeekLayer<B> {
             input_layernorm: RMSNorm::new(config.hidden_size, config.rms_norm_eps as f64, device),
             post_attention_layernorm: RMSNorm::new(config.hidden_size, config.rms_norm_eps as f64, device),
         }
-    }
-
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        rope: &RotaryEmbedding<B>,
-        start_pos: usize,
-    ) -> Tensor<B, 3> {
-        let residual = x.clone();
-        let x = self.input_layernorm.forward(x);
-        let x = self.attention.forward(x, rope, start_pos);
-        let x = x + residual;
-
-        let residual = x.clone();
-        let x = self.post_attention_layernorm.forward(x);
-        let x = self.moe.forward(x);
-        x + residual
     }
 
     /// Prefill forward: returns hidden state and the layer's KV entry.
@@ -520,37 +468,15 @@ impl<B: Backend> DeepSeek<B> {
         })
     }
 
-    /// Forward pass (no KV cache — for standalone use)
-    pub fn forward_pass(
-        &self,
-        input_ids: Tensor<B, 2>,
-        start_pos: usize,
-    ) -> Tensor<B, 3> {
-        let mut x = self.embed_tokens.forward(input_ids.int());
-        for layer in &self.layers {
-            x = layer.forward(x, &self.rope, start_pos);
-        }
-        let x = self.norm.forward(x);
-        self.lm_head.forward(x)
-    }
-
     /// Full-sequence prefill: returns last-position logits (CPU) and populated KV cache.
     pub fn prefill(&self, input_ids: Tensor<B, 2>) -> (Vec<f32>, KvCache<B>) {
         let [_, seq_len] = input_ids.dims();
         let device = input_ids.device();
         let vocab = self.config.vocab_size;
 
-        let causal_bias: Option<Tensor<B, 4>> = if seq_len > 1 {
-            let mut data = vec![-1e9_f32; seq_len * seq_len];
-            for i in 0..seq_len {
-                for j in 0..=i {
-                    data[i * seq_len + j] = 0.0;
-                }
-            }
-            Some(Tensor::<B, 1>::from_floats(data.as_slice(), &device).reshape([1, 1, seq_len, seq_len]))
-        } else {
-            None
-        };
+        // Build additive causal bias once — [1, 1, seq, seq]; shared helper.
+        let causal_bias: Option<Tensor<B, 4>> =
+            super::common::build_causal_bias::<B>(seq_len, &device);
 
         let mut x = self.embed_tokens.forward(input_ids.int());
         let mut kv_cache: KvCache<B> = Vec::with_capacity(self.layers.len());

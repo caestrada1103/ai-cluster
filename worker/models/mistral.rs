@@ -313,6 +313,13 @@ impl<B: Backend> Mistral<B> {
         input_ids: Tensor<B, 2>,
         start_pos: usize,
     ) -> Tensor<B, 3> {
+        // The sliding-window mask below indexes chunk-local (i, j) while RoPE uses
+        // absolute start_pos — only a full-prompt (start_pos == 0) pass is correct.
+        assert_eq!(
+            start_pos, 0,
+            "Mistral::forward_pass only supports start_pos == 0 (no chunked prefill)"
+        );
+
         // Token embeddings: [batch, seq] -> [batch, seq, hidden]
         let mut x = self.embed_tokens.forward(input_ids.int());
 
