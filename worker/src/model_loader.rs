@@ -114,6 +114,13 @@ impl ModelLoader {
             return Ok(entry.value().clone());
         }
 
+        if quantization != crate::cluster::Quantization::None {
+            return Err(WorkerError::InvalidRequest(format!(
+                "quantization {:?} is not implemented — request NONE (weights load as FP32)",
+                quantization
+            )));
+        }
+
         // Per-model lock: two concurrent requests for the SAME model serialize here,
         // so exactly one performs the multi-GB load.
         let model_lock = self
@@ -136,7 +143,7 @@ impl ModelLoader {
         let model_path = self.get_model_path(model_name).await?;
         let config = self.load_model_config(model_name, model_config, &model_path).await?;
 
-        let memory_used = self.calculate_memory_usage(&config, quantization);
+        let memory_used = self.calculate_memory_usage(&config);
         let mut reserved_gpus: Vec<usize> = Vec::new();
         for &gpu_id in gpu_ids {
             match self
@@ -405,22 +412,22 @@ impl ModelLoader {
         })
     }
 
-    fn calculate_memory_usage(&self, config: &ModelConfig, q: crate::cluster::Quantization) -> usize {
+    /// Honest accounting: every weight is loaded as FP32 today (4 bytes/param),
+    /// and MoE models replicate the FFN per expert.
+    fn calculate_memory_usage(&self, config: &ModelConfig) -> usize {
         let embed = config.vocab_size * config.hidden_size;
         let attn = config.num_layers * 4 * config.hidden_size * config.hidden_size;
-        let ffn = config.num_layers * 3 * config.hidden_size * config.intermediate_size;
+        let expert_factor = if config.is_moe {
+            config.num_experts.unwrap_or(1).max(1)
+        } else {
+            1
+        };
+        let ffn = config.num_layers * 3 * config.hidden_size * config.intermediate_size * expert_factor;
         let norm = (config.num_layers * 2 + 1) * config.hidden_size;
         let params = embed + attn + ffn + norm;
-
-        // Bytes per parameter depends on quantization precision
-        match q {
-            crate::cluster::Quantization::Int4 => params / 2,   // 0.5 bytes/param
-            crate::cluster::Quantization::Int8 => params,       // 1 byte/param
-            crate::cluster::Quantization::Fp8 => params,        // 1 byte/param
-            _ => params * 2,                                     // FP16 = 2 bytes/param
-        }
+        params * 4
     }
-    
+
 }
 
 /// Helper to transpose Linear weights (HF [out, in] -> Burn [in, out])
