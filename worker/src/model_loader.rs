@@ -127,10 +127,9 @@ impl ModelLoader {
         
         let memory_used = self.calculate_memory_usage(&config, quantization);
         for &gpu_id in gpu_ids {
-            self.gpu_manager.allocate_memory(
-                gpu_id as usize,
-                memory_used as u64,
-            ).await?;
+            self.gpu_manager
+                .allocate_memory(gpu_id as usize, memory_used as u64, model_name)
+                .await?;
         }
 
         let device = if let Some(&id) = gpu_ids.first() {
