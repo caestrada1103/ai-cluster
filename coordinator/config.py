@@ -94,6 +94,23 @@ class Settings(BaseSettings):
         10, description="Maximum concurrent requests per worker", ge=1
     )
 
+    # Request routing (consumed by coordinator.router.RequestRouter)
+    routing_strategy: str = Field(
+        "least_load",
+        description=(
+            "Load balancing strategy: least_load, round_robin, random, affinity, power_of_two"
+        ),
+    )
+    circuit_breaker_failure_threshold: int = Field(
+        5, description="Consecutive failures before a worker's circuit opens", ge=1
+    )
+    circuit_breaker_recovery_timeout: float = Field(
+        30.0, description="Seconds before an open circuit half-opens", gt=0
+    )
+    affinity_ttl_seconds: float = Field(
+        600.0, description="How long a session sticks to a worker (affinity strategy)", gt=0
+    )
+
     # Performance
     enable_batching: bool = Field(True, description="Enable continuous batching")
     max_batch_size: int = Field(32, description="Maximum batch size", ge=1, le=256)

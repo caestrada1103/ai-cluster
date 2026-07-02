@@ -43,6 +43,9 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = Field(0.95, ge=0.0, le=1.0)
     top_k: Optional[int] = Field(40, ge=0)
     stream: Optional[bool] = False
+    session_id: Optional[str] = Field(
+        None, description="Sticky-session key for affinity routing (optional)"
+    )
 
 
 class CompletionRequest(BaseModel):
@@ -57,6 +60,9 @@ class CompletionRequest(BaseModel):
     stream: bool = False
     worker_id: Optional[str] = Field(
         None, description="Optional worker ID to force routing to a specific GPU"
+    )
+    session_id: Optional[str] = Field(
+        None, description="Sticky-session key for affinity routing (optional)"
     )
 
 
@@ -166,6 +172,7 @@ async def create_completion(body: CompletionRequest, request: "Request[Any]") ->
             top_k=body.top_k,
             stream=body.stream,
             worker_id=worker_id,
+            session_id=body.session_id,
         )
         return CompletionResponse(**result)
     except TimeoutError as exc:
@@ -269,6 +276,7 @@ async def create_chat_completion(
             top_k=body.top_k or 40,
             stream=body.stream or False,
             worker_id=worker_id,
+            session_id=body.session_id,
         )
 
         if body.stream:

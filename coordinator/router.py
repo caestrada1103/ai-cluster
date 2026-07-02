@@ -9,7 +9,6 @@ This module handles:
 """
 
 import asyncio
-import hashlib
 import logging
 import random
 import time
@@ -18,6 +17,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from coordinator.config import Settings
 from coordinator.coordinator import WorkerInfo
 from coordinator.models import ModelRegistry
 from coordinator.monitoring import metrics
@@ -209,13 +209,13 @@ class RequestRouter:
     def __init__(
         self,
         get_workers_callback: Callable[[], Dict[str, WorkerInfo]],
-        settings: Any,
+        settings: Settings,
     ):
         self.get_workers = get_workers_callback
         self.settings = settings
 
         # Load balancing
-        self.strategy = LoadBalancingStrategy(settings.routing.get("strategy", "least_load"))
+        self.strategy = LoadBalancingStrategy(settings.routing_strategy)
         self.rr_index: Dict[str, int] = defaultdict(int)  # Per-model round-robin index
 
         # Circuit breakers per worker
@@ -227,14 +227,22 @@ class RequestRouter:
             QueuePriority.HIGH: asyncio.Queue(),
             QueuePriority.NORMAL: asyncio.Queue(),
             QueuePriority.LOW: asyncio.Queue(),
-            QueuePriority.BATCH: asyncio.Queue(maxsize=settings.max_batch_size),
+            QueuePriority.BATCH: asyncio.Queue(maxsize=settings.max_queue_size),
         }
 
         # Worker load tracking
         self.worker_loads: Dict[str, WorkerLoad] = {}
 
-        # Affinity tracking (request_id -> worker_id)
-        self.affinity_map: Dict[str, str] = {}
+        # Affinity tracking: session_id -> (worker_id, expires_at)
+        self.affinity_map: Dict[str, Tuple[str, float]] = {}
+        # Priority drain order — BATCH included (starvation fix)
+        self.drain_order: List[QueuePriority] = [
+            QueuePriority.CRITICAL,
+            QueuePriority.HIGH,
+            QueuePriority.NORMAL,
+            QueuePriority.LOW,
+            QueuePriority.BATCH,
+        ]
 
         # Background tasks
         self._queue_processor_task: Optional["asyncio.Task[None]"] = None
@@ -295,7 +303,7 @@ class RequestRouter:
             return None, await self._queue_request(request_id, model_name, prompt, params, priority)
 
         # Select best worker
-        worker = await self._select_worker(available_workers, model_name, request_id)
+        worker = await self._select_worker(available_workers, model_name, params.get("session_id"))
 
         if not worker:
             # No suitable worker, queue
@@ -305,6 +313,21 @@ class RequestRouter:
         self.routed_requests.labels(strategy=self.strategy.value, model=model_name).inc()
 
         return worker, None
+
+    async def pick_worker(
+        self,
+        workers: Dict[str, WorkerInfo],
+        model_name: str,
+        session_id: Optional[str],
+    ) -> Optional[WorkerInfo]:
+        """Filter (health + circuit breakers + capacity) then apply the strategy."""
+        available = self._get_available_workers(workers, model_name)
+        if not available:
+            return None
+        worker = await self._select_worker(available, model_name, session_id)
+        if worker is not None:
+            self.routed_requests.labels(strategy=self.strategy.value, model=model_name).inc()
+        return worker
 
     def _get_available_workers(
         self,
@@ -324,14 +347,15 @@ class RequestRouter:
             if not worker.is_available:
                 continue
 
-            # Check if model is loaded or can be loaded
+            # Check if model is loaded or can be loaded.
+            # Unknown registry names are direct HF repo ids — assume 8 GB until the
+            # worker downloads the real config.
             model_config = ModelRegistry.get_model(model_name)
-            if not model_config:
-                continue
+            required_gb = model_config.min_memory_gb if model_config else 8.0
 
             if model_name in worker.loaded_models:
                 available.append(worker)
-            elif worker.available_memory >= model_config.min_memory_gb * 1e9:
+            elif worker.available_memory >= required_gb * 1e9:
                 available.append(worker)
 
         return available
@@ -340,18 +364,21 @@ class RequestRouter:
         self,
         workers: List[WorkerInfo],
         model_name: str,
-        request_id: str,
+        session_id: Optional[str],
     ) -> Optional[WorkerInfo]:
         """Select the best worker using the configured strategy."""
         if not workers:
             return None
 
-        # Check affinity first
-        if request_id in self.affinity_map:
-            worker_id = self.affinity_map[request_id]
-            for worker in workers:
-                if worker.id == worker_id:
-                    return worker
+        # Sticky session: honor an unexpired affinity entry
+        if session_id is not None and session_id in self.affinity_map:
+            worker_id, expires_at = self.affinity_map[session_id]
+            if time.time() < expires_at:
+                for worker in workers:
+                    if worker.id == worker_id:
+                        return worker
+            else:
+                del self.affinity_map[session_id]
 
         # Apply strategy
         if self.strategy == LoadBalancingStrategy.ROUND_ROBIN:
@@ -367,11 +394,12 @@ class RequestRouter:
             return await self._power_of_two_select(workers)
 
         elif self.strategy == LoadBalancingStrategy.AFFINITY:
-            # Create affinity based on prompt hash
-            affinity_key = hashlib.md5(f"{model_name}:{request_id}".encode()).hexdigest()
-            index = int(affinity_key[:8], 16) % len(workers)
-            worker = workers[index]
-            self.affinity_map[request_id] = worker.id
+            worker = await self._least_load_select(workers)
+            if session_id is not None:
+                self.affinity_map[session_id] = (
+                    worker.id,
+                    time.time() + self.settings.affinity_ttl_seconds,
+                )
             return worker
 
         # Default to least load
@@ -469,12 +497,7 @@ class RequestRouter:
             try:
                 # Check queues in priority order
                 request: Optional[QueuedRequest] = None
-                for priority in [
-                    QueuePriority.CRITICAL,
-                    QueuePriority.HIGH,
-                    QueuePriority.NORMAL,
-                    QueuePriority.LOW,
-                ]:
+                for priority in self.drain_order:
                     try:
                         # Non-blocking check
                         request = self.queues[priority].get_nowait()
@@ -495,20 +518,17 @@ class RequestRouter:
                     )
                     continue
 
-                # Try to route again
-                worker, _ = await self.route_request(
-                    request.request_id,
-                    request.model_name,
-                    request.prompt,
-                    request.params,
-                    request.priority,
+                # Try to select again WITHOUT re-enqueueing (route_request would
+                # create a duplicate QueuedRequest).
+                worker = await self.pick_worker(
+                    self.get_workers(), request.model_name, request.params.get("session_id")
                 )
 
                 if worker:
                     # Success! Return the worker to the caller
                     request.future.set_result(worker)
                 else:
-                    # Still no worker, re-queue with backoff
+                    # Still no worker: back off, then re-queue the SAME request object
                     await asyncio.sleep(0.5)
                     await self.queues[request.priority].put(request)
                     self.queue_size.labels(priority=request.priority.value).inc()
@@ -574,12 +594,8 @@ class RequestRouter:
         """Record a failed request."""
         if worker_id not in self.circuit_breakers:
             self.circuit_breakers[worker_id] = CircuitBreaker(
-                failure_threshold=self.settings.routing.get("circuit_breaker", {}).get(
-                    "failure_threshold", 5
-                ),
-                recovery_timeout=self.settings.routing.get("circuit_breaker", {}).get(
-                    "recovery_timeout", 30
-                ),
+                failure_threshold=self.settings.circuit_breaker_failure_threshold,
+                recovery_timeout=self.settings.circuit_breaker_recovery_timeout,
             )
 
         self.circuit_breakers[worker_id].record_failure()

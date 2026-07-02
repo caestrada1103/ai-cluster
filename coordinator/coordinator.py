@@ -127,6 +127,13 @@ class ClusterCoordinator:
 
         # Components
         self.discovery = WorkerDiscovery(settings)
+        # Local import: router imports WorkerInfo from this module (cycle avoidance).
+        from coordinator.router import RequestRouter
+
+        self.router = RequestRouter(
+            get_workers_callback=lambda: dict(self.workers),
+            settings=settings,
+        )
 
         # Load models from configuration
         config_dict = settings.load_models_config()
@@ -153,6 +160,7 @@ class ClusterCoordinator:
 
         # Start components
         await self.discovery.start()
+        await self.router.start()
 
         # Start background tasks
         self._discovery_task = asyncio.create_task(self._discovery_loop())
@@ -174,6 +182,8 @@ class ClusterCoordinator:
                     await task
                 except asyncio.CancelledError:
                     pass
+
+        await self.router.stop()
 
         # Close worker connections
         async with self._workers_lock:
@@ -314,7 +324,7 @@ class ClusterCoordinator:
                         continue
                 else:
                     # Default load balancing logic if no explicit target
-                    worker = await self._select_worker(ctx.model_name)
+                    worker = await self._select_worker(ctx.model_name, ctx.params.get("session_id"))
 
                 if not worker:
                     logger.warning(f"No worker available for model {ctx.model_name}")
@@ -333,36 +343,13 @@ class ClusterCoordinator:
             except Exception as e:
                 logger.error(f"Error in request processor: {e}")
 
-    async def _select_worker(self, model_name: str) -> Optional[WorkerInfo]:
-        """Select the best worker for a request."""
-        available_workers = []
-
+    async def _select_worker(
+        self, model_name: str, session_id: Optional[str] = None
+    ) -> Optional[WorkerInfo]:
+        """Select the best worker via the RequestRouter (strategies + circuit breakers)."""
         async with self._workers_lock:
-            for worker in self.workers.values():
-                if not worker.is_available:
-                    continue
-
-                # Check if model is loaded
-                if model_name in worker.loaded_models:
-                    available_workers.append(worker)
-                else:
-                    # Check if worker has enough memory to load model
-                    model_config = ModelRegistry.get_model(model_name)
-                    if model_config:
-                        required_memory = model_config.min_memory_gb * 1e9
-                        if worker.available_memory >= required_memory:
-                            available_workers.append(worker)
-                    else:
-                        # For unknown HuggingFace models, assume 8GB requirement for now.
-                        # True size is unknown until the worker downloads the safetensors metadata.
-                        if worker.available_memory >= 8 * 1e9:
-                            available_workers.append(worker)
-
-        if not available_workers:
-            return None
-
-        # Simple load balancing: least active requests
-        return min(available_workers, key=lambda w: w.active_requests)
+            workers = dict(self.workers)
+        return await self.router.pick_worker(workers, model_name, session_id)
 
     async def _execute_request(self, ctx: RequestContext, worker: WorkerInfo) -> None:
         """Execute a request on a worker."""
@@ -411,6 +398,7 @@ class ClusterCoordinator:
             # Update metrics
             self.request_counter.labels(model=ctx.model_name, status="success").inc()
             self.request_duration.labels(model=ctx.model_name).observe(duration)
+            self.router.record_success(worker.id)
 
             logger.info(
                 f"Request {ctx.id} completed: {ctx.tokens_generated} tokens " f"in {duration:.2f}s"
@@ -420,6 +408,7 @@ class ClusterCoordinator:
             ctx.error = str(e)
             ctx.completed_at = time.time()
             self.request_counter.labels(model=ctx.model_name, status="error").inc()
+            self.router.record_failure(worker.id)
             logger.error(f"Request {ctx.id} failed: {e}")
 
         finally:

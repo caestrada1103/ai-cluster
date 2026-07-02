@@ -1,19 +1,19 @@
-"""Tests for coordinator.router — CircuitBreaker, WorkerLoad, and enums.
+"""Tests for coordinator.router — CircuitBreaker, WorkerLoad, enums, and RequestRouter."""
 
-RequestRouter is not tested here because it depends on coordinator.monitoring.metrics
-(Prometheus counters/gauges) and settings.routing (loaded from coordinator.yaml at
-runtime). The pure dataclasses and state machines are fully testable in isolation.
-"""
-
+from typing import Any, Dict
+from unittest.mock import Mock
 
 import pytest
 
+from coordinator.coordinator import WorkerInfo
 from coordinator.router import (
     CircuitBreaker,
     LoadBalancingStrategy,
     QueuePriority,
+    RequestRouter,
     WorkerLoad,
 )
+from coordinator.tests.conftest import make_settings
 
 # ---------------------------------------------------------------------------
 # Enum sanity checks
@@ -184,3 +184,65 @@ def test_cb_stats_state_is_string() -> None:
     cb = CircuitBreaker()
     assert isinstance(cb.stats["state"], str)
     assert cb.stats["state"] == "closed"
+
+
+# ---------------------------------------------------------------------------
+# RequestRouter — construction, selection, affinity, queues, circuit breakers
+# ---------------------------------------------------------------------------
+
+
+def _mock_worker(worker_id: str, active: int = 0) -> Any:
+    worker = Mock(spec=WorkerInfo)
+    worker.id = worker_id
+    worker.active_requests = active
+    worker.is_available = True
+    worker.loaded_models = {"deepseek-7b": object()}
+    worker.available_memory = 64 * 10**9
+    worker.gpus = []
+    worker.avg_latency_ms = 0.0
+    return worker
+
+
+def test_router_constructs_with_real_settings() -> None:
+    settings = make_settings()
+    router = RequestRouter(get_workers_callback=dict, settings=settings)
+    assert router.strategy.value == "least_load"
+
+
+@pytest.mark.asyncio
+async def test_pick_worker_least_load() -> None:
+    settings = make_settings()
+    workers: Dict[str, Any] = {
+        "w1": _mock_worker("w1", active=5),
+        "w2": _mock_worker("w2", active=1),
+    }
+    router = RequestRouter(get_workers_callback=lambda: workers, settings=settings)
+    picked = await router.pick_worker(workers, "deepseek-7b", session_id=None)
+    assert picked is not None and picked.id == "w2"
+
+
+@pytest.mark.asyncio
+async def test_affinity_keyed_by_session_with_ttl() -> None:
+    settings = make_settings(routing_strategy="affinity", affinity_ttl_seconds=600.0)
+    workers: Dict[str, Any] = {"w1": _mock_worker("w1"), "w2": _mock_worker("w2")}
+    router = RequestRouter(get_workers_callback=lambda: workers, settings=settings)
+    first = await router.pick_worker(workers, "deepseek-7b", session_id="sess-1")
+    second = await router.pick_worker(workers, "deepseek-7b", session_id="sess-1")
+    assert first is not None and second is not None
+    assert first.id == second.id  # sticky per session
+    assert "sess-1" in router.affinity_map
+
+
+def test_batch_priority_is_drained() -> None:
+    """BATCH must appear in the queue drain order (starvation fix)."""
+    settings = make_settings()
+    router = RequestRouter(get_workers_callback=dict, settings=settings)
+    assert QueuePriority.BATCH in router.drain_order
+
+
+def test_circuit_breaker_settings_come_from_flat_fields() -> None:
+    settings = make_settings(circuit_breaker_failure_threshold=2)
+    router = RequestRouter(get_workers_callback=dict, settings=settings)
+    router.record_failure("w1")
+    router.record_failure("w1")
+    assert router.circuit_breakers["w1"].state.value == "open"
