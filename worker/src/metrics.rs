@@ -150,6 +150,7 @@ async fn metrics_handler(
 ) -> impl IntoResponse {
     // Update GPU metrics before serving
     let gpu_manager = &state.gpu_manager;
+    gpu_manager.refresh_telemetry().await;
 
     for gpu_info in gpu_manager.get_all_gpu_info().await {
         let gpu_label = gpu_info.id.to_string();

@@ -31,13 +31,17 @@ pub struct GPUDevice {
     /// Available VRAM in bytes
     pub available_memory: u64,
 
-    /// Current utilization (0-100)
+    /// Current utilization (0-100) at detection time — live values come from
+    /// `GpuTelemetry` via `refresh_telemetry`/`get_all_gpu_info` instead.
+    #[allow(dead_code)]
     pub utilization: f32,
 
-    /// Temperature in Celsius
+    /// Temperature in Celsius at detection time — see `utilization` note.
+    #[allow(dead_code)]
     pub temperature: f32,
 
-    /// Power usage in watts
+    /// Power usage in watts at detection time — see `utilization` note.
+    #[allow(dead_code)]
     pub power_usage: u32,
 
     /// Device capabilities
@@ -53,6 +57,14 @@ struct MemoryAllocation {
     size: u64,
     /// Allocation timestamp
     _timestamp: std::time::Instant,
+}
+
+/// Mutable GPU telemetry sampled from vendor tools at scrape time.
+#[derive(Debug, Clone, Default)]
+struct GpuTelemetry {
+    utilization: f32,
+    temperature: f32,
+    power_usage: u32,
 }
 
 /// GPU Manager — handles device detection and memory tracking
@@ -72,6 +84,9 @@ pub struct GPUManager {
 
     /// Whether peer-to-peer is enabled
     _p2p_enabled: bool,
+
+    /// Per-managed-device telemetry, refreshed on demand (metrics scrape / health check).
+    telemetry: Arc<tokio::sync::RwLock<Vec<GpuTelemetry>>>,
 }
 
 impl GPUManager {
@@ -132,6 +147,10 @@ impl GPUManager {
             used_bytes: Arc::new((0..num_devices).map(|_| AtomicU64::new(0)).collect()),
             memory_locks,
             _p2p_enabled: false,
+            telemetry: Arc::new(tokio::sync::RwLock::new(vec![
+                GpuTelemetry::default();
+                num_devices
+            ])),
         })
     }
 
@@ -306,21 +325,63 @@ impl GPUManager {
         self.devices.len()
     }
 
+    /// Re-sample utilization/temperature/power via nvidia-smi (one CSV line per GPU).
+    /// AMD/Intel adapters keep zeros until a rocm-smi refresh is added.
+    /// Managed device i maps to vendor-tool line i (single-vendor hosts; documented limitation).
+    pub async fn refresh_telemetry(&self) {
+        let output = tokio::task::spawn_blocking(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let out = Command::new("nvidia-smi")
+                    .arg("--query-gpu=utilization.gpu,temperature.gpu,power.draw")
+                    .arg("--format=csv,noheader,nounits")
+                    .output();
+                let _ = tx.send(out);
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(3)).ok().and_then(|r| r.ok())
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let Some(output) = output else { return };
+        if !output.status.success() {
+            return;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut telemetry = self.telemetry.write().await;
+        for (i, line) in stdout.lines().enumerate() {
+            if i >= telemetry.len() {
+                break;
+            }
+            let fields: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            if fields.len() >= 3 {
+                telemetry[i] = GpuTelemetry {
+                    utilization: fields[0].parse().unwrap_or(0.0),
+                    temperature: fields[1].parse().unwrap_or(0.0),
+                    power_usage: fields[2].parse::<f32>().map(|w| w as u32).unwrap_or(0),
+                };
+            }
+        }
+    }
+
     /// Get all GPU info for status reporting (gRPC)
     pub async fn get_all_gpu_info(&self) -> Vec<GpuInfo> {
+        let telemetry = self.telemetry.read().await.clone();
         let mut infos = Vec::new();
 
-        for device in &self.devices {
+        for (i, device) in self.devices.iter().enumerate() {
             let available = self.get_available_memory(device.id).await;
+            let t = telemetry.get(i).cloned().unwrap_or_default();
 
             infos.push(GpuInfo {
                 id: device.id as i32,
                 name: device.name.clone(),
                 total_memory: device.total_memory,
                 available_memory: available,
-                utilization: device.utilization,
-                temperature: device.temperature,
-                power_usage: device.power_usage,
+                utilization: t.utilization,
+                temperature: t.temperature,
+                power_usage: t.power_usage,
                 capabilities: device.capabilities.clone(),
             });
         }
@@ -405,10 +466,12 @@ impl GPUManager {
         freed
     }
 
-    /// Check if all GPUs are healthy
+    /// Check if all GPUs are healthy (refreshes telemetry first).
     pub async fn is_healthy(&self) -> bool {
-        for device in &self.devices {
-            if device.temperature > 100.0 {
+        self.refresh_telemetry().await;
+        let telemetry = self.telemetry.read().await;
+        for t in telemetry.iter() {
+            if t.temperature > 100.0 {
                 return false;
             }
         }
@@ -456,6 +519,7 @@ mod tests {
             allocations: Arc::new(DashMap::new()),
             used_bytes: Arc::new(vec![AtomicU64::new(0)]),
             memory_locks: vec![Arc::new(Semaphore::new(1))],
+            telemetry: Arc::new(tokio::sync::RwLock::new(vec![Default::default()])),
             _p2p_enabled: false,
         }
     }
