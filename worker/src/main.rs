@@ -158,6 +158,12 @@ fn create_runtime() -> Result<Runtime, WorkerError> {
 }
 
 async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Result<(), WorkerError> {
+    // Install the Prometheus recorder BEFORE any metric is described or recorded.
+    // If this fails the process must not run blind — bail out.
+    let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .map_err(|e| WorkerError::Runtime(format!("Failed to install metrics recorder: {}", e)))?;
+
     // Initialize GPU manager
     info!("Initializing GPU Manager...");
     let gpu_manager = Arc::new(gpu_manager::GPUManager::new(&gpu_ids).await?);
@@ -210,6 +216,7 @@ async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Re
     let metrics_server = MetricsServer::new(
         metrics_port,
         gpu_manager.clone(),
+        prometheus_handle,
     );
     tokio::spawn(async move {
         if let Err(e) = metrics_server.run().await {

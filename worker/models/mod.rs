@@ -184,6 +184,7 @@ impl ModelInstance {
         seed: Option<u64>,
     ) -> Result<TextStream, WorkerError> {
         if let Some(model) = &self.model {
+            self.inference_count.fetch_add(1, Ordering::Relaxed);
             let stream = {
                 debug!("ModelInstance::generate starting for {} - waiting for Mutex", self.name);
                 let guard = model.lock()

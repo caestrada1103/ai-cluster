@@ -415,10 +415,24 @@ impl GPUManager {
         true
     }
 
-    /// Get system memory information: (free, total)
+    /// Get system memory information from /proc/meminfo: (available, total) bytes.
     pub async fn system_memory(&self) -> (u64, u64) {
-        // Fallback — real system memory detection can be added later
-        (0, 0)
+        let Ok(contents) = tokio::fs::read_to_string("/proc/meminfo").await else {
+            return (0, 0);
+        };
+        let mut total = 0u64;
+        let mut available = 0u64;
+        for line in contents.lines() {
+            let mut parts = line.split_whitespace();
+            match parts.next() {
+                Some("MemTotal:") => total = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+                Some("MemAvailable:") => {
+                    available = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0)
+                }
+                _ => {}
+            }
+        }
+        (available * 1024, total * 1024) // /proc/meminfo reports kB
     }
 }
 

@@ -17,7 +17,7 @@ use metrics::{
     describe_counter, describe_gauge, describe_histogram,
     counter, gauge, histogram,
 };
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::PrometheusHandle;
 use tracing::info;
 
 use crate::gpu_manager::GPUManager;
@@ -70,11 +70,6 @@ impl Metrics {
         describe_counter!(
             "worker_tokens_generated_total",
             "Total number of tokens generated"
-        );
-
-        describe_histogram!(
-            "worker_batch_size",
-            "Batch size distribution"
         );
 
         describe_gauge!(
@@ -132,6 +127,21 @@ impl Metrics {
         );
     }
 
+    /// Gauge: number of in-flight inference requests.
+    pub fn set_active_requests(&self, n: usize) {
+        gauge!("worker_active_requests", n as f64);
+    }
+
+    /// Gauge: number of models currently loaded.
+    pub fn set_loaded_models(&self, n: usize) {
+        gauge!("worker_loaded_models", n as f64);
+    }
+
+    /// Counter: errors by kind ("inference", "timeout", "model_load").
+    pub fn record_error(&self, kind: &str) {
+        counter!("worker_errors_total", 1, "kind" => kind.to_string());
+    }
+
 }
 
 /// Metrics HTTP handler
@@ -176,25 +186,23 @@ struct MetricsAppState {
 pub struct MetricsServer {
     port: u16,
     gpu_manager: Arc<GPUManager>,
+    handle: PrometheusHandle,
 }
 
 impl MetricsServer {
-    /// Create new metrics server
-    pub fn new(
-        port: u16,
-        gpu_manager: Arc<GPUManager>,
-    ) -> Self {
+    /// Create new metrics server. The recorder handle is installed by main()
+    /// before any service starts, so early describe!/counter! calls register.
+    pub fn new(port: u16, gpu_manager: Arc<GPUManager>, handle: PrometheusHandle) -> Self {
         Self {
             port,
             gpu_manager,
+            handle,
         }
     }
 
     /// Run the metrics server
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Build Prometheus recorder and exporter
-        let builder = PrometheusBuilder::new();
-        let handle = builder.install_recorder()?;
+        let handle = self.handle.clone();
 
         let state = Arc::new(MetricsAppState {
             gpu_manager: self.gpu_manager.clone(),

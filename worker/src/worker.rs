@@ -88,11 +88,13 @@ impl WorkerService {
 struct ActiveGuard {
     map: Arc<DashMap<String, Instant>>,
     id: String,
+    metrics: Metrics,
 }
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         self.map.remove(&self.id);
+        self.metrics.set_active_requests(self.map.len());
     }
 }
 
@@ -161,6 +163,7 @@ impl Worker for WorkerService {
                 // Update metrics
                 self.metrics.record_model_load(&req.model_name, load_time);
                 self.metrics.set_model_memory(&req.model_name, memory_used as i64);
+                self.metrics.set_loaded_models(self.loaded_models.read().await.len());
 
                 info!(
                     "Model {} loaded successfully in {:?}, using {}MB VRAM",
@@ -176,6 +179,7 @@ impl Worker for WorkerService {
             }
             Err(e) => {
                 error!("Failed to load model {}: {}", req.model_name, e);
+                self.metrics.record_error("model_load");
                 Err(Status::internal(format!("Failed to load model: {}", e)))
             }
         }
@@ -211,9 +215,11 @@ impl Worker for WorkerService {
 
         // Track active request
         self.active_requests.insert(request_id.clone(), Instant::now());
+        self.metrics.set_active_requests(self.active_requests.len());
         let active_guard = ActiveGuard {
             map: self.active_requests.clone(),
             id: request_id.clone(),
+            metrics: self.metrics.clone(),
         };
 
         // Get model
@@ -270,6 +276,7 @@ impl Worker for WorkerService {
                         match tokio::time::timeout_at(deadline, token_stream.next()).await {
                             Err(_) => {
                                 timed_out = true;
+                                metrics.record_error("timeout");
                                 break;
                             }
                             Ok(None) => break,
@@ -287,6 +294,7 @@ impl Worker for WorkerService {
                             Ok(Some(Err(e))) => {
                                 tracing::error!("Generation error: {}", e);
                                 stream_error = true;
+                                metrics.record_error("inference");
                                 break;
                             }
                         }
@@ -328,6 +336,7 @@ impl Worker for WorkerService {
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Inference error for {}: {}", req_id, e);
+                    metrics.record_error("inference");
                     yield InferenceResponse {
                         request_id: req_id.clone(),
                         text: format!("Error: {}", e),
@@ -339,6 +348,7 @@ impl Worker for WorkerService {
                 }
                 Err(_) => {
                     tracing::warn!("Request {} timed out after {:?}", req_id, timeout_duration);
+                    metrics.record_error("timeout");
                     yield InferenceResponse {
                         request_id: req_id.clone(),
                         text: String::new(),
@@ -418,6 +428,7 @@ impl Worker for WorkerService {
 
         if removed_from_service || removed_from_loader {
             self.metrics.remove_model_metrics(&req.model_name);
+            self.metrics.set_loaded_models(self.loaded_models.read().await.len());
             info!("Model {} unloaded successfully", req.model_name);
             Ok(Response::new(Empty {}))
         } else {
