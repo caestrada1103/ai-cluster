@@ -3,7 +3,7 @@
 import json
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Dict, List, Union
+from typing import Annotated, Any, Dict, List, Union, cast
 
 import toml
 import yaml
@@ -13,6 +13,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 class DiscoveryMethod(str, Enum):
     """Worker discovery methods."""
+
     STATIC = "static"
     MDNS = "mdns"
     BROADCAST = "broadcast"
@@ -21,6 +22,7 @@ class DiscoveryMethod(str, Enum):
 
 class LogLevel(str, Enum):
     """Logging levels."""
+
     DEBUG = "debug"
     INFO = "info"
     WARNING = "warning"
@@ -29,13 +31,13 @@ class LogLevel(str, Enum):
 
 class Settings(BaseSettings):
     """Application settings."""
-    
+
     model_config = SettingsConfigDict(
         env_prefix="COORDINATOR_",
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",  # the shared .env also carries worker vars (HF_TOKEN, GPU_INDEX, ...)
-        json_schema_extra = {
+        json_schema_extra={
             "example": {
                 "host": "0.0.0.0",
                 "port": 8000,
@@ -44,58 +46,41 @@ class Settings(BaseSettings):
                 "health_check_interval": 30,
                 "default_model": "deepseek-7b",
             }
-        }
+        },
     )
-    
+
     # Server settings
     host: str = Field("0.0.0.0", description="Host to bind to")
     port: int = Field(8000, description="Port to bind to", ge=1, le=65535)
-    
+
     # Worker discovery
     discovery_method: DiscoveryMethod = Field(
         DiscoveryMethod.STATIC, description="How to discover workers"
     )
     static_workers: List[str] = Field(
-        default_factory=list,
-        description="Static worker addresses (host:port)"
+        default_factory=list, description="Static worker addresses (host:port)"
     )
-    discovery_interval: int = Field(
-        30, description="Worker discovery interval (seconds)", ge=5
-    )
-    
+    discovery_interval: int = Field(30, description="Worker discovery interval (seconds)", ge=5)
+
     # Health monitoring
-    health_check_interval: int = Field(
-        30, description="Health check interval (seconds)", ge=5
-    )
-    health_check_timeout: int = Field(
-        5, description="Health check timeout (seconds)", ge=1
-    )
+    health_check_interval: int = Field(30, description="Health check interval (seconds)", ge=5)
+    health_check_timeout: int = Field(5, description="Health check timeout (seconds)", ge=1)
     max_failures: int = Field(
         3, description="Max consecutive failures before marking unhealthy", ge=1
     )
-    
+
     # Request routing
-    default_model: str = Field(
-        "deepseek-7b", description="Default model for inference"
-    )
-    request_timeout: int = Field(
-        300, description="Request timeout (seconds)", ge=1
-    )
-    max_queue_size: int = Field(
-        1000, description="Maximum queued requests", ge=1
-    )
-    
+    default_model: str = Field("deepseek-7b", description="Default model for inference")
+    request_timeout: int = Field(300, description="Request timeout (seconds)", ge=1)
+    max_queue_size: int = Field(1000, description="Maximum queued requests", ge=1)
+
     # Model management
     models_config: Path = Field(
         Path("config/models.toml"), description="Path to models configuration"
     )
-    model_cache_dir: Path = Field(
-        Path("./models"), description="Directory for cached models"
-    )
-    auto_load_models: bool = Field(
-        False, description="Automatically load models on startup"
-    )
-    
+    model_cache_dir: Path = Field(Path("./models"), description="Directory for cached models")
+    auto_load_models: bool = Field(False, description="Automatically load models on startup")
+
     # CORS
     # NoDecode: pydantic-settings otherwise JSON-decodes any complex-typed env
     # value before our validator runs, which rejects non-JSON strings like "*".
@@ -110,35 +95,29 @@ class Settings(BaseSettings):
     )
 
     # Performance
-    enable_batching: bool = Field(
-        True, description="Enable continuous batching"
-    )
-    max_batch_size: int = Field(
-        32, description="Maximum batch size", ge=1, le=256
-    )
+    enable_batching: bool = Field(True, description="Enable continuous batching")
+    max_batch_size: int = Field(32, description="Maximum batch size", ge=1, le=256)
     batch_timeout_ms: int = Field(
         50, description="Maximum wait time for batching (ms)", ge=1, le=1000
     )
-    
+
     # Security
     enable_auth: bool = Field(False, description="Enable API authentication")
-    api_keys: List[str] = Field(
-        default_factory=list, description="Valid API keys"
-    )
+    api_keys: List[str] = Field(default_factory=list, description="Valid API keys")
     rate_limit_per_minute: int = Field(
         60, description="Rate limit per API key (requests/minute)", ge=1
     )
-    
+
     # Logging
     log_level: LogLevel = Field(LogLevel.INFO, description="Logging level")
     log_format: str = Field(
         "json", description="Log format (json or text)", pattern="^(json|text)$"
     )
-    
+
     # Monitoring
     enable_metrics: bool = Field(True, description="Enable Prometheus metrics")
     metrics_port: int = Field(9090, description="Metrics port", ge=1, le=65535)
-    
+
     @field_validator("static_workers", mode="before")
     @classmethod
     def validate_static_workers(cls, v: Union[str, List[str]]) -> List[str]:
@@ -167,17 +146,16 @@ class Settings(BaseSettings):
             return [origin.strip() for origin in v.split(",") if origin.strip()]
         return v
 
-    def load_models_config(self) -> Dict:
+    def load_models_config(self) -> Dict[str, Any]:
         """Load models configuration from file."""
         if not self.models_config.exists():
             return {}
-        
+
         if self.models_config.suffix == ".toml":
             with open(self.models_config) as f:
                 return toml.load(f)
         elif self.models_config.suffix in (".yaml", ".yml"):
             with open(self.models_config) as f:
-                return yaml.safe_load(f)
+                return cast(Dict[str, Any], yaml.safe_load(f))
         else:
             raise ValueError(f"Unsupported config format: {self.models_config.suffix}")
-    

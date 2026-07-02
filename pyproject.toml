@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Python coordinator for distributed AI inference cluster"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [
     { name = "Carlos Estrada", email = "caestrada1103@gmail.com" }
 ]
@@ -47,13 +47,22 @@ build-backend = "setuptools.build_meta"
 
 [tool.black]
 line-length = 100
+extend-exclude = "coordinator/proto/"
 
 [tool.ruff]
 line-length = 100
 select = ["E", "F", "I", "B"]
 ignore = []
+extend-exclude = ["coordinator/proto"]
 
 [tool.mypy]
 python_version = "3.10"
 strict = true
 ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+exclude = ["coordinator/proto/"]
+
+[[tool.mypy.overrides]]
+module = "coordinator.proto.*"
+follow_imports = "skip"
+ignore_errors = true

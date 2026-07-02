@@ -14,6 +14,7 @@ from coordinator.models import (
 # Enum sanity checks
 # ---------------------------------------------------------------------------
 
+
 def test_quantization_enum_values():
     assert Quantization.FP16.value == "fp16"
     assert Quantization.INT8.value == "int8"
@@ -32,6 +33,7 @@ def test_parallelism_strategy_enum_values():
 # ---------------------------------------------------------------------------
 # ModelConfig validation
 # ---------------------------------------------------------------------------
+
 
 def test_moe_requires_num_experts():
     with pytest.raises(ValueError, match="num_experts"):
@@ -76,6 +78,7 @@ def test_gqa_defaults_num_kv_heads():
 # ModelRegistry — default models
 # ---------------------------------------------------------------------------
 
+
 def test_registry_initialized():
     models = ModelRegistry.list_models()
     assert len(models) >= 5
@@ -117,6 +120,7 @@ def test_find_models_by_family_returns_only_matching():
 # ModelRegistry.validate_requirements
 # ---------------------------------------------------------------------------
 
+
 def test_validate_requirements_pass():
     # phi-2: min_memory_gb=6, FP16 multiplier=0.5 → need 3GB → fits in 6GB
     ok, msg = ModelRegistry.validate_requirements("phi-2", available_memory=6.0, num_gpus=1)
@@ -140,6 +144,7 @@ def test_validate_requirements_unknown_model():
 # ---------------------------------------------------------------------------
 # ModelRegistry.load_from_dict
 # ---------------------------------------------------------------------------
+
 
 def test_load_from_dict_adds_model():
     config_dict = {

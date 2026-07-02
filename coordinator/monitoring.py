@@ -5,7 +5,7 @@ metrics API used across coordinator modules.
 """
 
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from prometheus_client import REGISTRY, CollectorRegistry, Counter, Gauge, Histogram
 
@@ -23,9 +23,9 @@ class MetricsManager:
         my_counter.labels(method="GET").inc()
     """
 
-    def __init__(self, registry: Optional[CollectorRegistry] = None):
+    def __init__(self, registry: Optional[CollectorRegistry] = None) -> None:
         self._registry = registry or REGISTRY
-        self._metrics = {}
+        self._metrics: Dict[str, Any] = {}
 
     def counter(
         self,
@@ -35,7 +35,7 @@ class MetricsManager:
     ) -> Counter:
         """Create or retrieve a Counter metric."""
         if name in self._metrics:
-            return self._metrics[name]
+            return cast(Counter, self._metrics[name])
 
         labels = labels or []
         metric = Counter(name, description, labels, registry=self._registry)
@@ -51,16 +51,14 @@ class MetricsManager:
     ) -> Histogram:
         """Create or retrieve a Histogram metric."""
         if name in self._metrics:
-            return self._metrics[name]
+            return cast(Histogram, self._metrics[name])
 
         labels = labels or []
-        kwargs = {}
+        kwargs: Dict[str, Any] = {}
         if buckets:
             kwargs["buckets"] = buckets
 
-        metric = Histogram(
-            name, description, labels, registry=self._registry, **kwargs
-        )
+        metric = Histogram(name, description, labels, registry=self._registry, **kwargs)
         self._metrics[name] = metric
         return metric
 
@@ -72,7 +70,7 @@ class MetricsManager:
     ) -> Gauge:
         """Create or retrieve a Gauge metric."""
         if name in self._metrics:
-            return self._metrics[name]
+            return cast(Gauge, self._metrics[name])
 
         labels = labels or []
         metric = Gauge(name, description, labels, registry=self._registry)

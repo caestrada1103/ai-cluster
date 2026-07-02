@@ -19,6 +19,7 @@ from coordinator.router import (
 # Enum sanity checks
 # ---------------------------------------------------------------------------
 
+
 def test_load_balancing_strategy_values():
     assert LoadBalancingStrategy.ROUND_ROBIN.value == "round_robin"
     assert LoadBalancingStrategy.LEAST_LOAD.value == "least_load"
@@ -37,6 +38,7 @@ def test_queue_priority_ordering():
 # ---------------------------------------------------------------------------
 # WorkerLoad
 # ---------------------------------------------------------------------------
+
 
 def test_workload_score_all_zero():
     load = WorkerLoad(worker_id="w1")
@@ -80,6 +82,7 @@ def test_workload_score_memory_total_zero_doesnt_divide_by_zero():
 # CircuitBreaker — initial state
 # ---------------------------------------------------------------------------
 
+
 def test_cb_initial_state_closed():
     cb = CircuitBreaker()
     assert cb.state == CircuitBreaker.State.CLOSED
@@ -98,6 +101,7 @@ def test_cb_total_requests_starts_zero():
 # ---------------------------------------------------------------------------
 # CircuitBreaker — state transitions
 # ---------------------------------------------------------------------------
+
 
 def test_cb_opens_after_threshold_failures():
     cb = CircuitBreaker(failure_threshold=3)
@@ -150,6 +154,7 @@ def test_cb_reopens_on_failure_in_half_open():
 # ---------------------------------------------------------------------------
 # CircuitBreaker — counters
 # ---------------------------------------------------------------------------
+
 
 def test_cb_counts_successes_and_failures():
     cb = CircuitBreaker()

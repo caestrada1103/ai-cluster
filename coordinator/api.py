@@ -10,7 +10,7 @@ Endpoints:
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -25,14 +25,17 @@ router = APIRouter()
 # Request / Response schemas
 # ---------------------------------------------------------------------------
 
+
 class ChatMessage(BaseModel):
     """Schema for a single chat message."""
+
     role: str
     content: str
 
 
 class ChatCompletionRequest(BaseModel):
     """Body for the POST /chat/completions endpoint (OpenAI compatible)."""
+
     model: str
     messages: List[ChatMessage]
     max_tokens: Optional[int] = Field(512, ge=1, le=32768)
@@ -52,7 +55,9 @@ class CompletionRequest(BaseModel):
     top_p: float = Field(0.95, ge=0.0, le=1.0)
     top_k: int = Field(40, ge=0)
     stream: bool = False
-    worker_id: Optional[str] = Field(None, description="Optional worker ID to force routing to a specific GPU")
+    worker_id: Optional[str] = Field(
+        None, description="Optional worker ID to force routing to a specific GPU"
+    )
 
 
 class CompletionResponse(BaseModel):
@@ -90,7 +95,7 @@ class ModelInfo(BaseModel):
     object: str = "model"
     created: int = 0
     owned_by: str = "custom"
-    
+
     # Custom AI Cluster extensions
     family: Optional[str] = None
     parameters: Optional[str] = None
@@ -98,8 +103,10 @@ class ModelInfo(BaseModel):
     loaded_on: List[Dict[str, Any]] = []
     supports_quantization: List[str] = []
 
+
 class ModelsResponse(BaseModel):
     """Schema for the /models response, compatible with OpenAI API."""
+
     object: str = "list"
     data: List[ModelInfo]
 
@@ -119,7 +126,8 @@ class WorkerInfoResponse(BaseModel):
 # Helper to get the coordinator from the request
 # ---------------------------------------------------------------------------
 
-def _get_coordinator(request: Request):
+
+def _get_coordinator(request: "Request[Any]") -> Any:
     """Retrieve the ClusterCoordinator stored in app state."""
     coordinator = getattr(request.app.state, "coordinator", None)
     if coordinator is None:
@@ -131,6 +139,7 @@ def _get_coordinator(request: Request):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+
 def _parse_model_and_worker(model_string: str) -> tuple[str, Optional[str]]:
     """Parse 'model@worker_id' syntax."""
     if "@" in model_string:
@@ -140,7 +149,7 @@ def _parse_model_and_worker(model_string: str) -> tuple[str, Optional[str]]:
 
 
 @router.post("/completions", response_model=CompletionResponse)
-async def create_completion(body: CompletionRequest, request: Request):
+async def create_completion(body: CompletionRequest, request: "Request[Any]") -> CompletionResponse:
     """Run inference on the cluster."""
     coordinator = _get_coordinator(request)
 
@@ -160,12 +169,12 @@ async def create_completion(body: CompletionRequest, request: Request):
         )
         return CompletionResponse(**result)
     except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail=str(exc))
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Inference failed")
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 def _build_flat_response(result: Dict[str, Any], model: str) -> Dict[str, Any]:
@@ -175,45 +184,45 @@ def _build_flat_response(result: Dict[str, Any], model: str) -> Dict[str, Any]:
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": result["text"]
-            },
-            "finish_reason": "stop"
-        }],
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": result["text"]},
+                "finish_reason": "stop",
+            }
+        ],
         "usage": {
             "prompt_tokens": 0,
             "completion_tokens": result["tokens_generated"],
-            "total_tokens": result["tokens_generated"]
-        }
+            "total_tokens": result["tokens_generated"],
+        },
     }
 
-async def _stream_chat_completion(ctx: Any, model: str):
+
+async def _stream_chat_completion(ctx: Any, model: str) -> AsyncGenerator[str, None]:
     """Generator for OpenAI-compatible Server-Sent Events (SSE)."""
     try:
         while True:
             # Wait for next token from the queue
             response = await ctx.token_queue.get()
-            
+
             # Build SSE chunk
             chunk = {
                 "id": ctx.id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "content": response.text if not response.finished else ""
-                    },
-                    "finish_reason": "stop" if response.finished else None
-                }]
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": response.text if not response.finished else ""},
+                        "finish_reason": "stop" if response.finished else None,
+                    }
+                ],
             }
-            
+
             yield f"data: {json.dumps(chunk)}\n\n"
-            
+
             if response.finished:
                 yield "data: [DONE]\n\n"
                 break
@@ -223,8 +232,11 @@ async def _stream_chat_completion(ctx: Any, model: str):
         yield f"data: {json.dumps(error_chunk)}\n\n"
         yield "data: [DONE]\n\n"
 
+
 @router.post("/chat/completions")
-async def create_chat_completion(body: ChatCompletionRequest, request: Request):
+async def create_chat_completion(
+    body: ChatCompletionRequest, request: "Request[Any]"
+) -> Union[Dict[str, Any], StreamingResponse]:
     """OpenAI-compatible chat completions endpoint used by Open-WebUI."""
     logger.info(f"Received chat completion request for model: {body.model}")
     coordinator = _get_coordinator(request)
@@ -258,51 +270,52 @@ async def create_chat_completion(body: ChatCompletionRequest, request: Request):
             stream=body.stream or False,
             worker_id=worker_id,
         )
-        
+
         if body.stream:
             request_context = coordinator.active_requests.pop(result["request_id"], None)
             if not request_context:
                 # Fallback to flat result if somehow lost from context
                 return _build_flat_response(result, body.model)
-            
+
             return StreamingResponse(
-                _stream_chat_completion(request_context, body.model),
-                media_type="text/event-stream"
+                _stream_chat_completion(request_context, body.model), media_type="text/event-stream"
             )
 
         return _build_flat_response(result, body.model)
     except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail=str(exc))
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Inference failed")
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/models", response_model=ModelsResponse)
-async def list_models(request: Request):
+async def list_models(request: "Request[Any]") -> ModelsResponse:
     """List all available models in OpenAI-compatible format."""
     coordinator = _get_coordinator(request)
     custom_models = await coordinator.list_models()
-    
+
     # Convert custom format to OpenAI compatible format
     openai_models = []
     for model in custom_models:
-        openai_models.append(ModelInfo(
-            id=model["name"],
-            family=model.get("family"),
-            parameters=model.get("parameters"),
-            min_memory_gb=model.get("min_memory_gb"),
-            loaded_on=model.get("loaded_on", []),
-            supports_quantization=model.get("supports_quantization", [])
-        ))
-        
+        openai_models.append(
+            ModelInfo(
+                id=model["name"],
+                family=model.get("family"),
+                parameters=model.get("parameters"),
+                min_memory_gb=model.get("min_memory_gb"),
+                loaded_on=model.get("loaded_on", []),
+                supports_quantization=model.get("supports_quantization", []),
+            )
+        )
+
     return ModelsResponse(data=openai_models)
 
 
 @router.post("/models/load", response_model=LoadModelResponse)
-async def load_model(body: LoadModelRequest, request: Request):
+async def load_model(body: LoadModelRequest, request: "Request[Any]") -> LoadModelResponse:
     """Load a model onto a worker."""
     coordinator = _get_coordinator(request)
 
@@ -354,21 +367,24 @@ async def load_model(body: LoadModelRequest, request: Request):
         raise
     except Exception as exc:
         logger.exception("Model load failed")
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/workers", response_model=List[WorkerInfoResponse])
-async def list_workers(request: Request):
+async def list_workers(request: "Request[Any]") -> List[Dict[str, Any]]:
     """List all connected workers."""
     coordinator = _get_coordinator(request)
-    return await coordinator.list_workers()
+    result: List[Dict[str, Any]] = await coordinator.list_workers()
+    return result
 
 
 @router.post("/workers/manual")
-async def add_manual_worker(addresses: List[str], request: Request):
+async def add_manual_worker(
+    addresses: List[str], request: "Request[Any]"
+) -> Dict[str, List[Dict[str, str]]]:
     """Manually add a worker by its host:port address."""
     coordinator = _get_coordinator(request)
-    results = []
+    results: List[Dict[str, str]] = []
     for address in addresses:
         worker = await coordinator._connect_worker(address)
         if worker:

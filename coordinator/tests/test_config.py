@@ -11,6 +11,7 @@ from coordinator.config import DiscoveryMethod, Settings
 # Defaults
 # ---------------------------------------------------------------------------
 
+
 def test_defaults():
     with patch.dict("os.environ", {}, clear=False):
         s = Settings(_env_file=None)
@@ -42,6 +43,7 @@ def test_port_validation_too_high_raises():
 # static_workers validator
 # ---------------------------------------------------------------------------
 
+
 def test_static_workers_from_comma_string():
     s = Settings(static_workers="host1:50051,host2:50052", _env_file=None)
     assert s.static_workers == ["host1:50051", "host2:50052"]
@@ -65,6 +67,7 @@ def test_static_workers_empty_string_gives_empty_list():
 # ---------------------------------------------------------------------------
 # load_models_config
 # ---------------------------------------------------------------------------
+
 
 def test_load_models_config_missing_file(tmp_path):
     s = Settings(models_config=tmp_path / "nonexistent.toml", _env_file=None)
@@ -92,8 +95,7 @@ def test_settings_ignores_unknown_dotenv_keys(tmp_path):
     """The shared .env ships worker vars (GPU_COUNT, HF_TOKEN, ...); Settings must ignore them."""
     env_file = tmp_path / ".env"
     env_file.write_text(
-        "GPU_COUNT=1\nHF_TOKEN=hf_dummy\nRUST_LOG=info\nGPU_INDEX=0\n"
-        "COORDINATOR_PORT=8123\n"
+        "GPU_COUNT=1\nHF_TOKEN=hf_dummy\nRUST_LOG=info\nGPU_INDEX=0\n" "COORDINATOR_PORT=8123\n"
     )
     s = Settings(_env_file=str(env_file))
     assert s.port == 8123
