@@ -1,11 +1,14 @@
 # Prometheus Alert Rules
 # ======================
+# Every expression below references a metric the code actually emits:
+#   worker:      worker/src/metrics.rs
+#   coordinator: coordinator/coordinator.py + coordinator/router.py
 
 groups:
   - name: ai_cluster_alerts
     interval: 30s
     rules:
-      # Worker availability
+      # Worker availability (scrape-level)
       - alert: WorkerDown
         expr: up{job="workers"} == 0
         for: 1m
@@ -13,20 +16,20 @@ groups:
           severity: critical
         annotations:
           summary: "Worker {{ $labels.instance }} is down"
-          description: "Worker has been down for more than 1 minute."
+          description: "Worker metrics endpoint has been unreachable for more than 1 minute."
 
-      - alert: WorkerUnhealthy
-        expr: worker_health_status{job="workers"} == 0
-        for: 30s
+      - alert: CoordinatorDown
+        expr: up{job="coordinator"} == 0
+        for: 1m
         labels:
-          severity: warning
+          severity: critical
         annotations:
-          summary: "Worker {{ $labels.instance }} is unhealthy"
-          description: "Worker health check failed"
+          summary: "Coordinator is down"
+          description: "Coordinator /metrics has been unreachable for more than 1 minute."
 
-      # GPU alerts
+      # GPU alerts (worker_gpu_* gauges, labelled by gpu)
       - alert: GPUHighTemperature
-        expr: gpu_temperature_celsius > 85
+        expr: worker_gpu_temperature_celsius > 85
         for: 5m
         labels:
           severity: warning
@@ -34,17 +37,17 @@ groups:
           summary: "GPU {{ $labels.gpu }} on {{ $labels.instance }} temperature is high"
           description: "GPU temperature is {{ $value }}°C (threshold 85°C)"
 
-      - alert: GPUOOM
-        expr: gpu_memory_free_bytes < 1e9  # Less than 1GB free
-        for: 1m
+      - alert: GPUMemoryPressure
+        expr: worker_gpu_memory_used_bytes > 0.9 * 6e9
+        for: 5m
         labels:
-          severity: critical
+          severity: warning
         annotations:
-          summary: "GPU {{ $labels.gpu }} on {{ $labels.instance }} is running out of memory"
-          description: "Only {{ $value | humanize1024 }} free memory"
+          summary: "GPU {{ $labels.gpu }} on {{ $labels.instance }} memory usage is high"
+          description: "GPU memory used: {{ $value | humanize1024 }} (adjust the 6 GB budget to your GPU_VRAM_GB)"
 
       - alert: GPUUtilizationLow
-        expr: gpu_utilization_percent < 10
+        expr: worker_gpu_utilization_percent < 10
         for: 30m
         labels:
           severity: info
@@ -52,77 +55,50 @@ groups:
           summary: "GPU {{ $labels.gpu }} on {{ $labels.instance }} utilization is low"
           description: "GPU utilization is {{ $value }}% for 30 minutes"
 
-      - alert: GPUPowerLimit
-        expr: gpu_power_usage_watts > gpu_power_limit_watts * 0.9
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "GPU {{ $labels.gpu }} on {{ $labels.instance }} approaching power limit"
-          description: "Power usage: {{ $value }}W, limit: {{ $labels.limit }}W"
-
-      # Inference alerts
+      # Inference latency / errors (worker histograms + counters)
       - alert: HighLatency
-        expr: histogram_quantile(0.95, sum(rate(inference_duration_seconds_bucket[5m])) by (le, model)) > 5
+        expr: histogram_quantile(0.95, sum(rate(worker_request_duration_seconds_bucket[5m])) by (le)) > 5
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "High latency for model {{ $labels.model }}"
+          summary: "High P95 inference latency"
           description: "P95 latency is {{ $value }}s (threshold 5s)"
 
       - alert: HighErrorRate
-        expr: sum(rate(inference_errors_total[5m])) / sum(rate(inference_requests_total[5m])) > 0.05
+        expr: sum(rate(worker_errors_total[5m])) / clamp_min(sum(rate(worker_requests_total[5m])), 1e-9) > 0.05
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "High error rate"
-          description: "Error rate is {{ $value | printf \"%.2f\" }}% for last 5 minutes"
+          summary: "High worker error rate"
+          description: "Error ratio is {{ $value | printf \"%.2f\" }} over the last 5 minutes"
 
-      - alert: QueueBacklog
-        expr: worker_queued_requests > 100
+      # Coordinator queue pressure
+      - alert: CoordinatorBacklog
+        expr: coordinator_active_requests > 100
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Request queue backlog on {{ $labels.instance }}"
-          description: "{{ $value }} requests queued"
+          summary: "Coordinator has a large in-flight request backlog"
+          description: "{{ $value }} requests active on the coordinator"
 
-      # Model alerts
-      - alert: ModelLoadFailed
-        expr: increase(model_load_failures_total[5m]) > 0
+      - alert: RouterCircuitBreakersOpen
+        expr: router_circuit_breaker_open > 0
         for: 1m
         labels:
-          severity: critical
+          severity: warning
         annotations:
-          summary: "Model load failures detected"
-          description: "{{ $value }} model loads failed in last 5 minutes"
+          summary: "One or more worker circuit breakers are open"
+          description: "{{ $value }} circuit breaker(s) currently open"
 
+      # Model memory (per-model gauge)
       - alert: ModelMemoryHigh
-        expr: model_memory_used_bytes > model_memory_limit_bytes * 0.9
+        expr: worker_model_memory_bytes > 5e9
         for: 5m
         labels:
-          severity: warning
+          severity: info
         annotations:
-          summary: "Model {{ $labels.model }} using high memory"
-          description: "Using {{ $value | humanize1024 }} of {{ $labels.limit | humanize1024 }}"
-
-      # System alerts
-      - alert: HighCPUUsage
-        expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 90
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High CPU usage on {{ $labels.instance }}"
-          description: "CPU usage is {{ $value }}%"
-
-      - alert: DiskSpaceLow
-        expr: node_filesystem_free_bytes{mountpoint="/data"} < node_filesystem_size_bytes{mountpoint="/data"} * 0.1
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Low disk space on {{ $labels.instance }}"
-          description: "Only {{ $value | humanize1024 }} free"
+          summary: "Model {{ $labels.model }} uses substantial memory"
+          description: "{{ $value | humanize1024 }} reserved for {{ $labels.model }}"

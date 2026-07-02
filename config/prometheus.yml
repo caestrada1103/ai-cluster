@@ -22,9 +22,6 @@ scrape_configs:
     scrape_interval: 10s
     scrape_timeout: 5s
     scheme: http
-    basic_auth:
-      username: prometheus
-      password: password
 
   # Worker metrics
   - job_name: "workers"
