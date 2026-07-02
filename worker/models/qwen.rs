@@ -291,6 +291,13 @@ pub struct Qwen<B: Backend> {
     pub rope: RotaryEmbedding<B>,
     #[module(ignore)]
     pub tokenizer: Ignored<Tokenizer>,
+    /// EOS token ids read from the checkpoint's (generation_)config.json.
+    ///
+    /// NOTE: must come before `device` — burn_derive's `Module::to_device`/`fork`
+    /// codegen binds a `let device = ...;` when it processes a field literally
+    /// named `device`, shadowing the `&B::Device` parameter for every field
+    /// generated afterward. Keeping `device` last avoids the shadowing bug.
+    pub eos_token_ids: Ignored<std::collections::HashSet<u32>>,
     pub device: Ignored<B::Device>,
 }
 
@@ -302,15 +309,13 @@ impl<B: Backend> Qwen<B> {
 
         let rope = RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_theta, device);
 
+        // Load tokenizer from the model directory — no cross-model network fallback:
+        // a mismatched tokenizer silently produces garbage.
         let tok_file = tokenizer_path.join("tokenizer.json");
-        eprintln!("[INFO] Loading Qwen tokenizer from: {:?}", tok_file);
-        let tokenizer = Tokenizer::from_file(&tok_file)
-            .map_err(|e| {
-                eprintln!("[WARN] Failed to load tokenizer from {:?}: {}. Trying HF pretrained...", tok_file, e);
-                e
-            })
-            .or_else(|_| Tokenizer::from_pretrained("Qwen/Qwen2.5-0.5B", None))
-            .map_err(|e| WorkerError::ModelLoad(format!("Failed to load Qwen tokenizer: {}", e)))?;
+        let tokenizer = Tokenizer::from_file(&tok_file).map_err(|e| {
+            WorkerError::ModelLoad(format!("Failed to load Qwen tokenizer {:?}: {}", tok_file, e))
+        })?;
+        let eos_token_ids = super::common::load_eos_ids(tokenizer_path);
 
         Ok(Self {
             embed_tokens: EmbeddingConfig::new(config.vocab_size, config.hidden_size).init(device),
@@ -321,6 +326,7 @@ impl<B: Backend> Qwen<B> {
             rope,
             tokenizer: Ignored(tokenizer),
             device: Ignored(device.clone()),
+            eos_token_ids: Ignored(eos_token_ids),
         })
     }
 
@@ -487,9 +493,7 @@ impl<B: Backend> TextGeneration for Qwen<B> {
                 Ok(delta)
             };
 
-            // Prefer <|im_end|> as EOS; fall back to <|endoftext|>
-            let eos_id: Option<u32> = model.tokenizer.token_to_id("<|im_end|>")
-                .or_else(|| model.tokenizer.token_to_id("<|endoftext|>"));
+            let eos_ids = &*model.eos_token_ids;
 
             // ── FIRST TOKEN (from prefill logits) ────────────────────────────
             let first_tok = sample(&logits_vec);
@@ -499,7 +503,7 @@ impl<B: Backend> TextGeneration for Qwen<B> {
             let _ = tx.blocking_send(delta_text(
                 &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
             ));
-            if eos_id == Some(first_tok) { return; }
+            if eos_ids.contains(&first_tok) { return; }
 
             // ── DECODE LOOP ──────────────────────────────────────────────────
             for _step in 1..max_tokens {
@@ -511,7 +515,7 @@ impl<B: Backend> TextGeneration for Qwen<B> {
                 let _ = tx.blocking_send(delta_text(
                     &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
                 ));
-                if eos_id == Some(next_tok) { break; }
+                if eos_ids.contains(&next_tok) { break; }
             }
         });
 

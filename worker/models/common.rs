@@ -257,6 +257,51 @@ pub fn build_causal_bias<B: Backend>(seq_len: usize, device: &B::Device) -> Opti
 }
 
 // ---------------------------------------------------------------------------
+// EOS token ids
+// ---------------------------------------------------------------------------
+
+/// Read `eos_token_id` (int or list) from the checkpoint directory.
+/// `generation_config.json` wins over `config.json` (HF convention).
+/// Returns an empty set when neither declares one (generation then runs to max_tokens).
+pub fn load_eos_ids(model_dir: &std::path::Path) -> std::collections::HashSet<u32> {
+    let mut ids = std::collections::HashSet::new();
+    for file in ["generation_config.json", "config.json"] {
+        let path = model_dir.join(file);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
+        match &json["eos_token_id"] {
+            serde_json::Value::Number(n) => {
+                if let Some(v) = n.as_u64() {
+                    ids.insert(v as u32);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for n in arr {
+                    if let Some(v) = n.as_u64() {
+                        ids.insert(v as u32);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !ids.is_empty() {
+            break;
+        }
+    }
+    if ids.is_empty() {
+        tracing::warn!(
+            "No eos_token_id found in {:?} — generation will only stop at max_tokens",
+            model_dir
+        );
+    }
+    ids
+}
+
+// ---------------------------------------------------------------------------
 // SwiGLU activation
 // ---------------------------------------------------------------------------
 
@@ -307,5 +352,27 @@ mod tests {
             (0..50).map(|_| top_k_top_p_sample(&logits, 1.0, 0.9, 0, &mut rng)).collect()
         };
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_load_eos_ids_int_and_list() {
+        let dir = tempfile::tempdir().unwrap();
+        // generation_config.json wins and may hold a list (Llama-3 style)
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"eos_token_id": [128001, 128009]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("config.json"), r#"{"eos_token_id": 2}"#).unwrap();
+        let ids = load_eos_ids(dir.path());
+        assert!(ids.contains(&128001) && ids.contains(&128009));
+        assert!(!ids.contains(&2));
+
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(dir2.path().join("config.json"), r#"{"eos_token_id": 2}"#).unwrap();
+        assert!(load_eos_ids(dir2.path()).contains(&2));
+
+        let dir3 = tempfile::tempdir().unwrap();
+        assert!(load_eos_ids(dir3.path()).is_empty());
     }
 }

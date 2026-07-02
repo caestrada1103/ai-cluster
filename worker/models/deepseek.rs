@@ -437,6 +437,8 @@ pub struct DeepSeek<B: Backend> {
     pub rope: RotaryEmbedding<B>,
     #[module(ignore)]
     pub tokenizer: Ignored<Tokenizer>,
+    /// EOS token ids read from the checkpoint's (generation_)config.json.
+    pub eos_token_ids: Ignored<std::collections::HashSet<u32>>,
 }
 
 /// DeepSeek configuration
@@ -549,15 +551,13 @@ impl<B: Backend> DeepSeek<B> {
             .init(device);
         let rope = RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_theta, device);
 
+        // Load tokenizer from the model directory — no cross-model network fallback:
+        // a mismatched tokenizer silently produces garbage.
         let tok_file = tokenizer_path.join("tokenizer.json");
-        eprintln!("[INFO] Loading DeepSeek tokenizer from: {:?}", tok_file);
-        let tokenizer = Tokenizer::from_file(&tok_file)
-            .map_err(|e| {
-                eprintln!("[WARN] Failed to load tokenizer from {:?}: {}. Trying HF pretrained...", tok_file, e);
-                e
-            })
-            .or_else(|_| Tokenizer::from_pretrained("deepseek-ai/deepseek-llm-7b-base", None))
-            .map_err(|e| WorkerError::ModelLoad(format!("Failed to load DeepSeek tokenizer: {}", e)))?;
+        let tokenizer = Tokenizer::from_file(&tok_file).map_err(|e| {
+            WorkerError::ModelLoad(format!("Failed to load DeepSeek tokenizer {:?}: {}", tok_file, e))
+        })?;
+        let eos_token_ids = super::common::load_eos_ids(tokenizer_path);
 
         Ok(Self {
             embed_tokens,
@@ -568,6 +568,7 @@ impl<B: Backend> DeepSeek<B> {
             context_device: Ignored(device.clone()),
             rope,
             tokenizer: Ignored(tokenizer),
+            eos_token_ids: Ignored(eos_token_ids),
         })
     }
 
@@ -759,8 +760,7 @@ impl<B: Backend> TextGeneration for DeepSeek<B> {
                 Ok(delta)
             };
 
-            let eos_id: Option<u32> = model.tokenizer.token_to_id("<|EOT|>")
-                .or_else(|| model.tokenizer.token_to_id("</s>"));
+            let eos_ids = &*model.eos_token_ids;
 
             // ── FIRST TOKEN (from prefill logits) ────────────────────────────
             let first_tok = sample(&logits_vec);
@@ -770,7 +770,7 @@ impl<B: Backend> TextGeneration for DeepSeek<B> {
             let _ = tx.blocking_send(delta_text(
                 &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
             ));
-            if eos_id == Some(first_tok) { return; }
+            if eos_ids.contains(&first_tok) { return; }
 
             // ── DECODE LOOP ──────────────────────────────────────────────────
             for _step in 1..max_tokens {
@@ -782,7 +782,7 @@ impl<B: Backend> TextGeneration for DeepSeek<B> {
                 let _ = tx.blocking_send(delta_text(
                     &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
                 ));
-                if eos_id == Some(next_tok) { break; }
+                if eos_ids.contains(&next_tok) { break; }
             }
         });
 

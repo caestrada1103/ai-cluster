@@ -277,6 +277,13 @@ pub struct Llama<B: Backend> {
     
     #[module(ignore)]
     pub tokenizer: Ignored<Tokenizer>,
+    /// EOS token ids read from the checkpoint's (generation_)config.json.
+    ///
+    /// NOTE: must come before `device` — burn_derive's `Module::to_device`/`fork`
+    /// codegen binds a `let device = ...;` when it processes a field literally
+    /// named `device`, shadowing the `&B::Device` parameter for every field
+    /// generated afterward. Keeping `device` last avoids the shadowing bug.
+    pub eos_token_ids: Ignored<std::collections::HashSet<u32>>,
     pub device: Ignored<B::Device>,
 }
 
@@ -317,18 +324,13 @@ impl<B: Backend> Llama<B> {
             device,
         );
 
-        // Load tokenizer from the model directory
+        // Load tokenizer from the model directory — no cross-model network fallback:
+        // a mismatched tokenizer silently produces garbage.
         let tok_file = tokenizer_path.join("tokenizer.json");
-        eprintln!("[INFO] Loading tokenizer from: {:?}", tok_file);
-        let tokenizer = Tokenizer::from_file(&tok_file)
-            .map_err(|e| {
-                eprintln!("[WARN] Failed to load tokenizer from {:?}: {}. Trying HF pretrained...", tok_file, e);
-                e
-            })
-            .or_else(|_| {
-                Tokenizer::from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0", None)
-            })
-            .map_err(|e| WorkerError::ModelLoad(format!("Failed to load tokenizer: {}", e)))?;
+        let tokenizer = Tokenizer::from_file(&tok_file).map_err(|e| {
+            WorkerError::ModelLoad(format!("Failed to load tokenizer {:?}: {}", tok_file, e))
+        })?;
+        let eos_token_ids = super::common::load_eos_ids(tokenizer_path);
 
         Ok(Self {
             embed_tokens: EmbeddingConfig::new(config.vocab_size, config.hidden_size)
@@ -342,6 +344,7 @@ impl<B: Backend> Llama<B> {
             rope,
             tokenizer: Ignored(tokenizer),
             device: Ignored(device.clone()),
+            eos_token_ids: Ignored(eos_token_ids),
         })
     }
 
@@ -581,8 +584,7 @@ impl<B: Backend> TextGeneration for Llama<B> {
                 Ok(delta)
             };
 
-            // Look up EOS id via O(1) token_to_id (avoids rebuilding the full vocab HashMap)
-            let eos_id: Option<u32> = model.tokenizer.token_to_id("</s>");
+            let eos_ids = &*model.eos_token_ids;
 
             // ── FIRST GENERATED TOKEN (from prefill logits) ───────────────────────
             let first_tok = sample(&logits_vec);
@@ -592,7 +594,7 @@ impl<B: Backend> TextGeneration for Llama<B> {
             let _ = tx.blocking_send(delta_text(
                 &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
             ));
-            if eos_id == Some(first_tok) { return; }
+            if eos_ids.contains(&first_tok) { return; }
 
             // ── DECODE LOOP (one GPU dispatch per step, no Tokio context switch) ──
             for _step in 1..max_tokens {
@@ -604,7 +606,7 @@ impl<B: Backend> TextGeneration for Llama<B> {
                 let _ = tx.blocking_send(delta_text(
                     &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
                 ));
-                if eos_id == Some(next_tok) { break; }
+                if eos_ids.contains(&next_tok) { break; }
             }
         });
 

@@ -175,6 +175,10 @@ impl ModelLoader {
                 let _ = repo.get("tokenizer.json").await
                     .map_err(|e| WorkerError::ModelLoad(format!("Failed to download tokenizer.json: {}", e)))?;
                 info!("Tokenizer downloaded to: {:?}", model_path);
+
+                // generation_config.json carries the authoritative eos_token_id for many repos.
+                // Best-effort: absent for some models, config.json then supplies it.
+                let _ = repo.get("generation_config.json").await;
             }
 
             // Instantiate model
@@ -531,6 +535,7 @@ fn create_qwen_record(
         rope,
         tokenizer: ConstantRecord,
         device: ConstantRecord,
+        eos_token_ids: ConstantRecord,
     })
 }
 
@@ -608,6 +613,7 @@ fn create_deepseek_record(
         context_device: ConstantRecord,
         rope,
         tokenizer: ConstantRecord,
+        eos_token_ids: ConstantRecord,
     })
 }
 
@@ -667,5 +673,6 @@ fn create_llama_record(
         rope,
         tokenizer: ConstantRecord,
         device: ConstantRecord,
+        eos_token_ids: ConstantRecord,
     })
 }
