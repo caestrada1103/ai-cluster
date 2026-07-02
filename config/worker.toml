@@ -3,6 +3,12 @@
 # Precedence for worker_id / grpc_port / metrics_port / gpu_ids:
 #   CLI flag or env var  >  this file  >  built-in default
 
+# llama.cpp engine defaults (only used when the worker binary is built with
+# `--features llamacpp`). NOTE: WorkerConfig parses flat top-level keys, so
+# these MUST stay above the first [section] header in this file.
+llamacpp_n_threads = 0              # 0 = llama.cpp auto-detects thread count
+llamacpp_default_n_gpu_layers = -1  # -1 = offload all layers to the GPU
+
 # worker_id = "my-worker"        # optional; auto-generated when absent everywhere
 grpc_port = 50051
 metrics_port = 9091

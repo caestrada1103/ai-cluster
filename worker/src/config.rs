@@ -45,6 +45,15 @@ pub struct WorkerConfig {
 
     /// HuggingFace Hub cache directory override.
     pub hf_cache_dir: Option<PathBuf>,
+
+    /// CPU threads for llama.cpp generation (0 = let llama.cpp auto-detect).
+    /// Only used when the worker is built with the `llamacpp` feature.
+    pub llamacpp_n_threads: i32,
+
+    /// Default number of transformer layers to offload to the GPU for
+    /// llama.cpp models (-1 = all layers). Per-model `n_gpu_layers` metadata
+    /// from the registry overrides this.
+    pub llamacpp_default_n_gpu_layers: i32,
 }
 
 impl Default for WorkerConfig {
@@ -61,6 +70,8 @@ impl Default for WorkerConfig {
             max_concurrent_requests: 32,
             hf_token: None,
             hf_cache_dir: None,
+            llamacpp_n_threads: 0,
+            llamacpp_default_n_gpu_layers: -1,
         }
     }
 }
@@ -139,5 +150,20 @@ mod tests {
         std::fs::write(&p, "[grpc]\nport = 50051\n").unwrap();
         let err = WorkerConfig::from_file(p.to_str().unwrap()).unwrap_err();
         assert!(err.to_string().contains("Failed to parse config"));
+    }
+
+    #[test]
+    fn test_llamacpp_defaults() {
+        let config = WorkerConfig::default();
+        assert_eq!(config.llamacpp_n_threads, 0);
+        assert_eq!(config.llamacpp_default_n_gpu_layers, -1);
+    }
+
+    #[test]
+    fn test_llamacpp_keys_parse_from_flat_toml() {
+        let toml_str = "llamacpp_n_threads = 8\nllamacpp_default_n_gpu_layers = 20\n";
+        let config: WorkerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.llamacpp_n_threads, 8);
+        assert_eq!(config.llamacpp_default_n_gpu_layers, 20);
     }
 }
