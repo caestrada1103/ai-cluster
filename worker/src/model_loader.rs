@@ -196,7 +196,9 @@ impl ModelLoader {
                         num_layers: config.num_layers,
                         num_attention_heads: config.num_attention_heads,
                         num_kv_heads: config.num_kv_heads,
-                        head_dim: config.hidden_size / config.num_attention_heads,
+                        head_dim: config
+                            .head_dim
+                            .unwrap_or(config.hidden_size / config.num_attention_heads),
                         intermediate_size: config.intermediate_size,
                         vocab_size: config.vocab_size,
                         max_seq_len: config.max_seq_len,
@@ -217,12 +219,15 @@ impl ModelLoader {
                         num_layers: config.num_layers,
                         num_attention_heads: config.num_attention_heads,
                         num_kv_heads: config.num_kv_heads,
-                        head_dim: config.hidden_size / config.num_attention_heads,
+                        head_dim: config
+                            .head_dim
+                            .unwrap_or(config.hidden_size / config.num_attention_heads),
                         intermediate_size: config.intermediate_size,
                         vocab_size: config.vocab_size,
                         max_seq_len: config.max_seq_len,
                         rms_norm_eps: config.rms_norm_eps,
                         rope_theta: config.rope_theta,
+                        attention_bias: config.attention_bias,
                     };
 
                     info!("Mapping weights to QwenRecord...");
@@ -381,6 +386,13 @@ impl ModelLoader {
             .map_err(|e| WorkerError::ModelLoad(format!("Failed to read config: {}", e)))?;
         let json: serde_json::Value = serde_json::from_str(&s)?;
         let arch_raw = json["architectures"][0].as_str().unwrap_or("llama").to_lowercase();
+        if arch_raw.contains("qwen3") {
+            return Err(WorkerError::ModelLoad(
+                "Qwen3 checkpoints are not supported yet (per-head q_norm/k_norm not implemented). \
+                 Use a Qwen2.5 checkpoint instead."
+                    .to_string(),
+            ));
+        }
         let architecture = if arch_raw.contains("llama") {
             "llama".to_string()
         } else if arch_raw.contains("qwen") {
@@ -406,6 +418,8 @@ impl ModelLoader {
             intermediate_size: json["intermediate_size"].as_u64().unwrap_or(0) as usize,
             rms_norm_eps: json["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32,
             rope_theta: json["rope_theta"].as_f64().unwrap_or(10000.0) as f32,
+            head_dim: json["head_dim"].as_u64().map(|v| v as usize),
+            attention_bias: json["attention_bias"].as_bool().unwrap_or(false),
             is_moe,
             num_experts,
             num_experts_per_tok,
@@ -498,12 +512,13 @@ fn create_qwen_record(
     for i in 0..config.num_layers {
         let prefix = format!("model.layers.{}", i);
 
+        let bias = config.attention_bias;
         let q = load_linear(weights, &format!("{}.self_attn.q_proj", prefix),
-            config.hidden_size, config.num_attention_heads * config.head_dim, false)?;
+            config.hidden_size, config.num_attention_heads * config.head_dim, bias)?;
         let k = load_linear(weights, &format!("{}.self_attn.k_proj", prefix),
-            config.hidden_size, config.num_kv_heads * config.head_dim, false)?;
+            config.hidden_size, config.num_kv_heads * config.head_dim, bias)?;
         let v = load_linear(weights, &format!("{}.self_attn.v_proj", prefix),
-            config.hidden_size, config.num_kv_heads * config.head_dim, false)?;
+            config.hidden_size, config.num_kv_heads * config.head_dim, bias)?;
         let o = load_linear(weights, &format!("{}.self_attn.o_proj", prefix),
             config.num_attention_heads * config.head_dim, config.hidden_size, false)?;
 

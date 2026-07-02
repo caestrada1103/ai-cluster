@@ -54,6 +54,12 @@ pub struct ModelConfig {
     /// Rotary embedding theta
     pub rope_theta: f32,
 
+    /// Explicit head dimension from config.json (None → hidden_size / num_attention_heads).
+    pub head_dim: Option<usize>,
+
+    /// Whether q/k/v projections carry biases (Qwen2/2.5 style).
+    pub attention_bias: bool,
+
     /// Whether model uses MoE
     #[allow(dead_code)]
     pub is_moe: bool,

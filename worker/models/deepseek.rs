@@ -526,6 +526,8 @@ impl DeepSeekConfig {
             intermediate_size: self.intermediate_size,
             rms_norm_eps: self.rms_norm_eps,
             rope_theta: self.rope_theta,
+            head_dim: Some(self.head_dim),
+            attention_bias: false,
             is_moe: true,
             num_experts: Some(self.num_experts),
             num_experts_per_tok: Some(self.num_experts_per_tok),

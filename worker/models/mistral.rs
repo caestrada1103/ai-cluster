@@ -71,6 +71,8 @@ impl MistralConfig {
             intermediate_size: self.intermediate_size,
             rms_norm_eps: self.rms_norm_eps,
             rope_theta: self.rope_theta,
+            head_dim: None,
+            attention_bias: false,
             is_moe: false,
             num_experts: None,
             num_experts_per_tok: None,

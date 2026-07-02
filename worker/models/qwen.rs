@@ -36,24 +36,7 @@ pub struct QwenConfig {
     pub max_seq_len: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
-}
-
-impl QwenConfig {
-    /// Default configuration for Qwen3-Coder-32B (Qwen/Qwen3-Coder-32B).
-    pub fn qwen3_coder_32b() -> Self {
-        Self {
-            hidden_size: 5120,
-            num_layers: 64,
-            num_attention_heads: 40,
-            num_kv_heads: 8,
-            head_dim: 128, // 5120 / 40
-            intermediate_size: 27648,
-            vocab_size: 151936,
-            max_seq_len: 131072,
-            rms_norm_eps: 1e-6,
-            rope_theta: 1_000_000.0,
-        }
-    }
+    pub attention_bias: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -81,14 +64,15 @@ impl<B: Backend> QwenAttention<B> {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        attention_bias: bool,
         device: &B::Device,
     ) -> Self {
         let q_out = num_heads * head_dim;
         let kv_out = num_kv_heads * head_dim;
         Self {
-            q_proj: LinearConfig::new(hidden_size, q_out).with_bias(false).init(device),
-            k_proj: LinearConfig::new(hidden_size, kv_out).with_bias(false).init(device),
-            v_proj: LinearConfig::new(hidden_size, kv_out).with_bias(false).init(device),
+            q_proj: LinearConfig::new(hidden_size, q_out).with_bias(attention_bias).init(device),
+            k_proj: LinearConfig::new(hidden_size, kv_out).with_bias(attention_bias).init(device),
+            v_proj: LinearConfig::new(hidden_size, kv_out).with_bias(attention_bias).init(device),
             o_proj: LinearConfig::new(q_out, hidden_size).with_bias(false).init(device),
             num_heads,
             num_kv_heads,
@@ -229,6 +213,7 @@ impl<B: Backend> QwenLayer<B> {
                 config.num_attention_heads,
                 config.num_kv_heads,
                 config.head_dim,
+                config.attention_bias,
                 device,
             ),
             mlp: QwenMLP::new(config.hidden_size, config.intermediate_size, device),
