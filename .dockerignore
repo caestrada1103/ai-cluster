@@ -1,0 +1,17 @@
+.git/
+venv/
+models/
+data/
+logs/
+target/
+worker/target/
+**/__pycache__/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+monitoring/
+docs/
+tests/
+pending-work/
+.env
+.claude/

@@ -1,8 +1,6 @@
 # Rust
 target/
 **/*.rs.bk
-Cargo.lock
-.idea/
 
 # Python
 __pycache__/
@@ -30,15 +28,18 @@ TODO.md
 
 # Models
 /models/*
-!models/.gitkeep
+!/models/.gitkeep
 /worker/data/
+/data/*
+!/data/.gitkeep
 
 # Config
 /config/local.yaml
 .env
 
 # Logs
-logs/
+/logs/*
+!/logs/.gitkeep
 *.log
 
 # IDE
@@ -49,8 +50,6 @@ logs/
 
 # Docker
 *.pid
-*.lock
-.dockerignore
 docker-compose.override.yml
 
 # Protobuf generated
@@ -62,12 +61,10 @@ coordinator/*_pb2_grpc.py
 *.exe
 *.exe~
 *.dll
-*.so
 *.dylib
 *.bin
 
 # Output files
 *.mpk
 *.safetensors
-*.bin
 *.onnx
