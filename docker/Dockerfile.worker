@@ -39,12 +39,22 @@ FROM ${BUILDER_IMAGE} AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG BACKEND=wgpu
+# Extra cargo features appended to BACKEND (default: none = pure Burn/wgpu image).
+# For the llama.cpp GGUF engine build with one of:
+#   --build-arg WORKER_FEATURES="llamacpp,llamacpp-vulkan"                         (wgpu base, Vulkan offload)
+#   --build-arg BACKEND=cuda --build-arg WORKER_FEATURES="llamacpp,llamacpp-cuda"  (CUDA base, CUDA offload)
+# llama.cpp is compiled from source: needs clang/libclang-dev (bindgen) + glslc
+# (Vulkan shaders), added to the builder below; libgomp1 is added to the runtime.
+ARG WORKER_FEATURES=""
 # Vulkan headers are needed for the default wgpu build; vendor bases ship their own stacks.
 ARG BUILDER_EXTRA_PKGS="libvulkan-dev mesa-vulkan-drivers"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
+    clang \
+    libclang-dev \
+    glslc \
     pkg-config \
     libssl-dev \
     curl \
@@ -81,13 +91,13 @@ COPY proto ../proto/
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
 # Build dependencies (cached layer — only invalidated by Cargo.toml changes)
-RUN cargo build --release --features="${BACKEND}"
+RUN cargo build --release --features="${BACKEND}${WORKER_FEATURES:+,${WORKER_FEATURES}}"
 
 # Copy real source and do the final build
 COPY worker/src ./src/
 COPY worker/models ./models/
 
-RUN touch src/main.rs && cargo build --release --features="${BACKEND}"
+RUN touch src/main.rs && cargo build --release --features="${BACKEND}${WORKER_FEATURES:+,${WORKER_FEATURES}}"
 
 
 # ── Stage 2: Runtime ────────────────────────────────────────────────────────
@@ -105,6 +115,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     libssl3 \
+    libgomp1 \
     ${RUNTIME_EXTRA_PKGS} \
     && rm -rf /var/lib/apt/lists/*
 
