@@ -68,3 +68,8 @@ coordinator/*_pb2_grpc.py
 *.mpk
 *.safetensors
 *.onnx
+
+# Local-only: planning docs and session skills (never commit/push)
+pending-work/
+.claude/skills/
+!.claude/skills/commit/
