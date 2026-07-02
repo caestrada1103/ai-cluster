@@ -38,6 +38,12 @@ jobs:
       - name: cargo check (wgpu feature)
         run: cargo check -p ai-worker --features wgpu
 
+      - name: Install llama.cpp build dependencies
+        run: sudo apt-get install -y --no-install-recommends cmake libclang-dev
+
+      - name: cargo check (llamacpp feature)
+        run: cargo check -p ai-worker --features llamacpp
+
       - name: cargo fmt --check
         run: cargo fmt -p ai-worker -- --check
 
