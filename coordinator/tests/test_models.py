@@ -15,7 +15,7 @@ from coordinator.models import (
 # ---------------------------------------------------------------------------
 
 
-def test_quantization_enum_values():
+def test_quantization_enum_values() -> None:
     assert Quantization.FP16.value == "fp16"
     assert Quantization.INT8.value == "int8"
     assert Quantization.INT4.value == "int4"
@@ -23,7 +23,7 @@ def test_quantization_enum_values():
     assert Quantization.NONE.value == "none"
 
 
-def test_parallelism_strategy_enum_values():
+def test_parallelism_strategy_enum_values() -> None:
     assert ParallelismStrategy.SINGLE.value == "single"
     assert ParallelismStrategy.PIPELINE.value == "pipeline"
     assert ParallelismStrategy.TENSOR.value == "tensor"
@@ -35,7 +35,7 @@ def test_parallelism_strategy_enum_values():
 # ---------------------------------------------------------------------------
 
 
-def test_moe_requires_num_experts():
+def test_moe_requires_num_experts() -> None:
     with pytest.raises(ValueError, match="num_experts"):
         ModelConfig(
             name="bad-moe",
@@ -55,7 +55,7 @@ def test_moe_requires_num_experts():
         )
 
 
-def test_gqa_defaults_num_kv_heads():
+def test_gqa_defaults_num_kv_heads() -> None:
     cfg = ModelConfig(
         name="test-gqa",
         family=ModelFamily.LLAMA,
@@ -79,12 +79,12 @@ def test_gqa_defaults_num_kv_heads():
 # ---------------------------------------------------------------------------
 
 
-def test_registry_initialized():
+def test_registry_initialized() -> None:
     models = ModelRegistry.list_models()
     assert len(models) >= 5
 
 
-def test_get_known_model_deepseek():
+def test_get_known_model_deepseek() -> None:
     cfg = ModelRegistry.get_model("deepseek-7b")
     assert cfg is not None
     assert cfg.name == "deepseek-7b"
@@ -92,25 +92,25 @@ def test_get_known_model_deepseek():
     assert cfg.num_layers == 30
 
 
-def test_get_known_model_llama():
+def test_get_known_model_llama() -> None:
     cfg = ModelRegistry.get_model("llama3-8b")
     assert cfg is not None
     assert cfg.family == ModelFamily.LLAMA
     assert cfg.num_kv_heads == 8  # GQA
 
 
-def test_get_unknown_model_returns_none():
+def test_get_unknown_model_returns_none() -> None:
     assert ModelRegistry.get_model("totally-nonexistent-model-xyz") is None
 
 
-def test_find_models_by_family_llama():
+def test_find_models_by_family_llama() -> None:
     llama_models = ModelRegistry.find_models_by_family(ModelFamily.LLAMA)
     names = [m.name for m in llama_models]
     assert "llama3-8b" in names
     assert "llama3-70b" in names
 
 
-def test_find_models_by_family_returns_only_matching():
+def test_find_models_by_family_returns_only_matching() -> None:
     deepseek_models = ModelRegistry.find_models_by_family(ModelFamily.DEEPSEEK)
     for m in deepseek_models:
         assert m.family == ModelFamily.DEEPSEEK
@@ -121,21 +121,21 @@ def test_find_models_by_family_returns_only_matching():
 # ---------------------------------------------------------------------------
 
 
-def test_validate_requirements_pass():
+def test_validate_requirements_pass() -> None:
     # phi-2: min_memory_gb=6, FP16 multiplier=0.5 → need 3GB → fits in 6GB
     ok, msg = ModelRegistry.validate_requirements("phi-2", available_memory=6.0, num_gpus=1)
     assert ok is True
     assert "satisfied" in msg
 
 
-def test_validate_requirements_fail_memory():
+def test_validate_requirements_fail_memory() -> None:
     # phi-2 requires >0 GB; 0.1 GB will always fail
     ok, msg = ModelRegistry.validate_requirements("phi-2", available_memory=0.1, num_gpus=1)
     assert ok is False
     assert "memory" in msg.lower() or "insufficient" in msg.lower()
 
 
-def test_validate_requirements_unknown_model():
+def test_validate_requirements_unknown_model() -> None:
     ok, msg = ModelRegistry.validate_requirements("ghost-model", available_memory=100.0, num_gpus=8)
     assert ok is False
     assert "Unknown" in msg or "ghost-model" in msg
@@ -146,7 +146,7 @@ def test_validate_requirements_unknown_model():
 # ---------------------------------------------------------------------------
 
 
-def test_load_from_dict_adds_model():
+def test_load_from_dict_adds_model() -> None:
     config_dict = {
         "models": {
             "test-tiny": {
