@@ -68,7 +68,9 @@ impl<B: Backend> RotaryEmbedding<B> {
         let pos_tensor = Tensor::<B, 1>::from_floats(positions.as_slice(), device);
 
         // freqs = outer(positions, inv_freq)  -> [max_seq_len, half_dim]
-        let freqs = pos_tensor.unsqueeze::<2>().transpose()
+        let freqs = pos_tensor
+            .unsqueeze::<2>()
+            .transpose()
             .matmul(inv_freq_tensor.unsqueeze::<2>());
 
         let cos = freqs.clone().cos();
@@ -109,7 +111,9 @@ impl<B: Backend> RotaryEmbedding<B> {
         let head_dim = dims[3];
         let half = head_dim / 2;
 
-        let x1 = x.clone().slice([0..dims[0], 0..dims[1], 0..dims[2], 0..half]);
+        let x1 = x
+            .clone()
+            .slice([0..dims[0], 0..dims[1], 0..dims[2], 0..half]);
         let x2 = x.slice([0..dims[0], 0..dims[1], 0..dims[2], half..head_dim]);
 
         let cos = cos.unsqueeze::<4>();
@@ -164,10 +168,7 @@ pub fn top_k_top_p_sample(
     }
 
     // Apply temperature
-    let scaled: Vec<f32> = logits
-        .iter()
-        .map(|&l| l / temperature.max(1e-8))
-        .collect();
+    let scaled: Vec<f32> = logits.iter().map(|&l| l / temperature.max(1e-8)).collect();
 
     // Softmax
     let max_logit = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -249,10 +250,7 @@ pub fn build_causal_bias<B: Backend>(seq_len: usize, device: &B::Device) -> Opti
             data[i * seq_len + j] = 0.0;
         }
     }
-    Some(
-        Tensor::<B, 1>::from_floats(data.as_slice(), device)
-            .reshape([1, 1, seq_len, seq_len]),
-    )
+    Some(Tensor::<B, 1>::from_floats(data.as_slice(), device).reshape([1, 1, seq_len, seq_len]))
 }
 
 // ---------------------------------------------------------------------------
@@ -327,7 +325,11 @@ mod tests {
             let idx = top_k_top_p_sample(&logits, 1.0, 1.0, 0, &mut rng);
             seen[idx] = true;
         }
-        assert!(seen[0] && seen[1], "sampler must draw both candidates, got {:?}", seen);
+        assert!(
+            seen[0] && seen[1],
+            "sampler must draw both candidates, got {:?}",
+            seen
+        );
     }
 
     #[test]
@@ -344,11 +346,15 @@ mod tests {
         let logits = [0.3_f32, 0.2, 0.5, 0.1];
         let a: Vec<usize> = {
             let mut rng = rand::rngs::StdRng::seed_from_u64(99);
-            (0..50).map(|_| top_k_top_p_sample(&logits, 1.0, 0.9, 0, &mut rng)).collect()
+            (0..50)
+                .map(|_| top_k_top_p_sample(&logits, 1.0, 0.9, 0, &mut rng))
+                .collect()
         };
         let b: Vec<usize> = {
             let mut rng = rand::rngs::StdRng::seed_from_u64(99);
-            (0..50).map(|_| top_k_top_p_sample(&logits, 1.0, 0.9, 0, &mut rng)).collect()
+            (0..50)
+                .map(|_| top_k_top_p_sample(&logits, 1.0, 0.9, 0, &mut rng))
+                .collect()
         };
         assert_eq!(a, b);
     }

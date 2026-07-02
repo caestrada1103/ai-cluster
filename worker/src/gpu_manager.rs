@@ -4,14 +4,13 @@
 //! and device operations. Uses Burn's wgpu backend by default for
 //! automatic GPU detection across NVIDIA, AMD, and Intel.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
+use std::sync::Arc;
 
 use dashmap::DashMap;
-use tokio::sync::Semaphore;
-use tracing::{info, warn, debug};
 use std::process::Command;
+use tokio::sync::Semaphore;
+use tracing::{debug, info, warn};
 
 use crate::cluster::GpuInfo;
 use crate::error::WorkerError;
@@ -46,7 +45,6 @@ pub struct GPUDevice {
 
     /// Device capabilities
     pub capabilities: Vec<String>,
-
 }
 
 /// GPU memory allocation tracking
@@ -163,7 +161,7 @@ impl GPUManager {
                 .difference(wgpu::InstanceFlags::VALIDATION | wgpu::InstanceFlags::DEBUG),
             ..Default::default()
         });
-        
+
         let adapters = instance.enumerate_adapters(wgpu::Backends::all());
         let mut devices: Vec<(GPUDevice, bool)> = Vec::new();
         let mut seen_hardware = std::collections::HashSet::new();
@@ -199,7 +197,11 @@ impl GPUManager {
 
             debug!(
                 "Detected {} adapter {}: {} ({:?}) - VRAM: {}MB",
-                info.backend, idx, name, info.device_type, total_memory / 1024 / 1024
+                info.backend,
+                idx,
+                name,
+                info.device_type,
+                total_memory / 1024 / 1024
             );
 
             devices.push((
@@ -232,7 +234,7 @@ impl GPUManager {
             .collect();
 
         if devices.is_empty() {
-             devices.push(GPUDevice {
+            devices.push(GPUDevice {
                 id: 0,
                 name: "CPU Fallback".to_string(),
                 total_memory: 0,
@@ -265,7 +267,10 @@ impl GPUManager {
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let line = stdout.lines().nth(device_idx).or_else(|| stdout.lines().next())?;
+            let line = stdout
+                .lines()
+                .nth(device_idx)
+                .or_else(|| stdout.lines().next())?;
             if let Ok(mb) = line.trim().parse::<u64>() {
                 return Some(mb * 1024 * 1024);
             }
@@ -288,16 +293,22 @@ impl GPUManager {
             .recv_timeout(std::time::Duration::from_secs(3))
             .ok()?
             .ok()?;
-            
+
         if output.status.success() {
             let json_str = String::from_utf8_lossy(&output.stdout);
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
                 // rocm-smi returns a JSON object where keys are usually "card0", "card1", etc.
                 // We try "card{idx}" first, then fallback to any available card if idx fails.
                 let card_key = format!("card{}", device_idx);
-                
-                if let Some(card_data) = v.get(&card_key).or_else(|| v.as_object().and_then(|obj| obj.values().next())) {
-                    if let Some(vram_str) = card_data.get("VRAM Total Memory (B)").and_then(|v| v.as_str()) {
+
+                if let Some(card_data) = v
+                    .get(&card_key)
+                    .or_else(|| v.as_object().and_then(|obj| obj.values().next()))
+                {
+                    if let Some(vram_str) = card_data
+                        .get("VRAM Total Memory (B)")
+                        .and_then(|v| v.as_str())
+                    {
                         if let Ok(vram_bytes) = vram_str.parse::<u64>() {
                             return Some(vram_bytes);
                         }
@@ -316,7 +327,7 @@ impl GPUManager {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(8);
-        
+
         gb * 1024 * 1024 * 1024
     }
 
@@ -338,7 +349,9 @@ impl GPUManager {
                     .output();
                 let _ = tx.send(out);
             });
-            rx.recv_timeout(std::time::Duration::from_secs(3)).ok().and_then(|r| r.ok())
+            rx.recv_timeout(std::time::Duration::from_secs(3))
+                .ok()
+                .and_then(|r| r.ok())
         })
         .await
         .ok()
@@ -395,7 +408,8 @@ impl GPUManager {
             Some(d) => d,
             None => return 0,
         };
-        let used = self.used_bytes
+        let used = self
+            .used_bytes
             .get(device_id)
             .map(|a| a.load(Ordering::Relaxed))
             .unwrap_or(0);
@@ -431,11 +445,14 @@ impl GPUManager {
             });
         }
 
-        self.allocations.entry(device_id).or_default().push(MemoryAllocation {
-            tag: tag.to_string(),
-            size,
-            _timestamp: std::time::Instant::now(),
-        });
+        self.allocations
+            .entry(device_id)
+            .or_default()
+            .push(MemoryAllocation {
+                tag: tag.to_string(),
+                size,
+                _timestamp: std::time::Instant::now(),
+            });
         if let Some(counter) = self.used_bytes.get(device_id) {
             counter.fetch_add(size, Ordering::Relaxed);
         }

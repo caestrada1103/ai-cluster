@@ -15,7 +15,7 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::runtime::Runtime;
 use tonic::transport::Server;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// Burn backend selection (wgpu / CUDA / ROCm / ndarray).
@@ -92,7 +92,8 @@ fn main() -> Result<(), WorkerError> {
     info!("Configuration: {:?}", config);
 
     // Parse GPU IDs — CLI/env wins, then config file, then [0]
-    let gpu_ids = args.gpu_ids
+    let gpu_ids = args
+        .gpu_ids
         .as_ref()
         .map(|s| {
             s.split(',')
@@ -113,12 +114,14 @@ fn main() -> Result<(), WorkerError> {
 }
 
 fn init_logging(args: &Args) {
-    let base_filter = std::env::var("RUST_LOG")
-        .unwrap_or_else(|_| args.log_level.clone());
+    let base_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| args.log_level.clone());
 
     // Aggressively silence driver-level noise from internal dependencies.
     // Use 'off' for crates that continue to leak INFO logs despite 'error' filters.
-    let filter_str = format!("{},wgpu=warn,wgpu_hal=off,naga=off,vulkan=off,vulkan_layer=off", base_filter);
+    let filter_str = format!(
+        "{},wgpu=warn,wgpu_hal=off,naga=off,vulkan=off,vulkan_layer=off",
+        base_filter
+    );
 
     let env_filter = EnvFilter::new(filter_str);
 
@@ -159,7 +162,11 @@ fn create_runtime() -> Result<Runtime, WorkerError> {
         .map_err(|e| WorkerError::Runtime(format!("Failed to create runtime: {}", e)))
 }
 
-async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Result<(), WorkerError> {
+async fn async_main(
+    args: Args,
+    config: WorkerConfig,
+    gpu_ids: Vec<usize>,
+) -> Result<(), WorkerError> {
     // Install the Prometheus recorder BEFORE any metric is described or recorded.
     // If this fails the process must not run blind — bail out.
     let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
@@ -169,7 +176,7 @@ async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Re
     // Initialize GPU manager
     info!("Initializing GPU Manager...");
     let gpu_manager = Arc::new(gpu_manager::GPUManager::new(&gpu_ids).await?);
-    
+
     #[cfg(feature = "wgpu")]
     {
         use burn::backend::wgpu::WgpuDevice;
@@ -184,9 +191,12 @@ async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Re
         let device = WgpuDevice::default();
         info!("Selected WGPU Device: {:?}", device);
     }
-    
+
     info!("GPU Manager initialized successfully");
-    info!("Initialized GPU manager with {} devices", gpu_manager.device_count());
+    info!(
+        "Initialized GPU manager with {} devices",
+        gpu_manager.device_count()
+    );
 
     // Initialize model loader
     let loader_config = ModelLoaderConfig {
@@ -209,19 +219,10 @@ async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Re
         .unwrap_or_else(|| format!("worker-{}", gpu_ids[0]));
 
     // Create worker service
-    let worker_service = WorkerService::new(
-        worker_id,
-        gpu_manager.clone(),
-        model_loader,
-        config,
-    );
+    let worker_service = WorkerService::new(worker_id, gpu_manager.clone(), model_loader, config);
 
     // Start metrics server
-    let metrics_server = MetricsServer::new(
-        metrics_port,
-        gpu_manager.clone(),
-        prometheus_handle,
-    );
+    let metrics_server = MetricsServer::new(metrics_port, gpu_manager.clone(), prometheus_handle);
     tokio::spawn(async move {
         if let Err(e) = metrics_server.run().await {
             error!("Metrics server error: {}", e);
@@ -235,7 +236,9 @@ async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Re
 
     // Health service
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
-    health_reporter.set_serving::<WorkerServer<WorkerService>>().await;
+    health_reporter
+        .set_serving::<WorkerServer<WorkerService>>()
+        .await;
 
     Server::builder()
         .add_service(health_service)

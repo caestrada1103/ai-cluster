@@ -6,21 +6,21 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_stream::try_stream;
-use futures::{Stream, StreamExt};
 use dashmap::DashMap;
+use futures::{Stream, StreamExt};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn, error, debug, instrument};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-use crate::cluster::*;
 use crate::cluster::worker_server::Worker;
+use crate::cluster::*;
+use crate::config::WorkerConfig;
 use crate::gpu_manager::GPUManager;
+use crate::metrics::Metrics;
 use crate::model_loader::ModelLoader;
 use crate::models::ModelInstance;
-use crate::config::WorkerConfig;
-use crate::metrics::Metrics;
 
 /// Worker service implementation
 #[derive(Clone)]
@@ -79,8 +79,6 @@ impl WorkerService {
     pub fn version(&self) -> &'static str {
         env!("CARGO_PKG_VERSION")
     }
-
-
 }
 
 /// Removes the request from the active map when dropped — even if the client
@@ -146,14 +144,17 @@ impl Worker for WorkerService {
         } else {
             Some(req.model_path.as_str())
         };
-        let result = self.model_loader.load_model(
-            &req.model_name,
-            repo_override,
-            req.config.as_ref(),
-            &gpu_ids,
-            req.quantization(),
-            req.parallelism(),
-        ).await;
+        let result = self
+            .model_loader
+            .load_model(
+                &req.model_name,
+                repo_override,
+                req.config.as_ref(),
+                &gpu_ids,
+                req.quantization(),
+                req.parallelism(),
+            )
+            .await;
 
         match result {
             Ok(model_instance) => {
@@ -161,19 +162,23 @@ impl Worker for WorkerService {
                 let memory_used = model_instance.memory_used();
 
                 // Store model
-                self.loaded_models.write().await.insert(
-                    req.model_name.clone(),
-                    model_instance,
-                );
+                self.loaded_models
+                    .write()
+                    .await
+                    .insert(req.model_name.clone(), model_instance);
 
                 // Update metrics
                 self.metrics.record_model_load(&req.model_name, load_time);
-                self.metrics.set_model_memory(&req.model_name, memory_used as i64);
-                self.metrics.set_loaded_models(self.loaded_models.read().await.len());
+                self.metrics
+                    .set_model_memory(&req.model_name, memory_used as i64);
+                self.metrics
+                    .set_loaded_models(self.loaded_models.read().await.len());
 
                 info!(
                     "Model {} loaded successfully in {:?}, using {}MB VRAM",
-                    req.model_name, load_time, memory_used / 1024 / 1024
+                    req.model_name,
+                    load_time,
+                    memory_used / 1024 / 1024
                 );
 
                 Ok(Response::new(LoadModelResponse {
@@ -205,7 +210,9 @@ impl Worker for WorkerService {
 
         info!(
             "Inference request {}: model={}, prompt_len={}",
-            request_id, req.model_name, req.prompt.len()
+            request_id,
+            req.model_name,
+            req.prompt.len()
         );
 
         // Concurrency limit — reject instead of queueing unboundedly.
@@ -220,7 +227,8 @@ impl Worker for WorkerService {
         };
 
         // Track active request
-        self.active_requests.insert(request_id.clone(), Instant::now());
+        self.active_requests
+            .insert(request_id.clone(), Instant::now());
         self.metrics.set_active_requests(self.active_requests.len());
         let active_guard = ActiveGuard {
             map: self.active_requests.clone(),
@@ -229,17 +237,26 @@ impl Worker for WorkerService {
         };
 
         // Get model
-        debug!("Inference request {}: waiting for loaded_models read lock", request_id);
+        debug!(
+            "Inference request {}: waiting for loaded_models read lock",
+            request_id
+        );
         let model = {
             let models = self.loaded_models.read().await;
             models.get(&req.model_name).cloned()
         };
-        debug!("Inference request {}: released loaded_models read lock (found: {})", request_id, model.is_some());
+        debug!(
+            "Inference request {}: released loaded_models read lock (found: {})",
+            request_id,
+            model.is_some()
+        );
 
         let model = match model {
             Some(m) => m,
             None => {
-                return Err(crate::error::WorkerError::ModelNotFound(req.model_name.clone()).into());
+                return Err(
+                    crate::error::WorkerError::ModelNotFound(req.model_name.clone()).into(),
+                );
             }
         };
 
@@ -371,10 +388,7 @@ impl Worker for WorkerService {
     }
 
     #[instrument(skip(self))]
-    async fn get_status(
-        &self,
-        _request: Request<Empty>,
-    ) -> Result<Response<WorkerStatus>, Status> {
+    async fn get_status(&self, _request: Request<Empty>) -> Result<Response<WorkerStatus>, Status> {
         debug!("Status request received - waiting for locks");
 
         // Get GPU info
@@ -384,8 +398,9 @@ impl Worker for WorkerService {
         // Get loaded models info
         let loaded_models = {
             let models = self.loaded_models.read().await;
-            models.iter().map(|(name, instance)| {
-                LoadedModelInfo {
+            models
+                .iter()
+                .map(|(name, instance)| LoadedModelInfo {
                     model_name: name.clone(),
                     memory_used: instance.memory_used() as u64,
                     gpu_ids: instance.gpu_ids().iter().map(|&id| id as i32).collect(),
@@ -393,8 +408,8 @@ impl Worker for WorkerService {
                     parallelism: instance.parallelism(),
                     loaded_at_timestamp: instance.loaded_at().timestamp() as u64,
                     num_inferences: instance.inference_count(),
-                }
-            }).collect()
+                })
+                .collect()
         };
 
         // Get system info
@@ -434,12 +449,16 @@ impl Worker for WorkerService {
 
         if removed_from_service || removed_from_loader {
             self.metrics.remove_model_metrics(&req.model_name);
-            self.metrics.set_loaded_models(self.loaded_models.read().await.len());
+            self.metrics
+                .set_loaded_models(self.loaded_models.read().await.len());
             info!("Model {} unloaded successfully", req.model_name);
             Ok(Response::new(Empty {}))
         } else {
             warn!("Model {} not found for unloading", req.model_name);
-            Err(Status::not_found(format!("Model {} not found", req.model_name)))
+            Err(Status::not_found(format!(
+                "Model {} not found",
+                req.model_name
+            )))
         }
     }
 
@@ -457,7 +476,9 @@ impl Worker for WorkerService {
 
         Ok(Response::new(HealthCheckResponse {
             status: status as i32,
-            message: format!("Worker {} is {}", self.worker_id,
+            message: format!(
+                "Worker {} is {}",
+                self.worker_id,
                 if is_healthy { "healthy" } else { "unhealthy" }
             ),
         }))

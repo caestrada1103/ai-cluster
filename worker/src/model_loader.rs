@@ -3,37 +3,38 @@
 //! This module handles loading models from various formats,
 //! managing model instances, and coordinating with the GPU manager.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::collections::HashMap;
 
-use dashmap::DashMap;
-use tokio::sync::Semaphore;
-use tracing::info;
-use hf_hub::{api::tokio::Api, Repo, RepoType};
-use safetensors::SafeTensors;
-use burn::{
-    tensor::Tensor,
-    module::{Module, Param, ConstantRecord, ParamId},
-    nn::{LinearRecord, EmbeddingRecord},
-};
-use half::f16;
+use crate::backend::WorkerBackend;
 use crate::error::WorkerError;
 use crate::gpu_manager::GPUManager;
 use crate::models::{
-    ModelConfig, ModelInstance, TextGeneration,
-    llama::{Llama, LlamaConfig, LlamaRecord, LlamaLayerRecord, LlamaAttentionRecord, LlamaMLPRecord},
-    qwen::{Qwen, QwenConfig, QwenRecord, QwenLayerRecord, QwenAttentionRecord, QwenMLPRecord},
-    deepseek::{
-        DeepSeek, DeepSeekConfig,
-        DeepSeekRecord, DeepSeekLayerRecord, DeepSeekAttentionRecord,
-        DeepSeekMoERecord, ExpertRecord,
-    },
     common::{RMSNormRecord, RotaryEmbeddingRecord},
+    deepseek::{
+        DeepSeek, DeepSeekAttentionRecord, DeepSeekConfig, DeepSeekLayerRecord, DeepSeekMoERecord,
+        DeepSeekRecord, ExpertRecord,
+    },
+    llama::{
+        Llama, LlamaAttentionRecord, LlamaConfig, LlamaLayerRecord, LlamaMLPRecord, LlamaRecord,
+    },
+    qwen::{Qwen, QwenAttentionRecord, QwenConfig, QwenLayerRecord, QwenMLPRecord, QwenRecord},
+    ModelConfig, ModelInstance, TextGeneration,
 };
-use crate::backend::WorkerBackend;
 use burn::backend::wgpu::WgpuDevice;
+use burn::{
+    module::{ConstantRecord, Module, Param, ParamId},
+    nn::{EmbeddingRecord, LinearRecord},
+    tensor::Tensor,
+};
+use dashmap::DashMap;
+use half::f16;
+use hf_hub::{api::tokio::Api, Repo, RepoType};
+use safetensors::SafeTensors;
+use tokio::sync::Semaphore;
+use tracing::info;
 
 /// Model loader configuration
 #[derive(Debug, Clone)]
@@ -86,13 +87,18 @@ impl ModelLoader {
         config: ModelLoaderConfig,
         gpu_manager: Arc<GPUManager>,
     ) -> Result<Self, WorkerError> {
-        let cache_dir = config.hf_cache_dir.clone().unwrap_or_else(|| config.cache_dir.clone());
+        let cache_dir = config
+            .hf_cache_dir
+            .clone()
+            .unwrap_or_else(|| config.cache_dir.clone());
         let mut builder = hf_hub::api::tokio::ApiBuilder::new()
             .with_endpoint("https://huggingface.co".to_string())
             .with_cache_dir(cache_dir);
 
         // Env var wins; TOML hf_token is the fallback for gated repos.
-        let token = std::env::var("HF_TOKEN").ok().or_else(|| config.hf_token.clone());
+        let token = std::env::var("HF_TOKEN")
+            .ok()
+            .or_else(|| config.hf_token.clone());
         if let Some(token) = token {
             builder = builder.with_token(Some(token));
         }
@@ -124,7 +130,9 @@ impl ModelLoader {
         parallelism: crate::cluster::ParallelismStrategy,
     ) -> Result<ModelInstance, WorkerError> {
         // model_name is the registry key (map key everywhere); repo_id is what we download.
-        let repo_id: &str = repo_override.filter(|s| !s.is_empty()).unwrap_or(model_name);
+        let repo_id: &str = repo_override
+            .filter(|s| !s.is_empty())
+            .unwrap_or(model_name);
 
         if let Some(entry) = self.loaded_models.get(model_name) {
             info!("Model {} already loaded", model_name);
@@ -152,9 +160,10 @@ impl ModelLoader {
             return Ok(entry.value().clone());
         }
 
-        let _permit = self.load_semaphore.acquire().await.map_err(|e| {
-            WorkerError::Resource(format!("Failed to acquire load permit: {}", e))
-        })?;
+        let _permit =
+            self.load_semaphore.acquire().await.map_err(|e| {
+                WorkerError::Resource(format!("Failed to acquire load permit: {}", e))
+            })?;
 
         // Engine routing: GGUF/llama.cpp models bypass the entire
         // safetensors + config.json path below (GGUF repos often ship no
@@ -170,7 +179,9 @@ impl ModelLoader {
 
         info!("Loading model {}...", model_name);
         let model_path = self.get_model_path(repo_id).await?;
-        let config = self.load_model_config(model_name, model_config, &model_path).await?;
+        let config = self
+            .load_model_config(model_name, model_config, &model_path)
+            .await?;
 
         let memory_used = self.calculate_memory_usage(&config);
         let mut reserved_gpus: Vec<usize> = Vec::new();
@@ -208,8 +219,9 @@ impl ModelLoader {
             // Ensure tokenizer.json is downloaded
             if let Some(api) = &self.hf_api {
                 let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
-                let _ = repo.get("tokenizer.json").await
-                    .map_err(|e| WorkerError::ModelLoad(format!("Failed to download tokenizer.json: {}", e)))?;
+                let _ = repo.get("tokenizer.json").await.map_err(|e| {
+                    WorkerError::ModelLoad(format!("Failed to download tokenizer.json: {}", e))
+                })?;
                 info!("Tokenizer downloaded to: {:?}", model_path);
 
                 // generation_config.json carries the authoritative eos_token_id for many repos.
@@ -239,7 +251,8 @@ impl ModelLoader {
                     let record = create_llama_record(&mut weights, &llama_config)?;
                     info!("Record created. Initializing Llama...");
 
-                    let model = Llama::new(&llama_config, &device, &model_path)?.load_record(record);
+                    let model =
+                        Llama::new(&llama_config, &device, &model_path)?.load_record(record);
                     Arc::new(Mutex::new(model))
                 }
                 "qwen" => {
@@ -289,7 +302,8 @@ impl ModelLoader {
                             rope_theta: config.rope_theta,
                         };
                         let record = create_llama_record(&mut weights, &llama_config)?;
-                        let model = Llama::new(&llama_config, &device, &model_path)?.load_record(record);
+                        let model =
+                            Llama::new(&llama_config, &device, &model_path)?.load_record(record);
                         Arc::new(Mutex::new(model))
                     } else {
                         // MoE checkpoint: build the config from config.json, not name substrings.
@@ -310,11 +324,17 @@ impl ModelLoader {
                         info!("Mapping weights to DeepSeekRecord...");
                         let record = create_deepseek_record(&mut weights, &ds_config)?;
                         info!("Record created. Initializing DeepSeek...");
-                        let model = DeepSeek::new(ds_config, &device, &model_path)?.load_record(record);
+                        let model =
+                            DeepSeek::new(ds_config, &device, &model_path)?.load_record(record);
                         Arc::new(Mutex::new(model))
                     }
                 }
-                other => return Err(WorkerError::ModelLoad(format!("Unsupported architecture: {}", other))),
+                other => {
+                    return Err(WorkerError::ModelLoad(format!(
+                        "Unsupported architecture: {}",
+                        other
+                    )))
+                }
             };
             Ok(model)
         }
@@ -339,7 +359,8 @@ impl ModelLoader {
             Some(model),
         );
 
-        self.loaded_models.insert(model_name.to_string(), instance.clone());
+        self.loaded_models
+            .insert(model_name.to_string(), instance.clone());
         info!("Model {} loaded successfully", model_name);
 
         Ok(instance)
@@ -352,46 +373,68 @@ impl ModelLoader {
             return false;
         };
         for &gpu_id in instance.gpu_ids() {
-            let freed = self.gpu_manager.free_memory(gpu_id as usize, model_name).await;
-            info!("Unload {}: freed {} bytes on GPU {}", model_name, freed, gpu_id);
+            let freed = self
+                .gpu_manager
+                .free_memory(gpu_id as usize, model_name)
+                .await;
+            info!(
+                "Unload {}: freed {} bytes on GPU {}",
+                model_name, freed, gpu_id
+            );
         }
         // instance drops here — last Arc clone (worker.rs removed its copy first) frees the weights.
         true
     }
 
-    async fn load_safetensors(&self, model_name: &str, device: &WgpuDevice) -> Result<HashMap<String, Tensor<WorkerBackend, 1>>, WorkerError> {
-        let api = self.hf_api.as_ref().ok_or(WorkerError::ModelLoad("HF API not initialized".to_string()))?;
+    async fn load_safetensors(
+        &self,
+        model_name: &str,
+        device: &WgpuDevice,
+    ) -> Result<HashMap<String, Tensor<WorkerBackend, 1>>, WorkerError> {
+        let api = self
+            .hf_api
+            .as_ref()
+            .ok_or(WorkerError::ModelLoad("HF API not initialized".to_string()))?;
         let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
-        
+
         let mut weights = HashMap::new();
         let mut files = Vec::new();
 
         // Check for index (sharded) or single file
         if let Ok(index_path) = repo.get("model.safetensors.index.json").await {
-            let index_content = tokio::fs::read_to_string(&index_path).await
+            let index_content = tokio::fs::read_to_string(&index_path)
+                .await
                 .map_err(|e| WorkerError::ModelLoad(format!("Failed to read index: {}", e)))?;
             let json: serde_json::Value = serde_json::from_str(&index_content)
                 .map_err(|e| WorkerError::ModelLoad(format!("Json error: {}", e)))?;
-            
+
             if let Some(map) = json["weight_map"].as_object() {
-                let mut filenames: Vec<String> = map.values().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                let mut filenames: Vec<String> = map
+                    .values()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
                 filenames.sort();
                 filenames.dedup();
                 for fname in filenames {
-                    files.push(repo.get(&fname).await.map_err(|e| WorkerError::ModelLoad(e.to_string()))?);
+                    files.push(
+                        repo.get(&fname)
+                            .await
+                            .map_err(|e| WorkerError::ModelLoad(e.to_string()))?,
+                    );
                 }
             }
         } else if let Ok(path) = repo.get("model.safetensors").await {
             files.push(path);
         } else {
-             return Err(WorkerError::ModelLoad("No safetensors found".to_string()));
+            return Err(WorkerError::ModelLoad("No safetensors found".to_string()));
         }
 
         info!("Loading {} safetensors files...", files.len());
 
         for file in files {
             // Async read keeps the runtime free during I/O
-            let data = tokio::fs::read(&file).await
+            let data = tokio::fs::read(&file)
+                .await
                 .map_err(|e| WorkerError::ModelLoad(e.to_string()))?;
 
             // CPU-heavy deserialization and dtype conversion run on the blocking thread pool
@@ -401,13 +444,19 @@ impl ModelLoader {
                 let mut out: Vec<(String, Vec<f32>)> = Vec::new();
                 for (name, view) in safetensors.tensors() {
                     let floats: Vec<f32> = match view.dtype() {
-                        safetensors::Dtype::F16 => view.data().chunks(2)
+                        safetensors::Dtype::F16 => view
+                            .data()
+                            .chunks(2)
                             .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32())
                             .collect(),
-                        safetensors::Dtype::BF16 => view.data().chunks(2)
+                        safetensors::Dtype::BF16 => view
+                            .data()
+                            .chunks(2)
                             .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
                             .collect(),
-                        safetensors::Dtype::F32 => view.data().chunks(4)
+                        safetensors::Dtype::F32 => view
+                            .data()
+                            .chunks(4)
                             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                             .collect(),
                         _ => continue, // Skip unsupported dtypes
@@ -425,28 +474,40 @@ impl ModelLoader {
                 weights.insert(name, tensor);
             }
         }
-        
+
         Ok(weights)
     }
 
     async fn get_model_path(&self, model_name: &str) -> Result<PathBuf, WorkerError> {
         if let Some(api) = &self.hf_api {
-             let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
-             let config = repo.get("config.json").await.map_err(|e| WorkerError::ModelLoad(e.to_string()))?;
-             let parent = config.parent().ok_or_else(|| {
+            let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
+            let config = repo
+                .get("config.json")
+                .await
+                .map_err(|e| WorkerError::ModelLoad(e.to_string()))?;
+            let parent = config.parent().ok_or_else(|| {
                 WorkerError::ModelLoad("config.json path has no parent directory".to_string())
             })?;
-             return Ok(parent.to_path_buf());
+            return Ok(parent.to_path_buf());
         }
         Err(WorkerError::ModelLoad("No HF API".to_string()))
     }
 
-    async fn load_model_config(&self, _name: &str, _provided: Option<&crate::cluster::ModelConfig>, path: &Path) -> Result<ModelConfig, WorkerError> {
+    async fn load_model_config(
+        &self,
+        _name: &str,
+        _provided: Option<&crate::cluster::ModelConfig>,
+        path: &Path,
+    ) -> Result<ModelConfig, WorkerError> {
         let config_path = path.join("config.json");
-        let s = tokio::fs::read_to_string(&config_path).await
+        let s = tokio::fs::read_to_string(&config_path)
+            .await
             .map_err(|e| WorkerError::ModelLoad(format!("Failed to read config: {}", e)))?;
         let json: serde_json::Value = serde_json::from_str(&s)?;
-        let arch_raw = json["architectures"][0].as_str().unwrap_or("llama").to_lowercase();
+        let arch_raw = json["architectures"][0]
+            .as_str()
+            .unwrap_or("llama")
+            .to_lowercase();
         if arch_raw.contains("qwen3") {
             return Err(WorkerError::ModelLoad(
                 "Qwen3 checkpoints are not supported yet (per-head q_norm/k_norm not implemented). \
@@ -467,7 +528,8 @@ impl ModelLoader {
             .as_u64()
             .or_else(|| json["n_routed_experts"].as_u64()) // DeepSeek-V2/V3 key
             .map(|v| v as usize);
-        let num_experts_per_tok = json["num_experts_per_token"].as_u64()
+        let num_experts_per_tok = json["num_experts_per_token"]
+            .as_u64()
             .or_else(|| json["num_experts_per_tok"].as_u64())
             .map(|v| v as usize);
         let is_moe = num_experts.is_some();
@@ -500,7 +562,8 @@ impl ModelLoader {
         } else {
             1
         };
-        let ffn = config.num_layers * 3 * config.hidden_size * config.intermediate_size * expert_factor;
+        let ffn =
+            config.num_layers * 3 * config.hidden_size * config.intermediate_size * expert_factor;
         let norm = (config.num_layers * 2 + 1) * config.hidden_size;
         let params = embed + attn + ffn + norm;
         params * 4
@@ -576,7 +639,10 @@ impl ModelLoader {
 
         self.loaded_models
             .insert(model_name.to_string(), instance.clone());
-        info!("GGUF model {} loaded successfully via llama.cpp", model_name);
+        info!(
+            "GGUF model {} loaded successfully via llama.cpp",
+            model_name
+        );
         Ok(instance)
     }
 
@@ -596,7 +662,6 @@ impl ModelLoader {
             model_name
         )))
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -757,25 +822,30 @@ fn load_linear(
     name: &str,
     in_features: usize,
     out_features: usize,
-    bias: bool
+    bias: bool,
 ) -> Result<LinearRecord<WorkerBackend>, WorkerError> {
     let w_name = format!("{}.weight", name);
-    let w_flat = weights.remove(&w_name).ok_or(WorkerError::ModelLoad(format!("Missing {}", w_name)))?;
-    
+    let w_flat = weights
+        .remove(&w_name)
+        .ok_or(WorkerError::ModelLoad(format!("Missing {}", w_name)))?;
+
     // HF: [out, in]
     // Burn expects: [in, out]
     // So we reshape to HF shape, transpose, then into Burn shape.
     // Actually, simply reshaping to [out, in] and transposing gives [in, out].
     let w = w_flat.reshape([out_features, in_features]).transpose();
-    
+
     let b = if bias {
         let b_name = format!("{}.bias", name);
         weights.remove(&b_name)
     } else {
         None
     };
-    
-    Ok(LinearRecord { weight: Param::initialized(ParamId::new(), w), bias: b.map(|t| Param::initialized(ParamId::new(), t)) })
+
+    Ok(LinearRecord {
+        weight: Param::initialized(ParamId::new(), w),
+        bias: b.map(|t| Param::initialized(ParamId::new(), t)),
+    })
 }
 
 fn load_embedding(
@@ -785,9 +855,13 @@ fn load_embedding(
     embedding_dim: usize,
 ) -> Result<EmbeddingRecord<WorkerBackend>, WorkerError> {
     let w_name = format!("{}.weight", name);
-    let w_flat = weights.remove(&w_name).ok_or(WorkerError::ModelLoad(format!("Missing {}", w_name)))?;
+    let w_flat = weights
+        .remove(&w_name)
+        .ok_or(WorkerError::ModelLoad(format!("Missing {}", w_name)))?;
     let w = w_flat.reshape([num_embeddings, embedding_dim]);
-    Ok(EmbeddingRecord { weight: Param::initialized(ParamId::new(), w) })
+    Ok(EmbeddingRecord {
+        weight: Param::initialized(ParamId::new(), w),
+    })
 }
 
 fn load_norm(
@@ -796,56 +870,130 @@ fn load_norm(
     _dim: usize,
 ) -> Result<RMSNormRecord<WorkerBackend>, WorkerError> {
     let w_name = format!("{}.weight", name);
-    let w_flat = weights.remove(&w_name).ok_or(WorkerError::ModelLoad(format!("Missing {}", w_name)))?;
+    let w_flat = weights
+        .remove(&w_name)
+        .ok_or(WorkerError::ModelLoad(format!("Missing {}", w_name)))?;
     let w = w_flat; // 1D
-    Ok(RMSNormRecord { weight: Param::initialized(ParamId::new(), w), eps: ConstantRecord })
+    Ok(RMSNormRecord {
+        weight: Param::initialized(ParamId::new(), w),
+        eps: ConstantRecord,
+    })
 }
 
 fn create_qwen_record(
     weights: &mut HashMap<String, Tensor<WorkerBackend, 1>>,
     config: &QwenConfig,
 ) -> Result<QwenRecord<WorkerBackend>, WorkerError> {
-    let embed = load_embedding(weights, "model.embed_tokens", config.vocab_size, config.hidden_size)?;
+    let embed = load_embedding(
+        weights,
+        "model.embed_tokens",
+        config.vocab_size,
+        config.hidden_size,
+    )?;
     let norm = load_norm(weights, "model.norm", config.hidden_size)?;
-    let lm_head = load_linear(weights, "lm_head", config.hidden_size, config.vocab_size, false)?;
+    let lm_head = load_linear(
+        weights,
+        "lm_head",
+        config.hidden_size,
+        config.vocab_size,
+        false,
+    )?;
 
     let mut layers = Vec::new();
     for i in 0..config.num_layers {
         let prefix = format!("model.layers.{}", i);
 
         let bias = config.attention_bias;
-        let q = load_linear(weights, &format!("{}.self_attn.q_proj", prefix),
-            config.hidden_size, config.num_attention_heads * config.head_dim, bias)?;
-        let k = load_linear(weights, &format!("{}.self_attn.k_proj", prefix),
-            config.hidden_size, config.num_kv_heads * config.head_dim, bias)?;
-        let v = load_linear(weights, &format!("{}.self_attn.v_proj", prefix),
-            config.hidden_size, config.num_kv_heads * config.head_dim, bias)?;
-        let o = load_linear(weights, &format!("{}.self_attn.o_proj", prefix),
-            config.num_attention_heads * config.head_dim, config.hidden_size, false)?;
+        let q = load_linear(
+            weights,
+            &format!("{}.self_attn.q_proj", prefix),
+            config.hidden_size,
+            config.num_attention_heads * config.head_dim,
+            bias,
+        )?;
+        let k = load_linear(
+            weights,
+            &format!("{}.self_attn.k_proj", prefix),
+            config.hidden_size,
+            config.num_kv_heads * config.head_dim,
+            bias,
+        )?;
+        let v = load_linear(
+            weights,
+            &format!("{}.self_attn.v_proj", prefix),
+            config.hidden_size,
+            config.num_kv_heads * config.head_dim,
+            bias,
+        )?;
+        let o = load_linear(
+            weights,
+            &format!("{}.self_attn.o_proj", prefix),
+            config.num_attention_heads * config.head_dim,
+            config.hidden_size,
+            false,
+        )?;
 
         let attention = QwenAttentionRecord {
-            q_proj: q, k_proj: k, v_proj: v, o_proj: o,
-            num_heads: ConstantRecord, num_kv_heads: ConstantRecord, head_dim: ConstantRecord,
+            q_proj: q,
+            k_proj: k,
+            v_proj: v,
+            o_proj: o,
+            num_heads: ConstantRecord,
+            num_kv_heads: ConstantRecord,
+            head_dim: ConstantRecord,
         };
 
-        let gate = load_linear(weights, &format!("{}.mlp.gate_proj", prefix),
-            config.hidden_size, config.intermediate_size, false)?;
-        let up = load_linear(weights, &format!("{}.mlp.up_proj", prefix),
-            config.hidden_size, config.intermediate_size, false)?;
-        let down = load_linear(weights, &format!("{}.mlp.down_proj", prefix),
-            config.intermediate_size, config.hidden_size, false)?;
+        let gate = load_linear(
+            weights,
+            &format!("{}.mlp.gate_proj", prefix),
+            config.hidden_size,
+            config.intermediate_size,
+            false,
+        )?;
+        let up = load_linear(
+            weights,
+            &format!("{}.mlp.up_proj", prefix),
+            config.hidden_size,
+            config.intermediate_size,
+            false,
+        )?;
+        let down = load_linear(
+            weights,
+            &format!("{}.mlp.down_proj", prefix),
+            config.intermediate_size,
+            config.hidden_size,
+            false,
+        )?;
 
-        let mlp = QwenMLPRecord { gate_proj: gate, up_proj: up, down_proj: down };
+        let mlp = QwenMLPRecord {
+            gate_proj: gate,
+            up_proj: up,
+            down_proj: down,
+        };
 
-        let in_norm = load_norm(weights, &format!("{}.input_layernorm", prefix), config.hidden_size)?;
-        let post_norm = load_norm(weights, &format!("{}.post_attention_layernorm", prefix), config.hidden_size)?;
+        let in_norm = load_norm(
+            weights,
+            &format!("{}.input_layernorm", prefix),
+            config.hidden_size,
+        )?;
+        let post_norm = load_norm(
+            weights,
+            &format!("{}.post_attention_layernorm", prefix),
+            config.hidden_size,
+        )?;
 
         layers.push(QwenLayerRecord {
-            attention, mlp, input_layernorm: in_norm, post_attention_layernorm: post_norm,
+            attention,
+            mlp,
+            input_layernorm: in_norm,
+            post_attention_layernorm: post_norm,
         });
     }
 
-    let rope = RotaryEmbeddingRecord { cos: ConstantRecord, sin: ConstantRecord };
+    let rope = RotaryEmbeddingRecord {
+        cos: ConstantRecord,
+        sin: ConstantRecord,
+    };
 
     Ok(QwenRecord {
         embed_tokens: embed,
@@ -864,9 +1012,20 @@ fn create_deepseek_record(
     weights: &mut HashMap<String, Tensor<WorkerBackend, 1>>,
     config: &DeepSeekConfig,
 ) -> Result<DeepSeekRecord<WorkerBackend>, WorkerError> {
-    let embed = load_embedding(weights, "model.embed_tokens", config.vocab_size, config.hidden_size)?;
+    let embed = load_embedding(
+        weights,
+        "model.embed_tokens",
+        config.vocab_size,
+        config.hidden_size,
+    )?;
     let norm = load_norm(weights, "model.norm", config.hidden_size)?;
-    let lm_head = load_linear(weights, "lm_head", config.hidden_size, config.vocab_size, false)?;
+    let lm_head = load_linear(
+        weights,
+        "lm_head",
+        config.hidden_size,
+        config.vocab_size,
+        false,
+    )?;
 
     let q_out = config.num_attention_heads * config.head_dim;
     let kv_out = config.num_kv_heads * config.head_dim;
@@ -875,35 +1034,84 @@ fn create_deepseek_record(
     for i in 0..config.num_layers {
         let prefix = format!("model.layers.{}", i);
 
-        let q = load_linear(weights, &format!("{}.self_attn.q_proj", prefix),
-            config.hidden_size, q_out, false)?;
-        let k = load_linear(weights, &format!("{}.self_attn.k_proj", prefix),
-            config.hidden_size, kv_out, false)?;
-        let v = load_linear(weights, &format!("{}.self_attn.v_proj", prefix),
-            config.hidden_size, kv_out, false)?;
-        let o = load_linear(weights, &format!("{}.self_attn.o_proj", prefix),
-            q_out, config.hidden_size, false)?;
+        let q = load_linear(
+            weights,
+            &format!("{}.self_attn.q_proj", prefix),
+            config.hidden_size,
+            q_out,
+            false,
+        )?;
+        let k = load_linear(
+            weights,
+            &format!("{}.self_attn.k_proj", prefix),
+            config.hidden_size,
+            kv_out,
+            false,
+        )?;
+        let v = load_linear(
+            weights,
+            &format!("{}.self_attn.v_proj", prefix),
+            config.hidden_size,
+            kv_out,
+            false,
+        )?;
+        let o = load_linear(
+            weights,
+            &format!("{}.self_attn.o_proj", prefix),
+            q_out,
+            config.hidden_size,
+            false,
+        )?;
 
         let attention = DeepSeekAttentionRecord {
-            q_proj: q, k_proj: k, v_proj: v, o_proj: o,
-            num_heads: ConstantRecord, num_kv_heads: ConstantRecord, head_dim: ConstantRecord,
+            q_proj: q,
+            k_proj: k,
+            v_proj: v,
+            o_proj: o,
+            num_heads: ConstantRecord,
+            num_kv_heads: ConstantRecord,
+            head_dim: ConstantRecord,
         };
 
         // Routing gate: [hidden_size → num_experts]
-        let gate_w = load_linear(weights, &format!("{}.mlp.gate", prefix),
-            config.hidden_size, config.num_experts, false)?;
+        let gate_w = load_linear(
+            weights,
+            &format!("{}.mlp.gate", prefix),
+            config.hidden_size,
+            config.num_experts,
+            false,
+        )?;
 
         // Load all routed experts
         let mut experts = Vec::with_capacity(config.num_experts);
         for j in 0..config.num_experts {
             let ep = format!("{}.mlp.experts.{}", prefix, j);
-            let eg = load_linear(weights, &format!("{}.gate_proj", ep),
-                config.hidden_size, config.intermediate_size, false)?;
-            let eu = load_linear(weights, &format!("{}.up_proj", ep),
-                config.hidden_size, config.intermediate_size, false)?;
-            let ed = load_linear(weights, &format!("{}.down_proj", ep),
-                config.intermediate_size, config.hidden_size, false)?;
-            experts.push(ExpertRecord { gate_proj: eg, up_proj: eu, down_proj: ed });
+            let eg = load_linear(
+                weights,
+                &format!("{}.gate_proj", ep),
+                config.hidden_size,
+                config.intermediate_size,
+                false,
+            )?;
+            let eu = load_linear(
+                weights,
+                &format!("{}.up_proj", ep),
+                config.hidden_size,
+                config.intermediate_size,
+                false,
+            )?;
+            let ed = load_linear(
+                weights,
+                &format!("{}.down_proj", ep),
+                config.intermediate_size,
+                config.hidden_size,
+                false,
+            )?;
+            experts.push(ExpertRecord {
+                gate_proj: eg,
+                up_proj: eu,
+                down_proj: ed,
+            });
         }
 
         let moe = DeepSeekMoERecord {
@@ -912,15 +1120,29 @@ fn create_deepseek_record(
             num_experts_per_tok: ConstantRecord,
         };
 
-        let in_norm = load_norm(weights, &format!("{}.input_layernorm", prefix), config.hidden_size)?;
-        let post_norm = load_norm(weights, &format!("{}.post_attention_layernorm", prefix), config.hidden_size)?;
+        let in_norm = load_norm(
+            weights,
+            &format!("{}.input_layernorm", prefix),
+            config.hidden_size,
+        )?;
+        let post_norm = load_norm(
+            weights,
+            &format!("{}.post_attention_layernorm", prefix),
+            config.hidden_size,
+        )?;
 
         layers.push(DeepSeekLayerRecord {
-            attention, moe, input_layernorm: in_norm, post_attention_layernorm: post_norm,
+            attention,
+            moe,
+            input_layernorm: in_norm,
+            post_attention_layernorm: post_norm,
         });
     }
 
-    let rope = RotaryEmbeddingRecord { cos: ConstantRecord, sin: ConstantRecord };
+    let rope = RotaryEmbeddingRecord {
+        cos: ConstantRecord,
+        sin: ConstantRecord,
+    };
 
     Ok(DeepSeekRecord {
         embed_tokens: embed,
@@ -939,44 +1161,116 @@ fn create_llama_record(
     weights: &mut HashMap<String, Tensor<WorkerBackend, 1>>,
     config: &LlamaConfig,
 ) -> Result<LlamaRecord<WorkerBackend>, WorkerError> {
-    let embed = load_embedding(weights, "model.embed_tokens", config.vocab_size, config.hidden_size)?;
+    let embed = load_embedding(
+        weights,
+        "model.embed_tokens",
+        config.vocab_size,
+        config.hidden_size,
+    )?;
     let norm = load_norm(weights, "model.norm", config.hidden_size)?;
-    let lm_head = load_linear(weights, "lm_head", config.hidden_size, config.vocab_size, false)?;
-    
+    let lm_head = load_linear(
+        weights,
+        "lm_head",
+        config.hidden_size,
+        config.vocab_size,
+        false,
+    )?;
+
     let mut layers = Vec::new();
     for i in 0..config.num_layers {
         let prefix = format!("model.layers.{}", i);
-        
-        let q = load_linear(weights, &format!("{}.self_attn.q_proj", prefix), config.hidden_size, config.num_attention_heads * config.head_dim, false)?;
-        let k = load_linear(weights, &format!("{}.self_attn.k_proj", prefix), config.hidden_size, config.num_kv_heads * config.head_dim, false)?;
-        let v = load_linear(weights, &format!("{}.self_attn.v_proj", prefix), config.hidden_size, config.num_kv_heads * config.head_dim, false)?;
-        let o = load_linear(weights, &format!("{}.self_attn.o_proj", prefix), config.num_attention_heads * config.head_dim, config.hidden_size, false)?;
-        
+
+        let q = load_linear(
+            weights,
+            &format!("{}.self_attn.q_proj", prefix),
+            config.hidden_size,
+            config.num_attention_heads * config.head_dim,
+            false,
+        )?;
+        let k = load_linear(
+            weights,
+            &format!("{}.self_attn.k_proj", prefix),
+            config.hidden_size,
+            config.num_kv_heads * config.head_dim,
+            false,
+        )?;
+        let v = load_linear(
+            weights,
+            &format!("{}.self_attn.v_proj", prefix),
+            config.hidden_size,
+            config.num_kv_heads * config.head_dim,
+            false,
+        )?;
+        let o = load_linear(
+            weights,
+            &format!("{}.self_attn.o_proj", prefix),
+            config.num_attention_heads * config.head_dim,
+            config.hidden_size,
+            false,
+        )?;
+
         // LlamaAttentionRecord
         // Attention has q,k,v,o
         let attention = LlamaAttentionRecord {
-            q_proj: q, k_proj: k, v_proj: v, o_proj: o,
-            num_heads: ConstantRecord, num_kv_heads: ConstantRecord, head_dim: ConstantRecord,
+            q_proj: q,
+            k_proj: k,
+            v_proj: v,
+            o_proj: o,
+            num_heads: ConstantRecord,
+            num_kv_heads: ConstantRecord,
+            head_dim: ConstantRecord,
         };
-        
-        let gate = load_linear(weights, &format!("{}.mlp.gate_proj", prefix), config.hidden_size, config.intermediate_size, false)?;
-        let up = load_linear(weights, &format!("{}.mlp.up_proj", prefix), config.hidden_size, config.intermediate_size, false)?;
-        let down = load_linear(weights, &format!("{}.mlp.down_proj", prefix), config.intermediate_size, config.hidden_size, false)?;
-        
+
+        let gate = load_linear(
+            weights,
+            &format!("{}.mlp.gate_proj", prefix),
+            config.hidden_size,
+            config.intermediate_size,
+            false,
+        )?;
+        let up = load_linear(
+            weights,
+            &format!("{}.mlp.up_proj", prefix),
+            config.hidden_size,
+            config.intermediate_size,
+            false,
+        )?;
+        let down = load_linear(
+            weights,
+            &format!("{}.mlp.down_proj", prefix),
+            config.intermediate_size,
+            config.hidden_size,
+            false,
+        )?;
+
         let mlp = LlamaMLPRecord {
-            gate_proj: gate, up_proj: up, down_proj: down,
+            gate_proj: gate,
+            up_proj: up,
+            down_proj: down,
         };
-        
-        let in_norm = load_norm(weights, &format!("{}.input_layernorm", prefix), config.hidden_size)?;
-        let post_norm = load_norm(weights, &format!("{}.post_attention_layernorm", prefix), config.hidden_size)?;
-        
+
+        let in_norm = load_norm(
+            weights,
+            &format!("{}.input_layernorm", prefix),
+            config.hidden_size,
+        )?;
+        let post_norm = load_norm(
+            weights,
+            &format!("{}.post_attention_layernorm", prefix),
+            config.hidden_size,
+        )?;
+
         layers.push(LlamaLayerRecord {
-            attention, mlp, input_layernorm: in_norm, post_attention_layernorm: post_norm,
+            attention,
+            mlp,
+            input_layernorm: in_norm,
+            post_attention_layernorm: post_norm,
         });
     }
 
     let rope = RotaryEmbeddingRecord {
-        cos: ConstantRecord, sin: ConstantRecord,
+        cos: ConstantRecord,
+        sin: ConstantRecord,
     };
 
     Ok(LlamaRecord {

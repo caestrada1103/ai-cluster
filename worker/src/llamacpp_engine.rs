@@ -134,14 +134,13 @@ impl LlamaCppEngine {
             n_gpu_layers as u32
         };
         let model_params = LlamaModelParams::default().with_n_gpu_layers(offload);
-        let model = LlamaModel::load_from_file(&backend, gguf_path, &model_params).map_err(
-            |e| {
+        let model =
+            LlamaModel::load_from_file(&backend, gguf_path, &model_params).map_err(|e| {
                 WorkerError::ModelLoad(format!(
                     "llama.cpp failed to load {}: {e}",
                     gguf_path.display()
                 ))
-            },
-        )?;
+            })?;
         info!(
             "llama.cpp model loaded: {} (trained ctx {}, eos token {:?})",
             gguf_path.display(),

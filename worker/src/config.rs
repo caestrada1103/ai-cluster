@@ -85,10 +85,7 @@ impl WorkerConfig {
         let path = PathBuf::from(path);
 
         if !path.exists() {
-            tracing::warn!(
-                "Config file {} not found, using defaults",
-                path.display()
-            );
+            tracing::warn!("Config file {} not found, using defaults", path.display());
             return Ok(Self::default());
         }
 
@@ -110,7 +107,6 @@ impl WorkerConfig {
 
         Ok(config)
     }
-
 }
 
 #[cfg(test)]

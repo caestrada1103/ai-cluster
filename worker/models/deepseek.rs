@@ -5,19 +5,19 @@
 
 #![allow(dead_code)]
 
-use burn::{
-    module::{Module, Ignored},
-    nn::{Linear, LinearConfig, Embedding, EmbeddingConfig},
-    tensor::{backend::Backend, Tensor},
-};
+use super::common::{repeat_kv, swiglu, RMSNorm, RotaryEmbedding};
+use super::llama::{KvCache, KvEntry};
 use super::ModelConfig;
-use super::common::{RMSNorm, RotaryEmbedding, swiglu, repeat_kv};
-use super::llama::{KvEntry, KvCache};
 use super::TextGeneration;
 use crate::error::WorkerError;
-use tokenizers::Tokenizer;
 use async_stream::stream;
+use burn::{
+    module::{Ignored, Module},
+    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig},
+    tensor::{backend::Backend, Tensor},
+};
 use std::path::Path;
+use tokenizers::Tokenizer;
 
 // ---------------------------------------------------------------------------
 // Expert Activation
@@ -48,11 +48,7 @@ pub struct Expert<B: Backend> {
 
 impl<B: Backend> Expert<B> {
     /// Create a new expert
-    pub fn new(
-        hidden_size: usize,
-        intermediate_size: usize,
-        device: &B::Device,
-    ) -> Self {
+    pub fn new(hidden_size: usize, intermediate_size: usize, device: &B::Device) -> Self {
         Self {
             gate_proj: LinearConfig::new(hidden_size, intermediate_size)
                 .with_bias(false)
@@ -105,7 +101,9 @@ impl<B: Backend> DeepSeekMoE<B> {
 
         Self {
             experts,
-            gate: LinearConfig::new(hidden_size, num_experts).with_bias(false).init(device),
+            gate: LinearConfig::new(hidden_size, num_experts)
+                .with_bias(false)
+                .init(device),
             num_experts_per_tok,
         }
     }
@@ -209,10 +207,18 @@ impl<B: Backend> DeepSeekAttention<B> {
         let kv_out = config.num_kv_heads * config.head_dim;
 
         Self {
-            q_proj: LinearConfig::new(config.hidden_size, q_out).with_bias(false).init(device),
-            k_proj: LinearConfig::new(config.hidden_size, kv_out).with_bias(false).init(device),
-            v_proj: LinearConfig::new(config.hidden_size, kv_out).with_bias(false).init(device),
-            o_proj: LinearConfig::new(q_out, config.hidden_size).with_bias(false).init(device),
+            q_proj: LinearConfig::new(config.hidden_size, q_out)
+                .with_bias(false)
+                .init(device),
+            k_proj: LinearConfig::new(config.hidden_size, kv_out)
+                .with_bias(false)
+                .init(device),
+            v_proj: LinearConfig::new(config.hidden_size, kv_out)
+                .with_bias(false)
+                .init(device),
+            o_proj: LinearConfig::new(q_out, config.hidden_size)
+                .with_bias(false)
+                .init(device),
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
@@ -229,13 +235,19 @@ impl<B: Backend> DeepSeekAttention<B> {
     ) -> (Tensor<B, 3>, KvEntry<B>) {
         let [batch, seq_len, _] = x.dims();
 
-        let q = self.q_proj.forward(x.clone())
+        let q = self
+            .q_proj
+            .forward(x.clone())
             .reshape([batch, seq_len, self.num_heads, self.head_dim])
             .swap_dims(1, 2);
-        let k = self.k_proj.forward(x.clone())
+        let k = self
+            .k_proj
+            .forward(x.clone())
             .reshape([batch, seq_len, self.num_kv_heads, self.head_dim])
             .swap_dims(1, 2);
-        let v = self.v_proj.forward(x)
+        let v = self
+            .v_proj
+            .forward(x)
             .reshape([batch, seq_len, self.num_kv_heads, self.head_dim])
             .swap_dims(1, 2);
 
@@ -253,9 +265,11 @@ impl<B: Backend> DeepSeekAttention<B> {
             None => scores,
         };
         let attn = burn::tensor::activation::softmax(scores, 3);
-        let output = attn.matmul(v_full)
-            .swap_dims(1, 2)
-            .reshape([batch, seq_len, self.num_heads * self.head_dim]);
+        let output = attn.matmul(v_full).swap_dims(1, 2).reshape([
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ]);
 
         (self.o_proj.forward(output), kv_entry)
     }
@@ -263,18 +277,24 @@ impl<B: Backend> DeepSeekAttention<B> {
     /// Single-token decode: appends new K/V to cache and attends over full cached sequence.
     pub fn forward_decode(
         &self,
-        hidden: Tensor<B, 3>,          // [1, 1, hidden]
+        hidden: Tensor<B, 3>, // [1, 1, hidden]
         rope: &RotaryEmbedding<B>,
         start_pos: usize,
         kv: &mut KvEntry<B>,
     ) -> Tensor<B, 3> {
-        let q = self.q_proj.forward(hidden.clone())
+        let q = self
+            .q_proj
+            .forward(hidden.clone())
             .reshape([1, 1, self.num_heads, self.head_dim])
             .swap_dims(1, 2);
-        let new_k = self.k_proj.forward(hidden.clone())
+        let new_k = self
+            .k_proj
+            .forward(hidden.clone())
             .reshape([1, 1, self.num_kv_heads, self.head_dim])
             .swap_dims(1, 2);
-        let new_v = self.v_proj.forward(hidden)
+        let new_v = self
+            .v_proj
+            .forward(hidden)
             .reshape([1, 1, self.num_kv_heads, self.head_dim])
             .swap_dims(1, 2);
 
@@ -293,11 +313,12 @@ impl<B: Backend> DeepSeekAttention<B> {
             q.matmul(k_full.swap_dims(2, 3)).div_scalar(scale),
             3,
         );
-        self.o_proj.forward(
-            attn.matmul(v_full)
-                .swap_dims(1, 2)
-                .reshape([1, 1, self.num_heads * self.head_dim]),
-        )
+        self.o_proj
+            .forward(attn.matmul(v_full).swap_dims(1, 2).reshape([
+                1,
+                1,
+                self.num_heads * self.head_dim,
+            ]))
     }
 }
 
@@ -326,7 +347,11 @@ impl<B: Backend> DeepSeekLayer<B> {
                 device,
             ),
             input_layernorm: RMSNorm::new(config.hidden_size, config.rms_norm_eps as f64, device),
-            post_attention_layernorm: RMSNorm::new(config.hidden_size, config.rms_norm_eps as f64, device),
+            post_attention_layernorm: RMSNorm::new(
+                config.hidden_size,
+                config.rms_norm_eps as f64,
+                device,
+            ),
         }
     }
 
@@ -340,7 +365,9 @@ impl<B: Backend> DeepSeekLayer<B> {
     ) -> (Tensor<B, 3>, KvEntry<B>) {
         let residual = x.clone();
         let h = self.input_layernorm.forward(x);
-        let (attn_out, kv) = self.attention.forward_prefill(h, rope, start_pos, causal_bias);
+        let (attn_out, kv) = self
+            .attention
+            .forward_prefill(h, rope, start_pos, causal_bias);
         let x = attn_out + residual;
 
         let residual = x.clone();
@@ -440,18 +467,28 @@ impl<B: Backend> DeepSeek<B> {
         let num_layers = config.num_layers;
 
         let embed_tokens = EmbeddingConfig::new(config.vocab_size, hidden_size).init(device);
-        let layers = (0..num_layers).map(|_| DeepSeekLayer::new(&config, device)).collect();
+        let layers = (0..num_layers)
+            .map(|_| DeepSeekLayer::new(&config, device))
+            .collect();
         let norm = RMSNorm::new(hidden_size, config.rms_norm_eps as f64, device);
         let lm_head = LinearConfig::new(hidden_size, config.vocab_size)
             .with_bias(false)
             .init(device);
-        let rope = RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_theta, device);
+        let rope = RotaryEmbedding::new(
+            config.head_dim,
+            config.max_seq_len,
+            config.rope_theta,
+            device,
+        );
 
         // Load tokenizer from the model directory — no cross-model network fallback:
         // a mismatched tokenizer silently produces garbage.
         let tok_file = tokenizer_path.join("tokenizer.json");
         let tokenizer = Tokenizer::from_file(&tok_file).map_err(|e| {
-            WorkerError::ModelLoad(format!("Failed to load DeepSeek tokenizer {:?}: {}", tok_file, e))
+            WorkerError::ModelLoad(format!(
+                "Failed to load DeepSeek tokenizer {:?}: {}",
+                tok_file, e
+            ))
         })?;
         let eos_token_ids = super::common::load_eos_ids(tokenizer_path);
 
@@ -500,7 +537,12 @@ impl<B: Backend> DeepSeek<B> {
     }
 
     /// Single-token decode step using the KV cache.
-    pub fn decode_step(&self, token_id: u32, start_pos: usize, kv_cache: &mut KvCache<B>) -> Vec<f32> {
+    pub fn decode_step(
+        &self,
+        token_id: u32,
+        start_pos: usize,
+        kv_cache: &mut KvCache<B>,
+    ) -> Vec<f32> {
         let device = &*self.context_device;
         let vocab = self.config.vocab_size;
 
@@ -513,10 +555,14 @@ impl<B: Backend> DeepSeek<B> {
 
         let x = self.norm.forward(x);
         let logits = self.lm_head.forward(x);
-        logits.reshape([vocab]).into_data().to_vec().unwrap_or_else(|e| {
-            tracing::error!("deepseek decode_step: failed to pull logits from GPU: {e:?}");
-            vec![0.0; vocab]
-        })
+        logits
+            .reshape([vocab])
+            .into_data()
+            .to_vec()
+            .unwrap_or_else(|e| {
+                tracing::error!("deepseek decode_step: failed to pull logits from GPU: {e:?}");
+                vec![0.0; vocab]
+            })
     }
 
     /// Tokenize a prompt, handling DeepSeek special tokens.
@@ -542,8 +588,12 @@ impl<B: Backend> DeepSeek<B> {
             if min_idx > current_pos {
                 let text_segment = &prompt[current_pos..min_idx];
                 let add_special = current_pos == 0;
-                let encoding = self.tokenizer.encode(text_segment, add_special)
-                    .map_err(|e| WorkerError::Internal(format!("DeepSeek tokenizer error: {}", e)))?;
+                let encoding = self
+                    .tokenizer
+                    .encode(text_segment, add_special)
+                    .map_err(|e| {
+                        WorkerError::Internal(format!("DeepSeek tokenizer error: {}", e))
+                    })?;
                 tokens.extend_from_slice(encoding.get_ids());
             }
 
@@ -551,8 +601,9 @@ impl<B: Backend> DeepSeek<B> {
                 if let Some(id) = self.tokenizer.token_to_id(st) {
                     tokens.push(id);
                 } else {
-                    let encoding = self.tokenizer.encode(st, false)
-                        .map_err(|e| WorkerError::Internal(format!("DeepSeek tokenizer error (special): {}", e)))?;
+                    let encoding = self.tokenizer.encode(st, false).map_err(|e| {
+                        WorkerError::Internal(format!("DeepSeek tokenizer error (special): {}", e))
+                    })?;
                     tokens.extend_from_slice(encoding.get_ids());
                 }
                 current_pos = min_idx + st.len();
@@ -610,8 +661,8 @@ impl<B: Backend> TextGeneration for DeepSeek<B> {
             // ── PREFILL ──────────────────────────────────────────────────────
             let input_f32: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
             let device: &<B as burn::tensor::backend::Backend>::Device = &model.context_device;
-            let input = Tensor::<B, 1>::from_floats(input_f32.as_slice(), device)
-                .reshape([1, prompt_len]);
+            let input =
+                Tensor::<B, 1>::from_floats(input_f32.as_slice(), device).reshape([1, prompt_len]);
             let (logits_vec, mut kv_cache) = model.prefill(input);
 
             use rand::SeedableRng;
@@ -622,7 +673,9 @@ impl<B: Backend> TextGeneration for DeepSeek<B> {
             let mut sample = |logits: &[f32]| -> u32 {
                 if temperature < 0.01 {
                     // Deterministic argmax for temperature ~ 0
-                    logits.iter().enumerate()
+                    logits
+                        .iter()
+                        .enumerate()
                         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                         .map(|(i, _)| i as u32)
                         .unwrap_or(0)
@@ -632,15 +685,23 @@ impl<B: Backend> TextGeneration for DeepSeek<B> {
                 }
             };
 
-            let delta_text = |tok_ids: &[u32], prev_len: &mut usize, tok: &Tokenizer| -> Result<String, WorkerError> {
-                let text = tok.decode(tok_ids, true)
+            let delta_text = |tok_ids: &[u32],
+                              prev_len: &mut usize,
+                              tok: &Tokenizer|
+             -> Result<String, WorkerError> {
+                let text = tok
+                    .decode(tok_ids, true)
                     .map_err(|e| WorkerError::Internal(format!("Decode error: {}", e)))?;
                 let delta = if text.len() > *prev_len {
                     let mut start = *prev_len;
                     while start < text.len() && !text.is_char_boundary(start) {
                         start += 1;
                     }
-                    if start < text.len() { text[start..].to_string() } else { String::new() }
+                    if start < text.len() {
+                        text[start..].to_string()
+                    } else {
+                        String::new()
+                    }
                 } else {
                     String::new()
                 };
@@ -655,28 +716,42 @@ impl<B: Backend> TextGeneration for DeepSeek<B> {
             let mut all_tokens = tokens;
             all_tokens.push(first_tok);
             let mut prev_text_len = 0usize;
-            if tx.blocking_send(delta_text(
-                &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
-            )).is_err() {
+            if tx
+                .blocking_send(delta_text(
+                    &all_tokens[prompt_len..],
+                    &mut prev_text_len,
+                    &model.tokenizer,
+                ))
+                .is_err()
+            {
                 // Receiver dropped (client disconnected) — stop burning GPU.
                 return;
             }
-            if eos_ids.contains(&first_tok) { return; }
+            if eos_ids.contains(&first_tok) {
+                return;
+            }
 
             // ── DECODE LOOP ──────────────────────────────────────────────────
             for _step in 1..max_tokens {
-                let cur_tok  = *all_tokens.last().unwrap();
-                let start    = all_tokens.len() - 1;
-                let logits   = model.decode_step(cur_tok, start, &mut kv_cache);
+                let cur_tok = *all_tokens.last().unwrap();
+                let start = all_tokens.len() - 1;
+                let logits = model.decode_step(cur_tok, start, &mut kv_cache);
                 let next_tok = sample(&logits);
                 all_tokens.push(next_tok);
-                if tx.blocking_send(delta_text(
-                    &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
-                )).is_err() {
+                if tx
+                    .blocking_send(delta_text(
+                        &all_tokens[prompt_len..],
+                        &mut prev_text_len,
+                        &model.tokenizer,
+                    ))
+                    .is_err()
+                {
                     // Receiver dropped (client disconnected) — stop burning GPU.
                     return;
                 }
-                if eos_ids.contains(&next_tok) { break; }
+                if eos_ids.contains(&next_tok) {
+                    break;
+                }
             }
         });
 
@@ -688,4 +763,3 @@ impl<B: Backend> TextGeneration for DeepSeek<B> {
         Ok(Box::pin(stream))
     }
 }
-

@@ -4,7 +4,6 @@
 //! modules.  Variants are derived from every `WorkerError::*` usage site
 //! found in the codebase.
 
-
 use thiserror::Error;
 
 /// Central error type for the AI worker.
@@ -93,17 +92,10 @@ impl From<WorkerError> for tonic::Status {
     fn from(err: WorkerError) -> Self {
         match &err {
             WorkerError::ModelNotFound(_) => tonic::Status::not_found(err.to_string()),
-            WorkerError::OutOfMemory { .. } => {
-                tonic::Status::resource_exhausted(err.to_string())
-            }
-            WorkerError::Configuration(_) => {
-                tonic::Status::invalid_argument(err.to_string())
-            }
+            WorkerError::OutOfMemory { .. } => tonic::Status::resource_exhausted(err.to_string()),
+            WorkerError::Configuration(_) => tonic::Status::invalid_argument(err.to_string()),
             WorkerError::InvalidRequest(_) => tonic::Status::invalid_argument(err.to_string()),
             _ => tonic::Status::internal(err.to_string()),
         }
     }
 }
-
-
-

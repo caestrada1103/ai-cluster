@@ -5,17 +5,17 @@
 
 #![allow(dead_code)]
 
+use super::common::{repeat_kv, swiglu, RMSNorm, RotaryEmbedding};
+use super::TextGeneration;
+use crate::error::WorkerError;
+use async_stream::stream;
 use burn::{
-    module::{Module, Ignored},
-    nn::{Linear, LinearConfig, Embedding, EmbeddingConfig},
+    module::{Ignored, Module},
+    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig},
     tensor::{backend::Backend, Tensor},
 };
-use super::TextGeneration;
-use super::common::{RMSNorm, RotaryEmbedding, swiglu, repeat_kv};
-use crate::error::WorkerError;
-use tokenizers::Tokenizer;
-use async_stream::stream;
 use std::path::Path;
+use tokenizers::Tokenizer;
 
 /// Per-layer KV cache entry: (keys, values) shaped [1, n_kv_heads, seq_so_far, head_dim]
 pub type KvEntry<B> = (Tensor<B, 4>, Tensor<B, 4>);
@@ -54,10 +54,18 @@ impl<B: Backend> LlamaAttention<B> {
         let kv_out = num_kv_heads * head_dim;
 
         Self {
-            q_proj: LinearConfig::new(hidden_size, q_out).with_bias(false).init(device),
-            k_proj: LinearConfig::new(hidden_size, kv_out).with_bias(false).init(device),
-            v_proj: LinearConfig::new(hidden_size, kv_out).with_bias(false).init(device),
-            o_proj: LinearConfig::new(q_out, hidden_size).with_bias(false).init(device),
+            q_proj: LinearConfig::new(hidden_size, q_out)
+                .with_bias(false)
+                .init(device),
+            k_proj: LinearConfig::new(hidden_size, kv_out)
+                .with_bias(false)
+                .init(device),
+            v_proj: LinearConfig::new(hidden_size, kv_out)
+                .with_bias(false)
+                .init(device),
+            o_proj: LinearConfig::new(q_out, hidden_size)
+                .with_bias(false)
+                .init(device),
             num_heads,
             num_kv_heads,
             head_dim,
@@ -78,13 +86,19 @@ impl<B: Backend> LlamaAttention<B> {
     ) -> Tensor<B, 3> {
         let [batch, seq_len, _] = hidden.dims();
 
-        let q = self.q_proj.forward(hidden.clone())
+        let q = self
+            .q_proj
+            .forward(hidden.clone())
             .reshape([batch, seq_len, self.num_heads, self.head_dim])
             .swap_dims(1, 2);
-        let k = self.k_proj.forward(hidden.clone())
+        let k = self
+            .k_proj
+            .forward(hidden.clone())
             .reshape([batch, seq_len, self.num_kv_heads, self.head_dim])
             .swap_dims(1, 2);
-        let v = self.v_proj.forward(hidden)
+        let v = self
+            .v_proj
+            .forward(hidden)
             .reshape([batch, seq_len, self.num_kv_heads, self.head_dim])
             .swap_dims(1, 2);
 
@@ -105,9 +119,11 @@ impl<B: Backend> LlamaAttention<B> {
         };
 
         let attn = burn::tensor::activation::softmax(attn_scores, 3);
-        let output = attn.matmul(v)
-            .swap_dims(1, 2)
-            .reshape([batch, seq_len, self.num_heads * self.head_dim]);
+        let output = attn.matmul(v).swap_dims(1, 2).reshape([
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ]);
 
         self.o_proj.forward(output)
     }
@@ -119,18 +135,24 @@ impl<B: Backend> LlamaAttention<B> {
     /// cached positions by construction.
     pub fn forward_decode(
         &self,
-        hidden: Tensor<B, 3>,          // [1, 1, hidden]
+        hidden: Tensor<B, 3>, // [1, 1, hidden]
         rope: &RotaryEmbedding<B>,
-        start_pos: usize,              // absolute position of the new token in the sequence
+        start_pos: usize, // absolute position of the new token in the sequence
         kv: &mut KvEntry<B>,
     ) -> Tensor<B, 3> {
-        let q = self.q_proj.forward(hidden.clone())
+        let q = self
+            .q_proj
+            .forward(hidden.clone())
             .reshape([1, 1, self.num_heads, self.head_dim])
-            .swap_dims(1, 2);                           // [1, n_heads, 1, head_dim]
-        let new_k = self.k_proj.forward(hidden.clone())
+            .swap_dims(1, 2); // [1, n_heads, 1, head_dim]
+        let new_k = self
+            .k_proj
+            .forward(hidden.clone())
             .reshape([1, 1, self.num_kv_heads, self.head_dim])
             .swap_dims(1, 2);
-        let new_v = self.v_proj.forward(hidden)
+        let new_v = self
+            .v_proj
+            .forward(hidden)
             .reshape([1, 1, self.num_kv_heads, self.head_dim])
             .swap_dims(1, 2);
 
@@ -152,11 +174,12 @@ impl<B: Backend> LlamaAttention<B> {
             q.matmul(k_full.swap_dims(2, 3)).div_scalar(scale),
             3,
         );
-        self.o_proj.forward(
-            attn.matmul(v_full)
-                .swap_dims(1, 2)
-                .reshape([1, 1, self.num_heads * self.head_dim]),
-        )
+        self.o_proj
+            .forward(attn.matmul(v_full).swap_dims(1, 2).reshape([
+                1,
+                1,
+                self.num_heads * self.head_dim,
+            ]))
     }
 }
 
@@ -173,15 +196,17 @@ pub struct LlamaMLP<B: Backend> {
 }
 
 impl<B: Backend> LlamaMLP<B> {
-    pub fn new(
-        hidden_size: usize,
-        intermediate_size: usize,
-        device: &B::Device,
-    ) -> Self {
+    pub fn new(hidden_size: usize, intermediate_size: usize, device: &B::Device) -> Self {
         Self {
-            gate_proj: LinearConfig::new(hidden_size, intermediate_size).with_bias(false).init(device),
-            up_proj: LinearConfig::new(hidden_size, intermediate_size).with_bias(false).init(device),
-            down_proj: LinearConfig::new(intermediate_size, hidden_size).with_bias(false).init(device),
+            gate_proj: LinearConfig::new(hidden_size, intermediate_size)
+                .with_bias(false)
+                .init(device),
+            up_proj: LinearConfig::new(hidden_size, intermediate_size)
+                .with_bias(false)
+                .init(device),
+            down_proj: LinearConfig::new(intermediate_size, hidden_size)
+                .with_bias(false)
+                .init(device),
         }
     }
 
@@ -244,7 +269,7 @@ impl<B: Backend> LlamaLayer<B> {
     /// Decode-step forward: processes a single token using the KV cache.
     pub fn forward_decode(
         &self,
-        x: Tensor<B, 3>,               // [1, 1, hidden]
+        x: Tensor<B, 3>, // [1, 1, hidden]
         rope: &RotaryEmbedding<B>,
         start_pos: usize,
         kv: &mut KvEntry<B>,
@@ -274,7 +299,7 @@ pub struct Llama<B: Backend> {
     pub lm_head: Linear<B>,
     pub config: Ignored<LlamaConfig>,
     pub rope: RotaryEmbedding<B>,
-    
+
     #[module(ignore)]
     pub tokenizer: Ignored<Tokenizer>,
     /// EOS token ids read from the checkpoint's (generation_)config.json.
@@ -304,17 +329,23 @@ pub struct LlamaConfig {
 
 impl<B: Backend> Llama<B> {
     /// Create a new Llama model
-    pub fn new(config: &LlamaConfig, device: &B::Device, tokenizer_path: &Path) -> Result<Self, WorkerError> {
+    pub fn new(
+        config: &LlamaConfig,
+        device: &B::Device,
+        tokenizer_path: &Path,
+    ) -> Result<Self, WorkerError> {
         let layers = (0..config.num_layers)
-            .map(|_| LlamaLayer::new(
-                config.hidden_size,
-                config.num_attention_heads,
-                config.num_kv_heads,
-                config.head_dim,
-                config.intermediate_size,
-                config.rms_norm_eps,
-                device,
-            ))
+            .map(|_| {
+                LlamaLayer::new(
+                    config.hidden_size,
+                    config.num_attention_heads,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    config.intermediate_size,
+                    config.rms_norm_eps,
+                    device,
+                )
+            })
             .collect();
 
         let rope = RotaryEmbedding::new(
@@ -333,8 +364,7 @@ impl<B: Backend> Llama<B> {
         let eos_token_ids = super::common::load_eos_ids(tokenizer_path);
 
         Ok(Self {
-            embed_tokens: EmbeddingConfig::new(config.vocab_size, config.hidden_size)
-                .init(device),
+            embed_tokens: EmbeddingConfig::new(config.vocab_size, config.hidden_size).init(device),
             layers,
             norm: RMSNorm::new(config.hidden_size, config.rms_norm_eps as f64, device),
             lm_head: LinearConfig::new(config.hidden_size, config.vocab_size)
@@ -356,11 +386,11 @@ impl<B: Backend> Llama<B> {
     pub fn prefill(&self, input_ids: Tensor<B, 2>) -> (Vec<f32>, KvCache<B>) {
         let [_, seq_len] = input_ids.dims();
         let device = input_ids.device();
-        let config   = &*self.config;
-        let n_heads  = config.num_attention_heads;
-        let n_kv     = config.num_kv_heads;
+        let config = &*self.config;
+        let n_heads = config.num_attention_heads;
+        let n_kv = config.num_kv_heads;
         let head_dim = config.head_dim;
-        let n_rep    = (n_heads / n_kv).max(1);
+        let n_rep = (n_heads / n_kv).max(1);
 
         // Build additive causal bias once — [1, 1, seq, seq]; shared helper.
         let causal_bias: Option<Tensor<B, 4>> =
@@ -374,13 +404,22 @@ impl<B: Backend> Llama<B> {
             let [b, s, _] = h.dims();
 
             // Project Q, K, V
-            let q = layer.attention.q_proj.forward(h.clone())
+            let q = layer
+                .attention
+                .q_proj
+                .forward(h.clone())
                 .reshape([b, s, n_heads, head_dim])
-                .swap_dims(1, 2);                       // [b, n_heads, s, head_dim]
-            let k = layer.attention.k_proj.forward(h.clone())
+                .swap_dims(1, 2); // [b, n_heads, s, head_dim]
+            let k = layer
+                .attention
+                .k_proj
+                .forward(h.clone())
                 .reshape([b, s, n_kv, head_dim])
                 .swap_dims(1, 2);
-            let v = layer.attention.v_proj.forward(h)
+            let v = layer
+                .attention
+                .v_proj
+                .forward(h)
                 .reshape([b, s, n_kv, head_dim])
                 .swap_dims(1, 2);
 
@@ -402,7 +441,8 @@ impl<B: Backend> Llama<B> {
                 None => scores,
             };
             let attn = burn::tensor::activation::softmax(scores, 3);
-            let ctx = attn.matmul(v_full)
+            let ctx = attn
+                .matmul(v_full)
                 .swap_dims(1, 2)
                 .reshape([b, s, n_heads * head_dim]);
             let attn_out = layer.attention.o_proj.forward(ctx);
@@ -415,7 +455,7 @@ impl<B: Backend> Llama<B> {
 
         // Final norm + lm_head
         let x = self.norm.forward(x);
-        let logits = self.lm_head.forward(x);           // [1, seq, vocab]
+        let logits = self.lm_head.forward(x); // [1, seq, vocab]
         let [_, s, vocab] = logits.dims();
         let last = logits.slice([0..1, s - 1..s, 0..vocab]).reshape([vocab]);
         let logits_vec: Vec<f32> = last.into_data().to_vec().unwrap_or_else(|e| {
@@ -439,20 +479,23 @@ impl<B: Backend> Llama<B> {
         let device = &*self.device;
         let vocab = self.config.vocab_size;
 
-        let input = Tensor::<B, 1>::from_floats([token_id as f32], device)
-            .reshape([1, 1]);                           // [1, 1]
+        let input = Tensor::<B, 1>::from_floats([token_id as f32], device).reshape([1, 1]); // [1, 1]
         let mut x = self.embed_tokens.forward(input.int()); // [1, 1, hidden]
 
         for (layer, kv) in self.layers.iter().zip(kv_cache.iter_mut()) {
             x = layer.forward_decode(x, &self.rope, start_pos, kv);
         }
 
-        let x = self.norm.forward(x);                  // [1, 1, hidden]
-        let logits = self.lm_head.forward(x);          // [1, 1, vocab]
-        logits.reshape([vocab]).into_data().to_vec().unwrap_or_else(|e| {
-            tracing::error!("decode_step: failed to pull logits from GPU: {e:?}");
-            vec![0.0; vocab]
-        })
+        let x = self.norm.forward(x); // [1, 1, hidden]
+        let logits = self.lm_head.forward(x); // [1, 1, vocab]
+        logits
+            .reshape([vocab])
+            .into_data()
+            .to_vec()
+            .unwrap_or_else(|e| {
+                tracing::error!("decode_step: failed to pull logits from GPU: {e:?}");
+                vec![0.0; vocab]
+            })
     }
 
     /// Tokenize a prompt, correctly handling known special tokens.
@@ -482,7 +525,9 @@ impl<B: Backend> Llama<B> {
             if min_idx > current_pos {
                 let text_segment = &prompt[current_pos..min_idx];
                 let add_special = current_pos == 0;
-                let encoding = self.tokenizer.encode(text_segment, add_special)
+                let encoding = self
+                    .tokenizer
+                    .encode(text_segment, add_special)
                     .map_err(|e| WorkerError::Internal(format!("Tokenizer error: {}", e)))?;
                 tokens.extend_from_slice(encoding.get_ids());
             }
@@ -491,8 +536,9 @@ impl<B: Backend> Llama<B> {
                 if let Some(id) = self.tokenizer.token_to_id(st) {
                     tokens.push(id);
                 } else {
-                    let encoding = self.tokenizer.encode(*st, false)
-                        .map_err(|e| WorkerError::Internal(format!("Tokenizer error (special): {}", e)))?;
+                    let encoding = self.tokenizer.encode(*st, false).map_err(|e| {
+                        WorkerError::Internal(format!("Tokenizer error (special): {}", e))
+                    })?;
                     tokens.extend_from_slice(encoding.get_ids());
                 }
                 current_pos = min_idx + st.len();
@@ -543,8 +589,8 @@ impl<B: Backend> TextGeneration for Llama<B> {
             // ── PREFILL ──────────────────────────────────────────────────────────────
             let input_f32: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
             let device: &<B as burn::tensor::backend::Backend>::Device = &model.device;
-            let input = Tensor::<B, 1>::from_floats(input_f32.as_slice(), device)
-                .reshape([1, prompt_len]);
+            let input =
+                Tensor::<B, 1>::from_floats(input_f32.as_slice(), device).reshape([1, prompt_len]);
             let (logits_vec, mut kv_cache) = model.prefill(input);
 
             // Inline helper: sample a token from a logit vector
@@ -556,7 +602,9 @@ impl<B: Backend> TextGeneration for Llama<B> {
             let mut sample = |logits: &[f32]| -> u32 {
                 if temperature < 0.01 {
                     // Deterministic argmax for temperature ~ 0
-                    logits.iter().enumerate()
+                    logits
+                        .iter()
+                        .enumerate()
                         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                         .map(|(i, _)| i as u32)
                         .unwrap_or(0)
@@ -567,7 +615,10 @@ impl<B: Backend> TextGeneration for Llama<B> {
             };
 
             // Inline helper: compute delta text from newly generated token ids
-            let delta_text = |tok_ids: &[u32], prev_len: &mut usize, tokenizer: &Tokenizer| -> Result<String, WorkerError> {
+            let delta_text = |tok_ids: &[u32],
+                              prev_len: &mut usize,
+                              tokenizer: &Tokenizer|
+             -> Result<String, WorkerError> {
                 let text = tokenizer
                     .decode(tok_ids, true)
                     .map_err(|e| WorkerError::Internal(format!("Decode error: {}", e)))?;
@@ -576,7 +627,11 @@ impl<B: Backend> TextGeneration for Llama<B> {
                     while start < text.len() && !text.is_char_boundary(start) {
                         start += 1;
                     }
-                    if start < text.len() { text[start..].to_string() } else { String::new() }
+                    if start < text.len() {
+                        text[start..].to_string()
+                    } else {
+                        String::new()
+                    }
                 } else {
                     String::new()
                 };
@@ -591,28 +646,42 @@ impl<B: Backend> TextGeneration for Llama<B> {
             let mut all_tokens = tokens;
             all_tokens.push(first_tok);
             let mut prev_text_len = 0usize;
-            if tx.blocking_send(delta_text(
-                &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
-            )).is_err() {
+            if tx
+                .blocking_send(delta_text(
+                    &all_tokens[prompt_len..],
+                    &mut prev_text_len,
+                    &model.tokenizer,
+                ))
+                .is_err()
+            {
                 // Receiver dropped (client disconnected) — stop burning GPU.
                 return;
             }
-            if eos_ids.contains(&first_tok) { return; }
+            if eos_ids.contains(&first_tok) {
+                return;
+            }
 
             // ── DECODE LOOP (one GPU dispatch per step, no Tokio context switch) ──
             for _step in 1..max_tokens {
-                let cur_tok  = *all_tokens.last().unwrap();
-                let start    = all_tokens.len() - 1; // absolute position of cur_tok
-                let logits   = model.decode_step(cur_tok, start, &mut kv_cache);
+                let cur_tok = *all_tokens.last().unwrap();
+                let start = all_tokens.len() - 1; // absolute position of cur_tok
+                let logits = model.decode_step(cur_tok, start, &mut kv_cache);
                 let next_tok = sample(&logits);
                 all_tokens.push(next_tok);
-                if tx.blocking_send(delta_text(
-                    &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
-                )).is_err() {
+                if tx
+                    .blocking_send(delta_text(
+                        &all_tokens[prompt_len..],
+                        &mut prev_text_len,
+                        &model.tokenizer,
+                    ))
+                    .is_err()
+                {
                     // Receiver dropped (client disconnected) — stop burning GPU.
                     return;
                 }
-                if eos_ids.contains(&next_tok) { break; }
+                if eos_ids.contains(&next_tok) {
+                    break;
+                }
             }
         });
 

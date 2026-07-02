@@ -7,16 +7,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{
-    extract::State,
-    response::IntoResponse,
-    routing::get,
-    Router,
-};
-use metrics::{
-    describe_counter, describe_gauge, describe_histogram,
-    counter, gauge, histogram,
-};
+use axum::{extract::State, response::IntoResponse, routing::get, Router};
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusHandle;
 use tracing::info;
 
@@ -52,40 +44,25 @@ impl Metrics {
             "GPU utilization percentage"
         );
 
-        describe_gauge!(
-            "worker_gpu_memory_used_bytes",
-            "GPU memory used in bytes"
-        );
+        describe_gauge!("worker_gpu_memory_used_bytes", "GPU memory used in bytes");
 
         describe_gauge!(
             "worker_gpu_temperature_celsius",
             "GPU temperature in Celsius"
         );
 
-        describe_gauge!(
-            "worker_gpu_power_watts",
-            "GPU power usage in watts"
-        );
+        describe_gauge!("worker_gpu_power_watts", "GPU power usage in watts");
 
         describe_counter!(
             "worker_tokens_generated_total",
             "Total number of tokens generated"
         );
 
-        describe_gauge!(
-            "worker_loaded_models",
-            "Number of loaded models"
-        );
+        describe_gauge!("worker_loaded_models", "Number of loaded models");
 
-        describe_gauge!(
-            "worker_model_memory_bytes",
-            "Memory used by each model"
-        );
+        describe_gauge!("worker_model_memory_bytes", "Memory used by each model");
 
-        describe_counter!(
-            "worker_errors_total",
-            "Total number of errors"
-        );
+        describe_counter!("worker_errors_total", "Total number of errors");
 
         Self { _private: () }
     }
@@ -141,13 +118,10 @@ impl Metrics {
     pub fn record_error(&self, kind: &str) {
         counter!("worker_errors_total", 1, "kind" => kind.to_string());
     }
-
 }
 
 /// Metrics HTTP handler
-async fn metrics_handler(
-    State(state): State<Arc<MetricsAppState>>,
-) -> impl IntoResponse {
+async fn metrics_handler(State(state): State<Arc<MetricsAppState>>) -> impl IntoResponse {
     // Update GPU metrics before serving
     let gpu_manager = &state.gpu_manager;
     gpu_manager.refresh_telemetry().await;
@@ -219,10 +193,7 @@ impl MetricsServer {
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         info!("Metrics server listening on {}", addr);
 
-        axum::serve(
-            tokio::net::TcpListener::bind(addr).await?,
-            app
-        ).await?;
+        axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
 
         Ok(())
     }

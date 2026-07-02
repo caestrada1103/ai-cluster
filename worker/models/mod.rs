@@ -3,23 +3,21 @@
 //! This module contains the implementations of different model architectures
 //! supported by the AI cluster, including DeepSeek, Llama, and Mistral.
 
+pub mod common;
 pub mod deepseek;
 pub mod llama;
 pub mod mistral;
 pub mod qwen;
-pub mod common;
 
 /// Re-export shared KV cache types used by llama, qwen, and deepseek.
 #[allow(unused_imports)]
-pub use llama::{KvEntry, KvCache};
+pub use llama::{KvCache, KvEntry};
 
-
-
-use std::sync::Arc;
+use crate::error::WorkerError;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::debug;
-use crate::error::WorkerError;
 
 /// Configuration common to all models
 #[derive(Debug, Clone)]
@@ -192,12 +190,19 @@ impl ModelInstance {
         if let Some(model) = &self.model {
             self.inference_count.fetch_add(1, Ordering::Relaxed);
             let stream = {
-                debug!("ModelInstance::generate starting for {} - waiting for Mutex", self.name);
-                let guard = model.lock()
+                debug!(
+                    "ModelInstance::generate starting for {} - waiting for Mutex",
+                    self.name
+                );
+                let guard = model
+                    .lock()
                     .map_err(|e| WorkerError::Internal(format!("Lock error: {}", e)))?;
                 debug!("ModelInstance::generate acquired Mutex for {}", self.name);
                 let res = guard.generate(prompt, max_tokens, temperature, top_p, top_k, seed);
-                debug!("ModelInstance::generate trait call finished for {}", self.name);
+                debug!(
+                    "ModelInstance::generate trait call finished for {}",
+                    self.name
+                );
                 res?
             }; // guard dropped here, stream is 'static
             Ok(stream)
