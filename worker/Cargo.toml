@@ -13,6 +13,10 @@ cuda = ["burn/cuda"]      # Opt-in: native CUDA for best NVIDIA perf
 rocm = ["burn/rocm"]      # Opt-in: native ROCm for best AMD perf
 wgpu = ["burn/wgpu"]      # Cross-platform GPU via Vulkan/DX12/Metal
 metal = ["wgpu", "burn/metal"]  # macOS Metal via wgpu
+# llama.cpp inference engine (opt-in; coexists with the Burn features above).
+llamacpp = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:once_cell"]
+llamacpp-cuda = ["llamacpp", "llama-cpp-2?/cuda"]      # llama.cpp CUDA kernels
+llamacpp-vulkan = ["llamacpp", "llama-cpp-2?/vulkan"]  # llama.cpp Vulkan kernels
 
 [dependencies]
 # Burn deep learning framework
@@ -65,6 +69,12 @@ tokenizers = { version = "0.15", features = ["http"] }
 hf-hub = { version = "0.4.3", features = ["tokio"] }
 half = "2.3"
 rand = "0.8"
+
+# llama.cpp engine (feature `llamacpp`). llama-cpp-sys-2 builds llama.cpp from
+# source via cmake; bindgen requires libclang on the build host.
+llama-cpp-2 = { version = "=0.1.150", optional = true }
+encoding_rs = { version = "0.8", optional = true }
+once_cell = { version = "1", optional = true }
 
 [build-dependencies]
 tonic-build = "0.10"
