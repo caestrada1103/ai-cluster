@@ -451,7 +451,7 @@ class ClusterCoordinator:
         self,
         worker: WorkerInfo,
         model_name: str,
-        quantization: Quantization = Quantization.FP16,
+        quantization: Quantization = Quantization.NONE,
     ) -> bool:
         """Load a model on a worker."""
         try:
@@ -488,10 +488,12 @@ class ClusterCoordinator:
                 )
                 gpu_ids = [g.id for g in worker.gpus]  # default to all available GPUs
 
-            # Prepare load request
+            # model_path carries the resolved HF repo id; empty means
+            # "model_name is already a repo id — download it directly".
+            hf_repo_id = model_config.hf_repo_id if model_config else None
             request = pb.LoadModelRequest(
                 model_name=model_name,
-                model_path="",  # Empty path signals the rust worker to download from HuggingFace
+                model_path=hf_repo_id or "",
                 config=config_pb,
                 gpu_ids=gpu_ids,
                 quantization=getattr(pb, quantization.value.upper()),

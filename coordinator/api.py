@@ -82,7 +82,7 @@ class LoadModelRequest(BaseModel):
 
     model_name: str
     worker_id: Optional[str] = None
-    quantization: str = "fp16"
+    quantization: str = "none"  # only "none" is accepted by workers today; others are planned
 
 
 class LoadModelResponse(BaseModel):

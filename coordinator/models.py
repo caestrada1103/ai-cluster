@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 class ModelFamily(str, Enum):
     """Supported model families."""
+
     DEEPSEEK = "deepseek"
     LLAMA = "llama"
     MISTRAL = "mistral"
@@ -20,6 +21,7 @@ class ModelFamily(str, Enum):
 
 class Quantization(str, Enum):
     """Supported quantization types."""
+
     NONE = "none"
     FP16 = "fp16"
     INT8 = "int8"
@@ -29,6 +31,7 @@ class Quantization(str, Enum):
 
 class ParallelismStrategy(str, Enum):
     """Supported parallelism strategies."""
+
     AUTO = "auto"
     SINGLE = "single"
     PIPELINE = "pipeline"
@@ -40,17 +43,17 @@ class ParallelismStrategy(str, Enum):
 @dataclass
 class ModelConfig:
     """Configuration for a specific model."""
-    
+
     # Basic info
     name: str
     family: ModelFamily
     parameters: str  # e.g., "7B", "67B", "8B"
-    
+
     # Resource requirements
     min_memory_gb: float  # Minimum VRAM required per GPU
     recommended_gpus: int  # Recommended number of GPUs
     max_gpus: int  # Maximum GPUs that can be used
-    
+
     # Model architecture
     num_layers: int
     hidden_size: int
@@ -59,13 +62,13 @@ class ModelConfig:
     max_seq_len: int
     intermediate_size: int
     num_kv_heads: Optional[int] = None  # For GQA/MQA
-    
+
     # Features
     supports_quantization: List[Quantization] = field(default_factory=list)
     supports_parallelism: List[ParallelismStrategy] = field(default_factory=list)
     is_moe: bool = False  # Mixture of Experts
     num_experts: Optional[int] = None  # For MoE models
-    
+
     # File paths
     config_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
@@ -78,28 +81,28 @@ class ModelConfig:
     description: str = ""
     paper_url: Optional[str] = None
     model_url: Optional[str] = None
-    
+
     def __post_init__(self) -> None:
         """Validate configuration."""
         if self.is_moe and not self.num_experts:
             raise ValueError("MoE models must specify num_experts")
-        
+
         if self.num_kv_heads is None:
             self.num_kv_heads = self.num_attention_heads
 
 
 class ModelRegistry:
     """Registry of all available models."""
-    
+
     # Predefined model configurations
     MODELS: Dict[str, ModelConfig] = {}
-    
+
     @classmethod
     def initialize(cls) -> None:
         """Initialize the model registry with default models."""
-        # Note: In a production environment, this could be empty and 
+        # Note: In a production environment, this could be empty and
         # only populated via load_from_config.
-        
+
         # DeepSeek models
         cls.MODELS["deepseek-7b"] = ModelConfig(
             name="deepseek-7b",
@@ -112,17 +115,16 @@ class ModelRegistry:
             hidden_size=4096,
             num_attention_heads=32,
             num_kv_heads=32,
-            vocab_size=32256,
+            vocab_size=102400,
             max_seq_len=4096,
             intermediate_size=11008,
-            supports_quantization=[Quantization.FP16, Quantization.INT8],
+            supports_quantization=[Quantization.NONE],
             supports_parallelism=[ParallelismStrategy.SINGLE, ParallelismStrategy.PIPELINE],
-            is_moe=True,
-            num_experts=64,
-            description="DeepSeek 7B Base Model with MoE architecture",
+            description="DeepSeek LLM 7B Base (dense, Llama-style)",
             model_url="https://huggingface.co/deepseek-ai/deepseek-llm-7b-base",
+            hf_repo_id="deepseek-ai/deepseek-llm-7b-base",
         )
-        
+
         cls.MODELS["deepseek-67b"] = ModelConfig(
             name="deepseek-67b",
             family=ModelFamily.DEEPSEEK,
@@ -133,22 +135,20 @@ class ModelRegistry:
             num_layers=95,
             hidden_size=8192,
             num_attention_heads=64,
-            num_kv_heads=64,
-            vocab_size=32256,
+            num_kv_heads=8,
+            vocab_size=102400,
             max_seq_len=4096,
             intermediate_size=22016,
-            supports_quantization=[Quantization.INT8, Quantization.INT4],
+            supports_quantization=[Quantization.NONE],
             supports_parallelism=[
                 ParallelismStrategy.PIPELINE,
                 ParallelismStrategy.TENSOR,
-                ParallelismStrategy.EXPERT,
             ],
-            is_moe=True,
-            num_experts=128,
-            description="DeepSeek 67B Model with extensive MoE",
+            description="DeepSeek LLM 67B Base (dense, GQA)",
             model_url="https://huggingface.co/deepseek-ai/deepseek-llm-67b-base",
+            hf_repo_id="deepseek-ai/deepseek-llm-67b-base",
         )
-        
+
         # Llama 3 models
         cls.MODELS["llama3-8b"] = ModelConfig(
             name="llama3-8b",
@@ -164,7 +164,7 @@ class ModelRegistry:
             vocab_size=128256,
             max_seq_len=8192,
             intermediate_size=14336,
-            supports_quantization=[Quantization.FP16, Quantization.INT8],
+            supports_quantization=[Quantization.NONE],
             supports_parallelism=[
                 ParallelismStrategy.SINGLE,
                 ParallelismStrategy.PIPELINE,
@@ -172,8 +172,9 @@ class ModelRegistry:
             ],
             description="Meta Llama 3 8B Instruct",
             model_url="https://huggingface.co/meta-llama/Meta-Llama-3-8B",
+            hf_repo_id="meta-llama/Meta-Llama-3-8B",
         )
-        
+
         cls.MODELS["llama3-70b"] = ModelConfig(
             name="llama3-70b",
             family=ModelFamily.LLAMA,
@@ -188,15 +189,16 @@ class ModelRegistry:
             vocab_size=128256,
             max_seq_len=8192,
             intermediate_size=28672,
-            supports_quantization=[Quantization.INT8, Quantization.INT4],
+            supports_quantization=[Quantization.NONE],
             supports_parallelism=[
                 ParallelismStrategy.PIPELINE,
                 ParallelismStrategy.TENSOR,
             ],
             description="Meta Llama 3 70B Instruct",
             model_url="https://huggingface.co/meta-llama/Meta-Llama-3-70B",
+            hf_repo_id="meta-llama/Meta-Llama-3-70B",
         )
-        
+
         # Mistral models
         cls.MODELS["mistral-7b"] = ModelConfig(
             name="mistral-7b",
@@ -212,15 +214,16 @@ class ModelRegistry:
             vocab_size=32000,
             max_seq_len=32768,  # Sliding window attention
             intermediate_size=14336,
-            supports_quantization=[Quantization.FP16, Quantization.INT8],
+            supports_quantization=[Quantization.NONE],
             supports_parallelism=[
                 ParallelismStrategy.SINGLE,
                 ParallelismStrategy.PIPELINE,
             ],
-            description="Mistral 7B v0.2",
+            description="Mistral 7B v0.1 (planned — worker cannot load Mistral yet)",
             model_url="https://huggingface.co/mistralai/Mistral-7B-v0.1",
+            hf_repo_id="mistralai/Mistral-7B-v0.1",
         )
-        
+
         # Phi models
         cls.MODELS["phi-2"] = ModelConfig(
             name="phi-2",
@@ -235,12 +238,13 @@ class ModelRegistry:
             vocab_size=51200,
             max_seq_len=2048,
             intermediate_size=10240,
-            supports_quantization=[Quantization.FP16],
+            supports_quantization=[Quantization.NONE],
             supports_parallelism=[ParallelismStrategy.SINGLE],
-            description="Microsoft Phi-2 (2.7B)",
+            description="Microsoft Phi-2 (2.7B) (planned — worker cannot load Phi yet)",
             model_url="https://huggingface.co/microsoft/phi-2",
+            hf_repo_id="microsoft/phi-2",
         )
-        
+
         # Qwen3-Coder-32B
         cls.MODELS["qwen3-coder-32b"] = ModelConfig(
             name="qwen3-coder-32b",
@@ -253,13 +257,14 @@ class ModelRegistry:
             hidden_size=5120,
             num_attention_heads=40,
             num_kv_heads=8,
-            vocab_size=151936,
-            max_seq_len=131072,
+            vocab_size=152064,
+            max_seq_len=32768,
             intermediate_size=27648,
-            supports_quantization=[Quantization.FP16, Quantization.INT8, Quantization.INT4],
+            supports_quantization=[Quantization.NONE],
             supports_parallelism=[ParallelismStrategy.SINGLE, ParallelismStrategy.TENSOR],
-            description="Qwen3-Coder 32B — top open-source coding model (SWE-Bench 70.6%), Claude Sonnet tier",
-            model_url="https://huggingface.co/Qwen/Qwen3-Coder-32B",
+            description="Qwen2.5-Coder 32B Instruct — strong open-source coding model",
+            model_url="https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct",
+            hf_repo_id="Qwen/Qwen2.5-Coder-32B-Instruct",
         )
 
         # DeepSeek V3
@@ -279,7 +284,7 @@ class ModelRegistry:
             intermediate_size=18432,
             is_moe=True,
             num_experts=256,
-            supports_quantization=[Quantization.FP16, Quantization.INT8, Quantization.INT4],
+            supports_quantization=[Quantization.NONE],
             supports_parallelism=[
                 ParallelismStrategy.SINGLE,
                 ParallelismStrategy.TENSOR,
@@ -287,6 +292,7 @@ class ModelRegistry:
             ],
             description="DeepSeek V3 — 671B MoE (37B active), Claude Opus tier (SWE-Bench 73.1%)",
             model_url="https://huggingface.co/deepseek-ai/DeepSeek-V3",
+            hf_repo_id="deepseek-ai/DeepSeek-V3",
         )
 
         logger.info(f"Initialized model registry with {len(cls.MODELS)} models")
@@ -319,7 +325,7 @@ class ModelRegistry:
                 parallel = get_dict(final_data, "parallelism")
                 paths = get_dict(final_data, "paths")
                 hf = get_dict(final_data, "hf")
-                
+
                 # Determine supported quantizations
                 supported_quants = quants.get("supported")
                 if not supported_quants:
@@ -372,23 +378,21 @@ class ModelRegistry:
 
         logger.info(f"Updated model registry. Total models: {len(cls.MODELS)}")
 
-
-    
     @classmethod
     def get_model(cls, name: str) -> Optional[ModelConfig]:
         """Get model configuration by name."""
         return cls.MODELS.get(name)
-    
+
     @classmethod
     def list_models(cls) -> List[str]:
         """List all available model names."""
         return list(cls.MODELS.keys())
-    
+
     @classmethod
     def find_models_by_family(cls, family: ModelFamily) -> List[ModelConfig]:
         """Find all models of a given family."""
         return [m for m in cls.MODELS.values() if m.family == family]
-    
+
     @classmethod
     def validate_requirements(
         cls,
@@ -401,7 +405,7 @@ class ModelRegistry:
         model = cls.get_model(model_name)
         if not model:
             return False, f"Unknown model: {model_name}"
-        
+
         # Adjust memory for quantization
         memory_multiplier = {
             Quantization.NONE: 1.0,
@@ -410,21 +414,20 @@ class ModelRegistry:
             Quantization.INT4: 0.125,
             Quantization.FP8: 0.25,
         }
-        
+
         required_memory = model.min_memory_gb * memory_multiplier.get(quantization, 1.0)
-        
+
         if available_memory < required_memory:
             return False, (
                 f"Insufficient memory: need {required_memory:.1f}GB, "
                 f"have {available_memory:.1f}GB"
             )
-        
+
         if num_gpus < model.recommended_gpus:
             return False, (
-                f"Insufficient GPUs: recommend {model.recommended_gpus}, "
-                f"have {num_gpus}"
+                f"Insufficient GPUs: recommend {model.recommended_gpus}, " f"have {num_gpus}"
             )
-        
+
         return True, "Requirements satisfied"
 
 

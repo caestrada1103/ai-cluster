@@ -164,7 +164,7 @@ def test_load_from_dict_adds_model() -> None:
                     "max_seq_len": 512,
                     "intermediate_size": 2048,
                 },
-                "quantization": {"supported": ["fp16"]},
+                "quantization": {"supported": ["none"]},
                 "parallelism": {"supported": ["single"]},
             }
         }
@@ -174,3 +174,65 @@ def test_load_from_dict_adds_model() -> None:
     assert cfg is not None
     assert cfg.parameters == "1B"
     assert cfg.num_layers == 8
+
+
+# ---------------------------------------------------------------------------
+# Task 19 — quantization honesty
+# ---------------------------------------------------------------------------
+
+
+def test_registry_models_advertise_only_none_quantization() -> None:
+    """Workers reject non-NONE quantization until real quantized inference lands."""
+    for name in ModelRegistry.list_models():
+        cfg = ModelRegistry.get_model(name)
+        assert cfg is not None
+        assert cfg.supports_quantization == [Quantization.NONE], name
+
+
+# ---------------------------------------------------------------------------
+# Task 20 — registry-name -> HF repo resolution
+# ---------------------------------------------------------------------------
+
+
+def test_hf_repo_id_loaded_from_toml() -> None:
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "friendly-name": {
+                    "family": "llama",
+                    "architecture": {"num_layers": 2, "hidden_size": 8},
+                    "hf": {"repo_id": "org/real-repo"},
+                }
+            }
+        }
+    )
+    cfg = ModelRegistry.get_model("friendly-name")
+    assert cfg is not None
+    assert cfg.hf_repo_id == "org/real-repo"
+
+
+def test_builtin_models_carry_hf_repo_id() -> None:
+    cfg = ModelRegistry.get_model("llama3-8b")
+    assert cfg is not None
+    assert cfg.hf_repo_id == "meta-llama/Meta-Llama-3-8B"
+
+
+# ---------------------------------------------------------------------------
+# Task 21 — models.toml + coordinator/models.py data corrections
+# ---------------------------------------------------------------------------
+
+
+def test_deepseek_7b_is_dense() -> None:
+    cfg = ModelRegistry.get_model("deepseek-7b")
+    assert cfg is not None
+    assert cfg.is_moe is False
+    assert cfg.num_experts is None
+    assert cfg.vocab_size == 102400
+
+
+def test_qwen_coder_entry_matches_real_repo() -> None:
+    cfg = ModelRegistry.get_model("qwen3-coder-32b")
+    assert cfg is not None
+    assert cfg.hf_repo_id == "Qwen/Qwen2.5-Coder-32B-Instruct"
+    assert cfg.vocab_size == 152064
+    assert cfg.max_seq_len == 32768
