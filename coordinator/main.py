@@ -94,9 +94,12 @@ async def root() -> Dict[str, Any]:
         "version": "0.1.0",
         "endpoints": [
             "/v1/completions",
+            "/v1/chat/completions",
             "/v1/models",
             "/v1/models/load",
+            "/v1/models/{name} (DELETE)",
             "/v1/workers",
+            "/v1/workers/manual",
             "/health",
             "/metrics",
         ],

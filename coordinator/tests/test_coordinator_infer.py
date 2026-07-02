@@ -53,6 +53,35 @@ async def test_get_status_uses_settings_thresholds() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unload_model_calls_worker_stub() -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    import coordinator.proto.cluster_pb2 as pb
+    from coordinator.coordinator import WorkerInfo, WorkerState
+
+    settings = make_settings()
+    coord = ClusterCoordinator(settings)
+    worker = WorkerInfo(id="w1", address="a:1", channel=AsyncMock(), stub=AsyncMock())
+    worker.state = WorkerState.HEALTHY
+    worker.loaded_models = {"deepseek-7b": MagicMock()}
+    worker.stub.UnloadModel = AsyncMock(return_value=pb.Empty())
+    coord.workers["w1"] = worker
+
+    unloaded_from = await coord.unload_model("deepseek-7b")
+    assert unloaded_from == ["w1"]
+    worker.stub.UnloadModel.assert_awaited_once()
+    assert "deepseek-7b" not in worker.loaded_models
+
+
+@pytest.mark.asyncio
+async def test_unload_model_not_loaded_raises() -> None:
+    settings = make_settings()
+    coord = ClusterCoordinator(settings)
+    with pytest.raises(KeyError):
+        await coord.unload_model("ghost-model")
+
+
+@pytest.mark.asyncio
 async def test_infer_pops_context_on_error() -> None:
     settings = make_settings(request_timeout=30)
     coord = ClusterCoordinator(settings)

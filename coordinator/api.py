@@ -355,36 +355,32 @@ async def load_model(body: LoadModelRequest, request: "Request[Any]") -> LoadMod
     """Load a model onto a worker."""
     coordinator = _get_coordinator(request)
 
-    # Pick a specific worker or let the coordinator decide
-    workers = await coordinator.list_workers()
-    if not workers:
-        raise HTTPException(status_code=503, detail="No workers available")
-
-    target_worker = None
-    if body.worker_id:
-        for w in workers:
-            if w["id"] == body.worker_id:
-                target_worker = w
-                break
-        if target_worker is None:
-            raise HTTPException(status_code=404, detail=f"Worker {body.worker_id} not found")
+    from coordinator.models import Quantization
 
     try:
-        # Delegate to coordinator's internal loading mechanism
-        first_worker_id = next(iter(coordinator.workers), None)
-        target_id = body.worker_id or first_worker_id
-        if target_id is None:
-            raise HTTPException(status_code=503, detail="No workers available")
-        worker_info = coordinator.workers.get(target_id)
-        if worker_info is None:
-            raise HTTPException(status_code=503, detail="No workers available")
+        quantization = Quantization(body.quantization)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid quantization '{body.quantization}'. "
+            f"Valid values: {[q.value for q in Quantization]} (only 'none' is loadable today)",
+        ) from exc
 
-        from coordinator.models import Quantization
+    try:
+        if body.worker_id is not None:
+            worker_info = coordinator.workers.get(body.worker_id)
+            if worker_info is None:
+                raise HTTPException(status_code=404, detail=f"Worker {body.worker_id} not found")
+        else:
+            first_worker_id = next(iter(coordinator.workers), None)
+            if first_worker_id is None:
+                raise HTTPException(status_code=503, detail="No workers available")
+            worker_info = coordinator.workers[first_worker_id]
 
         success = await coordinator._load_model_on_worker(
             worker_info,
             body.model_name,
-            quantization=Quantization(body.quantization),
+            quantization=quantization,
         )
 
         if success:
@@ -393,17 +389,32 @@ async def load_model(body: LoadModelRequest, request: "Request[Any]") -> LoadMod
                 model_name=body.model_name,
                 worker_id=worker_info.id,
             )
-        else:
-            return LoadModelResponse(
-                status="failed",
-                model_name=body.model_name,
-                message="Model loading failed on the worker",
-            )
+        return LoadModelResponse(
+            status="failed",
+            model_name=body.model_name,
+            message="Model loading failed on the worker",
+        )
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception("Model load failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.delete("/models/{model_name}")
+async def unload_model(
+    model_name: str, request: "Request[Any]", worker_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Unload a model and free its GPU memory (all workers, or one via ?worker_id=)."""
+    coordinator = _get_coordinator(request)
+    try:
+        unloaded_from = await coordinator.unload_model(model_name, worker_id=worker_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Model unload failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"status": "unloaded", "model_name": model_name, "workers": unloaded_from}
 
 
 @router.get("/workers", response_model=List[WorkerInfoResponse])

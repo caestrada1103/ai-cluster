@@ -514,6 +514,37 @@ class ClusterCoordinator:
             logger.exception(f"Error loading model on worker {worker.id}: {e}")
             return False
 
+    async def unload_model(self, model_name: str, worker_id: Optional[str] = None) -> List[str]:
+        """Unload a model from one worker (worker_id given) or every worker holding it.
+
+        Returns the worker ids it was unloaded from. Raises KeyError when the
+        model is loaded nowhere (or the named worker doesn't hold/exist it).
+        """
+        async with self._workers_lock:
+            if worker_id is not None:
+                candidates = [w for w in [self.workers.get(worker_id)] if w is not None]
+            else:
+                candidates = list(self.workers.values())
+            targets = [w for w in candidates if model_name in w.loaded_models]
+
+        if not targets:
+            raise KeyError(f"Model {model_name} is not loaded on any matching worker")
+
+        unloaded_from: List[str] = []
+        for worker in targets:
+            try:
+                await worker.stub.UnloadModel(
+                    pb.UnloadModelRequest(model_name=model_name), timeout=60
+                )
+                worker.loaded_models.pop(model_name, None)
+                unloaded_from.append(worker.id)
+                logger.info(f"Unloaded {model_name} from worker {worker.id}")
+            except Exception as e:
+                logger.error(f"Failed to unload {model_name} from {worker.id}: {e}")
+        if not unloaded_from:
+            raise RuntimeError(f"UnloadModel failed on all workers holding {model_name}")
+        return unloaded_from
+
     async def submit_request(self, model_name: str, prompt: str, **kwargs: Any) -> RequestContext:
         """Create a request context and enqueue it. Returns immediately (streaming path)."""
         request_id = str(uuid.uuid4())
