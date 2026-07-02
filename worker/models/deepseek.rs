@@ -459,60 +459,6 @@ pub struct DeepSeekConfig {
 }
 
 impl DeepSeekConfig {
-    /// Create configuration for DeepSeek 7B
-    pub fn deepseek_7b() -> Self {
-        Self {
-            hidden_size: 4096,
-            num_layers: 30,
-            num_attention_heads: 32,
-            num_kv_heads: 32,
-            head_dim: 128,
-            intermediate_size: 11008,
-            vocab_size: 102400,
-            max_seq_len: 4096,
-            rms_norm_eps: 1e-6,
-            rope_theta: 10000.0,
-            num_experts: 64,
-            num_experts_per_tok: 6,
-        }
-    }
-
-    /// Create configuration for DeepSeek V3 (671B, 37B active params).
-    pub fn deepseek_v3() -> Self {
-        Self {
-            hidden_size: 7168,
-            num_layers: 61,
-            num_attention_heads: 128,
-            num_kv_heads: 128,
-            head_dim: 56, // 7168 / 128
-            intermediate_size: 18432,
-            vocab_size: 129280,
-            max_seq_len: 163840,
-            rms_norm_eps: 1e-6,
-            rope_theta: 10000.0,
-            num_experts: 256,
-            num_experts_per_tok: 8,
-        }
-    }
-
-    /// Create configuration for DeepSeek 67B
-    pub fn deepseek_67b() -> Self {
-        Self {
-            hidden_size: 8192,
-            num_layers: 95,
-            num_attention_heads: 64,
-            num_kv_heads: 8,
-            head_dim: 128,
-            intermediate_size: 22016,
-            vocab_size: 102400,
-            max_seq_len: 4096,
-            rms_norm_eps: 1e-6,
-            rope_theta: 10000.0,
-            num_experts: 160,
-            num_experts_per_tok: 6,
-        }
-    }
-
     /// Convert to generic ModelConfig
     pub fn to_model_config(&self) -> ModelConfig {
         ModelConfig {
@@ -691,7 +637,7 @@ impl<B: Backend> DeepSeek<B> {
         Ok(tokens)
     }
 
-    /// Estimate memory usage in bytes (FP16)
+    /// Estimate memory usage in bytes (FP32 — all weights load as f32 today)
     pub fn memory_usage(&self) -> usize {
         let c = &self.config;
         let embed = c.vocab_size * c.hidden_size;
@@ -699,7 +645,7 @@ impl<B: Backend> DeepSeek<B> {
         let expert_ffn = c.num_layers * c.num_experts * 3 * c.hidden_size * c.intermediate_size;
         let norm = (c.num_layers * 2 + 1) * c.hidden_size;
         let routing = c.num_layers * c.hidden_size * c.num_experts;
-        (embed + attn + expert_ffn + norm + routing) * 2
+        (embed + attn + expert_ffn + norm + routing) * 4
     }
 }
 

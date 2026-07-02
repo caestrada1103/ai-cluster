@@ -238,20 +238,52 @@ impl ModelLoader {
                     Arc::new(Mutex::new(model))
                 }
                 "deepseek" => {
-                    let ds_config = if model_name.to_lowercase().contains("v3") {
-                        DeepSeekConfig::deepseek_v3()
-                    } else if model_name.to_lowercase().contains("67b") {
-                        DeepSeekConfig::deepseek_67b()
+                    let head_dim = config
+                        .head_dim
+                        .unwrap_or(config.hidden_size / config.num_attention_heads);
+                    let has_expert_weights =
+                        weights.contains_key("model.layers.0.mlp.experts.0.gate_proj.weight");
+
+                    if !has_expert_weights {
+                        // Dense DeepSeek checkpoints (deepseek-llm-7b/67b) use the Llama layout.
+                        info!("DeepSeek checkpoint has no expert weights — loading via Llama path");
+                        let llama_config = LlamaConfig {
+                            hidden_size: config.hidden_size,
+                            num_layers: config.num_layers,
+                            num_attention_heads: config.num_attention_heads,
+                            num_kv_heads: config.num_kv_heads,
+                            head_dim,
+                            intermediate_size: config.intermediate_size,
+                            vocab_size: config.vocab_size,
+                            max_seq_len: config.max_seq_len,
+                            rms_norm_eps: config.rms_norm_eps,
+                            rope_theta: config.rope_theta,
+                        };
+                        let record = create_llama_record(&mut weights, &llama_config, &device)?;
+                        let model = Llama::new(&llama_config, &device, &model_path)?.load_record(record);
+                        Arc::new(Mutex::new(model))
                     } else {
-                        DeepSeekConfig::deepseek_7b()
-                    };
-
-                    info!("Mapping weights to DeepSeekRecord...");
-                    let record = create_deepseek_record(&mut weights, &ds_config, &device)?;
-                    info!("Record created. Initializing DeepSeek...");
-
-                    let model = DeepSeek::new(ds_config, &device, &model_path)?.load_record(record);
-                    Arc::new(Mutex::new(model))
+                        // MoE checkpoint: build the config from config.json, not name substrings.
+                        let ds_config = DeepSeekConfig {
+                            hidden_size: config.hidden_size,
+                            num_layers: config.num_layers,
+                            num_attention_heads: config.num_attention_heads,
+                            num_kv_heads: config.num_kv_heads,
+                            head_dim,
+                            intermediate_size: config.intermediate_size,
+                            vocab_size: config.vocab_size,
+                            max_seq_len: config.max_seq_len,
+                            rms_norm_eps: config.rms_norm_eps,
+                            rope_theta: config.rope_theta,
+                            num_experts: config.num_experts.unwrap_or(1),
+                            num_experts_per_tok: config.num_experts_per_tok.unwrap_or(1),
+                        };
+                        info!("Mapping weights to DeepSeekRecord...");
+                        let record = create_deepseek_record(&mut weights, &ds_config, &device)?;
+                        info!("Record created. Initializing DeepSeek...");
+                        let model = DeepSeek::new(ds_config, &device, &model_path)?.load_record(record);
+                        Arc::new(Mutex::new(model))
+                    }
                 }
                 other => return Err(WorkerError::ModelLoad(format!("Unsupported architecture: {}", other))),
             };
@@ -402,7 +434,10 @@ impl ModelLoader {
         } else {
             arch_raw
         };
-        let num_experts = json["num_experts"].as_u64().map(|v| v as usize);
+        let num_experts = json["num_experts"]
+            .as_u64()
+            .or_else(|| json["n_routed_experts"].as_u64()) // DeepSeek-V2/V3 key
+            .map(|v| v as usize);
         let num_experts_per_tok = json["num_experts_per_token"].as_u64()
             .or_else(|| json["num_experts_per_tok"].as_u64())
             .map(|v| v as usize);
