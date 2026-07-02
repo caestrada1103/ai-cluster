@@ -23,6 +23,8 @@ pub mod backend;
 mod config;
 mod error;
 mod gpu_manager;
+#[cfg(feature = "llamacpp")]
+mod llamacpp_engine;
 mod metrics;
 mod model_loader;
 #[path = "../models/mod.rs"]
