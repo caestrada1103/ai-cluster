@@ -126,3 +126,13 @@ def test_cors_origins_json_array_string_from_env(tmp_path: Path) -> None:
     env_file.write_text('COORDINATOR_CORS_ORIGINS=["https://a.example","https://b.example"]\n')
     s = Settings(_env_file=str(env_file))
     assert s.cors_origins == ["https://a.example", "https://b.example"]
+
+
+def test_non_static_discovery_fails_fast_with_clear_error() -> None:
+    """mdns/broadcast/consul are planned, not implemented — creating the
+    discovery manager must raise a clear error instead of AttributeError."""
+    from coordinator.discovery import WorkerDiscovery
+
+    settings = make_settings(discovery_method="mdns")
+    with pytest.raises(ValueError, match="not implemented"):
+        WorkerDiscovery(settings)

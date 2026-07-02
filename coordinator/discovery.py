@@ -1,23 +1,18 @@
 """Worker discovery module for finding and connecting to workers.
 
-This module provides multiple discovery methods:
-- Static configuration
-- mDNS (Bonjour/Avahi)
-- Broadcast discovery
-- Consul service discovery
+Implemented: static configuration (settings.static_workers + config/workers.yaml).
+Planned (enum reserved, not implemented): mDNS, UDP broadcast, Consul.
 """
 
 import asyncio
 import json
 import logging
-import socket
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
+from typing import Any, Callable, Coroutine, Dict, List, Optional
 
-import aiohttp
 import yaml
 
 from coordinator.config import DiscoveryMethod, Settings
@@ -35,20 +30,6 @@ class WorkerEndpoint:
     total_memory_gb: float = 0.0
     tags: Dict[str, str] = field(default_factory=dict)
     last_seen: float = field(default_factory=time.time)
-
-    @property
-    def host(self) -> str:
-        return self.address.split(":")[0]
-
-    @property
-    def port(self) -> int:
-        parts = self.address.split(":")
-        if len(parts) > 1:
-            try:
-                return int(parts[1])
-            except ValueError:
-                logger.warning(f"Invalid port in address '{self.address}', using default 50051")
-        return 50051
 
 
 class DiscoveryProvider(ABC):
@@ -83,6 +64,7 @@ class StaticDiscoveryProvider(DiscoveryProvider):
         self.workers: List[WorkerEndpoint] = []
         self.config_path = Path("config/workers.yaml")
         self._watch_task: Optional["asyncio.Task[None]"] = None
+        self._notify_tasks: "set[asyncio.Task[None]]" = set()
 
     async def start(self) -> None:
         """Start watching for config changes."""
@@ -141,14 +123,18 @@ class StaticDiscoveryProvider(DiscoveryProvider):
         for addr in new_addresses - old_addresses:
             worker = next((w for w in new_workers if w.address == addr), None)
             if worker and self.on_worker_found:
-                asyncio.create_task(self.on_worker_found(worker))
+                task = asyncio.create_task(self.on_worker_found(worker))
+                self._notify_tasks.add(task)
+                task.add_done_callback(self._notify_tasks.discard)
                 logger.info(f"Discovered static worker: {addr}")
 
         # Notify about removed workers
         for addr in old_addresses - new_addresses:
             worker = next((w for w in self.workers if w.address == addr), None)
             if worker and self.on_worker_lost:
-                asyncio.create_task(self.on_worker_lost(worker))
+                task = asyncio.create_task(self.on_worker_lost(worker))
+                self._notify_tasks.add(task)
+                task.add_done_callback(self._notify_tasks.discard)
                 logger.info(f"Lost static worker: {addr}")
 
         self.workers = new_workers
@@ -176,413 +162,6 @@ class StaticDiscoveryProvider(DiscoveryProvider):
         return self.workers.copy()
 
 
-class MDNSDiscoveryProvider(DiscoveryProvider):
-    """mDNS (Bonjour/Avahi) discovery provider."""
-
-    def __init__(self, settings: Settings):
-        super().__init__(settings)
-        # NOTE: settings.discovery does not exist — this class is dead-on-arrival
-        # code deleted wholesale in a later task. type: ignore keeps mypy strict
-        # green in the interim without fabricating a fake Settings field.
-        self.service_name = settings.discovery.mdns.service_name  # type: ignore[attr-defined]
-        self.known_workers: Dict[str, WorkerEndpoint] = {}
-        self._browser = None
-        self._running = False
-
-        # Try to import zeroconf
-        try:
-            from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
-
-            self.zeroconf = Zeroconf
-            self.service_browser = ServiceBrowser
-            self.service_listener = ServiceListener
-            self._import_success = True
-        except ImportError:
-            logger.warning("zeroconf not installed, mDNS discovery disabled")
-            self._import_success = False
-
-    class Listener:
-        """mDNS service listener."""
-
-        def __init__(self, provider: "MDNSDiscoveryProvider"):
-            self.provider = provider
-
-        def add_service(self, zc: Any, type_: Any, name: str) -> None:
-            """Service added."""
-            asyncio.create_task(self.provider._handle_service_added(zc, type_, name))
-
-        def remove_service(self, zc: Any, type_: Any, name: str) -> None:
-            """Service removed."""
-            asyncio.create_task(self.provider._handle_service_removed(name))
-
-        def update_service(self, zc: Any, type_: Any, name: str) -> None:
-            """Service updated."""
-            asyncio.create_task(self.provider._handle_service_updated(zc, type_, name))
-
-    async def start(self) -> None:
-        """Start mDNS browsing."""
-        if not self._import_success:
-            return
-
-        try:
-            from zeroconf import Zeroconf
-
-            self.zc = Zeroconf()
-            self.listener = self.Listener(self)
-            self.browser = self.service_browser(self.zc, self.service_name, self.listener)
-            self._running = True
-            logger.info(f"mDNS discovery started for {self.service_name}")
-        except Exception as e:
-            logger.error(f"Failed to start mDNS discovery: {e}")
-
-    async def stop(self) -> None:
-        """Stop mDNS browsing."""
-        self._running = False
-        if hasattr(self, "zc"):
-            self.zc.close()
-
-    async def _handle_service_added(self, zc: Any, type_: Any, name: str) -> None:
-        """Handle new service discovery."""
-        try:
-            info = zc.get_service_info(type_, name)
-            if info:
-                address = socket.inet_ntoa(info.addresses[0])
-                port = info.port
-
-                # Parse TXT records
-                tags: Dict[str, str] = {}
-                if info.properties:
-                    for key, value in info.properties.items():
-                        if isinstance(key, bytes):
-                            key = key.decode("utf-8")
-                        if isinstance(value, bytes):
-                            value = value.decode("utf-8")
-                        tags[key] = value
-
-                endpoint = WorkerEndpoint(
-                    address=f"{address}:{port}",
-                    worker_id=tags.get("worker_id"),
-                    gpu_count=int(tags.get("gpus", 0)),
-                    total_memory_gb=float(tags.get("memory_gb", 0)),
-                    tags=tags,
-                )
-
-                self.known_workers[endpoint.address] = endpoint
-
-                if self.on_worker_found:
-                    await self.on_worker_found(endpoint)
-
-                logger.debug(f"Discovered worker via mDNS: {endpoint.address}")
-
-        except Exception as e:
-            logger.error(f"Error handling mDNS service add: {e}")
-
-    async def _handle_service_removed(self, name: str) -> None:
-        """Handle service removal."""
-        # Find endpoint by service name (difficult without mapping)
-        # For now, we'll rely on periodic discovery to detect removals
-        pass
-
-    async def _handle_service_updated(self, zc: Any, type_: Any, name: str) -> None:
-        """Handle service update."""
-        await self._handle_service_added(zc, type_, name)
-
-    async def discover(self) -> List[WorkerEndpoint]:
-        """Return currently discovered workers."""
-        return list(self.known_workers.values())
-
-
-class BroadcastDiscoveryProvider(DiscoveryProvider):
-    """UDP broadcast discovery provider."""
-
-    def __init__(self, settings: Settings):
-        super().__init__(settings)
-        # NOTE: settings.discovery does not exist — this class is dead-on-arrival
-        # code deleted wholesale in a later task. type: ignore keeps mypy strict
-        # green in the interim without fabricating a fake Settings field.
-        self.port = settings.discovery.broadcast.port  # type: ignore[attr-defined]
-        self.interface = settings.discovery.broadcast.interface  # type: ignore[attr-defined]
-        self.broadcast_address = (
-            settings.discovery.broadcast.broadcast_address  # type: ignore[attr-defined]
-        )
-        self.known_workers: Dict[str, WorkerEndpoint] = {}
-        self._running = False
-        self._server_task: Optional["asyncio.Task[None]"] = None
-        self._broadcast_task: Optional["asyncio.Task[None]"] = None
-
-    async def start(self) -> None:
-        """Start broadcast discovery."""
-        self._running = True
-
-        # Start UDP server to listen for responses
-        self._server_task = asyncio.create_task(self._udp_server())
-
-        # Start periodic broadcasting
-        self._broadcast_task = asyncio.create_task(self._periodic_broadcast())
-
-        logger.info(f"Broadcast discovery started on port {self.port}")
-
-    async def stop(self) -> None:
-        """Stop broadcast discovery."""
-        self._running = False
-
-        if self._server_task:
-            self._server_task.cancel()
-            try:
-                await self._server_task
-            except asyncio.CancelledError:
-                pass
-
-        if self._broadcast_task:
-            self._broadcast_task.cancel()
-            try:
-                await self._broadcast_task
-            except asyncio.CancelledError:
-                pass
-
-    async def _udp_server(self) -> None:
-        """UDP server to listen for worker responses."""
-        loop = asyncio.get_running_loop()
-
-        # Create UDP socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        # Bind to interface if specified (SO_BINDTODEVICE is Linux-only)
-        if self.interface and hasattr(socket, "SO_BINDTODEVICE"):
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, self.interface.encode())
-            except OSError as e:
-                logger.warning(f"Could not bind to interface {self.interface}: {e}")
-
-        sock.bind(("", self.port))
-        sock.setblocking(False)
-
-        try:
-            while self._running:
-                try:
-                    # sock_recvfrom needs Python >= 3.11 — removed in Task 28 (dead provider)
-                    data, addr = await loop.sock_recvfrom(sock, 1024)  # type: ignore[attr-defined]
-                    await self._handle_broadcast_response(data, addr)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error(f"UDP server error: {e}")
-        finally:
-            sock.close()
-
-    async def _handle_broadcast_response(self, data: bytes, addr: Tuple[str, int]) -> None:
-        """Handle response from worker."""
-        try:
-            message = json.loads(data.decode())
-
-            if message.get("type") == "worker_announce":
-                endpoint = WorkerEndpoint(
-                    address=f"{addr[0]}:{message.get('port', 50051)}",
-                    worker_id=message.get("worker_id"),
-                    gpu_count=message.get("gpus", 0),
-                    total_memory_gb=message.get("memory_gb", 0),
-                    tags=message.get("tags", {}),
-                )
-
-                self.known_workers[endpoint.address] = endpoint
-
-                if self.on_worker_found:
-                    await self.on_worker_found(endpoint)
-
-                logger.debug(f"Discovered worker via broadcast: {endpoint.address}")
-
-        except Exception as e:
-            logger.error(f"Error handling broadcast response: {e}")
-
-    async def _periodic_broadcast(self) -> None:
-        """Periodically broadcast discovery requests."""
-        while self._running:
-            try:
-                await self._broadcast_discovery()
-                await asyncio.sleep(self.settings.discovery_interval)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Broadcast error: {e}")
-
-    async def _broadcast_discovery(self) -> None:
-        """Send UDP broadcast discovery request."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-        # Bind to interface if specified (SO_BINDTODEVICE is Linux-only)
-        if self.interface and hasattr(socket, "SO_BINDTODEVICE"):
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, self.interface.encode())
-            except OSError as e:
-                logger.warning(f"Could not bind to interface {self.interface}: {e}")
-
-        message = {
-            "type": "discovery_request",
-            "coordinator_id": socket.gethostname(),
-            "timestamp": time.time(),
-        }
-
-        try:
-            sock.sendto(json.dumps(message).encode(), (self.broadcast_address, self.port))
-            logger.debug(
-                f"Broadcast discovery request sent to {self.broadcast_address}:{self.port}"
-            )
-        except Exception as e:
-            logger.error(f"Failed to send broadcast: {e}")
-        finally:
-            sock.close()
-
-    async def discover(self) -> List[WorkerEndpoint]:
-        """Return currently discovered workers."""
-        # Clean up stale workers (older than 3 intervals)
-        stale_threshold = time.time() - (self.settings.discovery_interval * 3)
-        self.known_workers = {
-            addr: worker
-            for addr, worker in self.known_workers.items()
-            if worker.last_seen > stale_threshold
-        }
-
-        return list(self.known_workers.values())
-
-
-class ConsulDiscoveryProvider(DiscoveryProvider):
-    """Consul service discovery provider."""
-
-    def __init__(self, settings: Settings):
-        super().__init__(settings)
-        # NOTE: settings.discovery does not exist — this class is dead-on-arrival
-        # code deleted wholesale in a later task. type: ignore keeps mypy strict
-        # green in the interim without fabricating a fake Settings field.
-        self.host = settings.discovery.consul.host  # type: ignore[attr-defined]
-        self.port = settings.discovery.consul.port  # type: ignore[attr-defined]
-        self.service_name = settings.discovery.consul.service_name  # type: ignore[attr-defined]
-        self.datacenter = settings.discovery.consul.datacenter  # type: ignore[attr-defined]
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.known_workers: Dict[str, WorkerEndpoint] = {}
-        self._watch_task: Optional["asyncio.Task[None]"] = None
-
-    async def start(self) -> None:
-        """Start Consul discovery."""
-        self.session = aiohttp.ClientSession()
-        self._watch_task = asyncio.create_task(self._watch_services())
-        logger.info(f"Consul discovery started for {self.service_name}")
-
-    async def stop(self) -> None:
-        """Stop Consul discovery."""
-        if self._watch_task:
-            self._watch_task.cancel()
-            try:
-                await self._watch_task
-            except asyncio.CancelledError:
-                pass
-
-        if self.session:
-            await self.session.close()
-
-    async def _watch_services(self) -> None:
-        """Watch for service changes in Consul."""
-        last_index = 0
-
-        while True:
-            try:
-                # Long-poll for changes
-                url = f"http://{self.host}:{self.port}/v1/health/service/{self.service_name}"
-                params = {
-                    "index": last_index,
-                    "wait": "60s",
-                    "dc": self.datacenter,
-                }
-
-                assert self.session is not None  # set in start(); removed in Task 28
-                async with self.session.get(url, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-
-                        # Update index for next request
-                        last_index = int(response.headers.get("X-Consul-Index", last_index))
-
-                        # Process services
-                        await self._process_services(data)
-
-                    elif response.status != 404:
-                        logger.error(f"Consul API error: {response.status}")
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Consul watch error: {e}")
-                await asyncio.sleep(5)
-
-    async def _process_services(self, services: List[Dict[str, Any]]) -> None:
-        """Process service entries from Consul."""
-        current_addresses: set[str] = set()
-
-        for service in services:
-            # Check if service is healthy
-            if not self._is_service_healthy(service):
-                continue
-
-            # Extract service info
-            node = service.get("Node", {})
-            svc = service.get("Service", {})
-
-            address = node.get("Address")
-            port = svc.get("Port", 50051)
-            tags = svc.get("Tags", [])
-
-            # Parse tags into dict
-            tag_dict: Dict[str, str] = {}
-            for tag in tags:
-                if "=" in tag:
-                    key, value = tag.split("=", 1)
-                    tag_dict[key] = value
-
-            endpoint = WorkerEndpoint(
-                address=f"{address}:{port}",
-                worker_id=svc.get("ID"),
-                gpu_count=int(tag_dict.get("gpus", 0)),
-                total_memory_gb=float(tag_dict.get("memory_gb", 0)),
-                tags=tag_dict,
-            )
-
-            current_addresses.add(endpoint.address)
-
-            # Check if new worker
-            if endpoint.address not in self.known_workers:
-                self.known_workers[endpoint.address] = endpoint
-                if self.on_worker_found:
-                    await self.on_worker_found(endpoint)
-                    logger.info(f"Discovered worker via Consul: {endpoint.address}")
-
-        # Check for removed workers
-        for addr in list(self.known_workers.keys()):
-            if addr not in current_addresses:
-                worker = self.known_workers.pop(addr)
-                if self.on_worker_lost:
-                    await self.on_worker_lost(worker)
-                    logger.info(f"Worker removed from Consul: {addr}")
-
-    def _is_service_healthy(self, service: Dict[str, Any]) -> bool:
-        """Check if service is healthy."""
-        # Check node health
-        for check in service.get("Checks", []):
-            if check.get("Status") != "passing":
-                return False
-
-        # Check service health
-        for check in service.get("ServiceChecks", []):
-            if check.get("Status") != "passing":
-                return False
-
-        return True
-
-    async def discover(self) -> List[WorkerEndpoint]:
-        """Return currently discovered workers."""
-        return list(self.known_workers.values())
-
-
 class WorkerDiscovery:
     """Main worker discovery manager."""
 
@@ -606,28 +185,11 @@ class WorkerDiscovery:
 
         if method == DiscoveryMethod.STATIC:
             self.providers[method] = StaticDiscoveryProvider(self.settings)
-
-        elif method == DiscoveryMethod.MDNS:
-            self.providers[method] = MDNSDiscoveryProvider(self.settings)
-
-        elif method == DiscoveryMethod.BROADCAST:
-            self.providers[method] = BroadcastDiscoveryProvider(self.settings)
-
-        elif method == DiscoveryMethod.CONSUL:
-            self.providers[method] = ConsulDiscoveryProvider(self.settings)
-
         else:
-            # Use multiple providers
-            if DiscoveryMethod.STATIC in method or "static" in method:
-                self.providers[DiscoveryMethod.STATIC] = StaticDiscoveryProvider(self.settings)
-            if DiscoveryMethod.MDNS in method or "mdns" in method:
-                self.providers[DiscoveryMethod.MDNS] = MDNSDiscoveryProvider(self.settings)
-            if DiscoveryMethod.BROADCAST in method or "broadcast" in method:
-                self.providers[DiscoveryMethod.BROADCAST] = BroadcastDiscoveryProvider(
-                    self.settings
-                )
-            if DiscoveryMethod.CONSUL in method or "consul" in method:
-                self.providers[DiscoveryMethod.CONSUL] = ConsulDiscoveryProvider(self.settings)
+            raise ValueError(
+                f"Discovery method '{method.value}' is not implemented yet — "
+                "only 'static' is supported. mDNS/broadcast/Consul are planned."
+            )
 
         # Set callbacks on providers
         for provider in self.providers.values():
@@ -705,7 +267,3 @@ class WorkerDiscovery:
     def get_all_workers(self) -> List[WorkerEndpoint]:
         """Get all discovered workers."""
         return list(self.workers.values())
-
-    def get_workers_by_tag(self, key: str, value: str) -> List[WorkerEndpoint]:
-        """Get workers with specific tag."""
-        return [w for w in self.workers.values() if w.tags.get(key) == value]

@@ -26,7 +26,6 @@ class WorkerState(Enum):
     CONNECTING = "connecting"
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"
-    DRAINING = "draining"
     OFFLINE = "offline"
 
 
