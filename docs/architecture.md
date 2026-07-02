@@ -103,7 +103,7 @@ The coordinator is the brain of the cluster, written in Python using FastAPI.
 - **Load Balancing**: Distribute load across workers
 - **Health Monitoring**: Track worker health and availability
 - **Model Registry**: Manage available models and their locations
-- **Authentication**: API key validation and rate limiting
+- **API request handling** (authentication/rate limiting are planned, not implemented)
 - **Metrics Collection**: Expose Prometheus metrics
 
 #### Internal Architecture:
@@ -185,13 +185,11 @@ The model layer provides implementations for various architectures.
 
 #### Supported Models:
 
-> **Implementation status**: Only the three architectures below have Rust implementations in `worker/models/`. The remaining model families listed in the README (Mixtral, Gemma, Phi, Qwen) are planned future additions.
-
-| Model Family | Architecture | Parallelism (core algorithms) | Quantization |
-|--------------|--------------|-------------------------------|--------------|
-| DeepSeek | MoE (Mixture of Experts) with sparse top-k routing | Pipeline, Expert (stub) | FP16, INT8, INT4 |
-| Llama 3 | GQA (Grouped Query Attention) + KV cache | Pipeline, Tensor | FP16, INT8, INT4 |
-| Mistral | Sliding Window Attention | Pipeline | FP16, INT8 |
+Loadable today (worker `model_loader.rs`): **Llama** (reference), **Qwen 2.5**
+(GQA + biases; Qwen3 rejected until q/k-norm lands), **DeepSeek dense** (Llama
+layout). DeepSeek MoE model code exists but V3-style routing/MLA is not
+implemented. Mistral model code exists but is not wired to the loader.
+Phi/Gemma/Mixtral: planned.
 
 ---
 
@@ -490,7 +488,7 @@ Distributes experts across GPUs for Mixture of Experts models.
 │                      Single Server                         │
 │    ┌─────────────────────────────────────────────────┐     │
 │    │              Coordinator Container              │     │
-│    │              Port: 8000, 9090                   │     │
+│    │              Port: 8000 (API + /metrics)         │     │
 │    └──────────────────────┬──────────────────────────┘     │
 │                           │                                │
 │  ┌─────────────┬──────────┴──┬─────────────┬─────────────┐ │
@@ -531,6 +529,8 @@ Distributes experts across GPUs for Mixture of Experts models.
 ```
 
 ### 3. Kubernetes Deployment
+
+> **Planned** — no manifests ship in this repo yet; the sketch below is a design target.
 
 ```yaml
 apiVersion: apps/v1
@@ -580,6 +580,8 @@ spec:
 
 ### 3. Throughput Scaling
 
+> Projected goals, not measured benchmarks (same disclaimer as the README).
+
 | GPUs | Model | Batch Size | Throughput (tokens/s) | Scaling Efficiency |
 |------|-------|------------|----------------------|-------------------|
 | 1 | DeepSeek-7B | 1 | 45 | 1.0x |
@@ -592,7 +594,9 @@ spec:
 
 ---
 
-## Security Architecture
+## Security Architecture (Roadmap)
+
+> None of the controls in this section are implemented yet: transport is plaintext gRPC/HTTP, there is no authN/Z, rate limiting, audit logging, or secure erasure. Deploy on trusted networks only.
 
 ### 1. Authentication & Authorization
 
