@@ -29,6 +29,30 @@ async def test_target_worker_unavailable_fails_fast() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_status_uses_settings_thresholds() -> None:
+    """A worker built by the coordinator honors Settings health thresholds, not hardcodes."""
+    from unittest.mock import AsyncMock
+
+    from coordinator.coordinator import WorkerInfo, WorkerState
+
+    worker = WorkerInfo(
+        id="w1",
+        address="127.0.0.1:1",
+        channel=AsyncMock(),
+        stub=AsyncMock(),
+        health_check_timeout=1,
+        max_failures=2,
+    )
+    worker.stub.GetStatus = AsyncMock(side_effect=RuntimeError("down"))
+    await worker.get_status()
+    assert worker.state != WorkerState.UNHEALTHY  # 1 failure < max_failures
+    await worker.get_status()
+    # mypy narrows worker.state from the assert above and doesn't know get_status()
+    # mutates it — this is a real state transition, not a dead comparison.
+    assert worker.state == WorkerState.UNHEALTHY  # type: ignore[comparison-overlap]
+
+
+@pytest.mark.asyncio
 async def test_infer_pops_context_on_error() -> None:
     settings = make_settings(request_timeout=30)
     coord = ClusterCoordinator(settings)

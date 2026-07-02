@@ -6,7 +6,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import grpc
 
@@ -52,11 +52,13 @@ class WorkerInfo:
     total_requests: int = 0
     avg_latency_ms: float = 0
     max_requests: int = 10  # Configurable via coordinator settings
+    health_check_timeout: int = 5
+    max_failures: int = 3
 
     async def get_status(self) -> Optional[pb.WorkerStatus]:
         """Get current worker status."""
         try:
-            status = await self.stub.GetStatus(pb.Empty(), timeout=60)
+            status = await self.stub.GetStatus(pb.Empty(), timeout=self.health_check_timeout)
             self.state = WorkerState.HEALTHY
             self.consecutive_failures = 0
             self.gpus = list(status.gpus)
@@ -66,7 +68,7 @@ class WorkerInfo:
         except Exception as e:
             self.consecutive_failures += 1
             self.last_error = str(e)
-            if self.consecutive_failures >= 10:
+            if self.consecutive_failures >= self.max_failures:
                 self.state = WorkerState.UNHEALTHY
             logger.warning(f"Failed to get status from {self.id}: {e}")
             return None
@@ -127,6 +129,7 @@ class ClusterCoordinator:
         self._discovery_task: Optional["asyncio.Task[None]"] = None
         self._health_check_task: Optional["asyncio.Task[None]"] = None
         self._processor_task: Optional["asyncio.Task[None]"] = None
+        self._inflight: "Set[asyncio.Task[None]]" = set()
 
         # Components
         self.discovery = WorkerDiscovery(settings)
@@ -220,53 +223,59 @@ class ClusterCoordinator:
             await asyncio.sleep(self.settings.discovery_interval)
 
     async def _connect_worker(self, address: str) -> Optional[WorkerInfo]:
-        """Connect to a worker at the given address."""
+        """Connect to a worker at the given address (network RPC held outside the lock)."""
         async with self._workers_lock:
-            # Check if already connected
             for worker in self.workers.values():
                 if worker.address == address:
                     return worker
 
-            try:
-                logger.info(f"Connecting to worker at {address}")
+        try:
+            logger.info(f"Connecting to worker at {address}")
+            channel = grpc.aio.insecure_channel(
+                address,
+                options=[
+                    ("grpc.keepalive_time_ms", 60000),
+                    ("grpc.keepalive_timeout_ms", 40000),
+                    ("grpc.http2.max_pings_without_data", 0),
+                    ("grpc.keepalive_permit_without_calls", 1),
+                ],
+            )
+            stub = pb_grpc.WorkerStub(channel)
+            status = await stub.GetStatus(pb.Empty(), timeout=30)
+        except Exception as e:
+            logger.error(f"Failed to connect to worker at {address}: {e}")
+            return None
 
-                # Create gRPC channel
-                channel = grpc.aio.insecure_channel(
-                    address,
-                    options=[
-                        ("grpc.keepalive_time_ms", 60000),  # 1 minute
-                        ("grpc.keepalive_timeout_ms", 40000),  # 40 seconds
-                        ("grpc.http2.max_pings_without_data", 0),
-                        ("grpc.keepalive_permit_without_calls", 1),
-                    ],
+        worker_id = status.worker_id or f"worker-{uuid.uuid4().hex[:8]}"
+        worker = WorkerInfo(
+            id=worker_id,
+            address=address,
+            channel=channel,
+            stub=stub,
+            max_requests=self.settings.max_concurrent_requests_per_worker,
+            health_check_timeout=self.settings.health_check_timeout,
+            max_failures=self.settings.max_failures,
+        )
+        worker.state = WorkerState.HEALTHY
+        worker.gpus = list(status.gpus)
+
+        async with self._workers_lock:
+            # Re-check: another task may have connected the same address meanwhile.
+            for existing in self.workers.values():
+                if existing.address == address:
+                    await channel.close()
+                    return existing
+            if worker_id in self.workers:
+                logger.warning(
+                    f"Worker id {worker_id} already registered from "
+                    f"{self.workers[worker_id].address}; refusing duplicate from {address}"
                 )
-
-                # Create stub
-                stub = pb_grpc.WorkerStub(channel)
-
-                # Test connection with status check (increased timeout for busy workers)
-                status = await stub.GetStatus(pb.Empty(), timeout=30)
-
-                worker_id = status.worker_id or f"worker-{len(self.workers)}"
-
-                worker = WorkerInfo(
-                    id=worker_id,
-                    address=address,
-                    channel=channel,
-                    stub=stub,
-                    max_requests=self.settings.max_concurrent_requests_per_worker,
-                )
-                worker.state = WorkerState.HEALTHY
-                worker.gpus = list(status.gpus)
-
-                self.workers[worker_id] = worker
-                logger.info(f"Connected to worker {worker_id} with {len(worker.gpus)} GPUs")
-
-                return worker
-
-            except Exception as e:
-                logger.error(f"Failed to connect to worker at {address}: {e}")
+                await channel.close()
                 return None
+            self.workers[worker_id] = worker
+
+        logger.info(f"Connected to worker {worker_id} with {len(worker.gpus)} GPUs")
+        return worker
 
     async def _health_check_loop(self) -> None:
         """Background task for checking worker health."""
@@ -281,9 +290,16 @@ class ClusterCoordinator:
                     continue
 
                 # 2. Perform health checks concurrently (NO LOCK HELD)
-                # This ensures slow network IO doesn't block the request processor
+                # This ensures slow network IO doesn't block the request processor.
+                # OFFLINE means "no longer discovered" — do NOT resurrect via get_status;
+                # let the cleanup below evict it even when it still answers RPCs.
                 await asyncio.gather(
-                    *[worker.get_status() for worker in workers_to_check], return_exceptions=True
+                    *[
+                        worker.get_status()
+                        for worker in workers_to_check
+                        if worker.state != WorkerState.OFFLINE
+                    ],
+                    return_exceptions=True,
                 )
 
                 # 3. Handle cleanup of offline workers under lock
@@ -342,8 +358,10 @@ class ClusterCoordinator:
 
                 logger.debug(f"Selected worker {worker.id} for request {request_id}")
                 logger.info(f"Dispatching request {request_id} to worker {worker.id}")
-                # Execute request concurrently
-                asyncio.create_task(self._execute_request(ctx, worker))
+                # Execute request concurrently (keep a strong ref so it isn't GC'd mid-flight)
+                task = asyncio.create_task(self._execute_request(ctx, worker))
+                self._inflight.add(task)
+                task.add_done_callback(self._inflight.discard)
 
             except asyncio.CancelledError:
                 # Propagate — stop() awaits this task expecting CancelledError.
