@@ -471,3 +471,24 @@ default = "none"
 [models.deepseek-v3.parallelism]
 supported = ["single", "tensor", "pipeline"]
 default = "tensor"
+
+# GGUF / llama.cpp Models
+# =======================
+# Served by the worker's llama.cpp engine (worker built with --features llamacpp).
+# Architecture parameters come from GGUF metadata, so no [.architecture] block
+# is needed. `engine` defaults to "burn" for every other model in this file.
+
+[models."qwen2.5-0.5b-gguf"]
+family = "qwen"
+description = "Qwen2.5 0.5B Instruct — Q4_K_M GGUF served by the llama.cpp engine"
+parameters = "0.5B"
+min_memory_gb = 1
+recommended_gpus = 1
+max_gpus = 1
+engine = "llamacpp"
+
+[models."qwen2.5-0.5b-gguf".gguf]
+repo_id = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+file = "qwen2.5-0.5b-instruct-q4_k_m.gguf"  # ~469 MiB download
+n_gpu_layers = -1  # -1 = offload all layers to the GPU
+n_ctx = 4096

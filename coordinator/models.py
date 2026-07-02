@@ -82,6 +82,14 @@ class ModelConfig:
     paper_url: Optional[str] = None
     model_url: Optional[str] = None
 
+    # Inference engine selection ("burn" = default Burn/safetensors path,
+    # "llamacpp" = GGUF served by the worker's llama.cpp engine)
+    engine: str = "burn"
+    gguf_repo_id: Optional[str] = None  # HF repo containing the GGUF file
+    gguf_file: Optional[str] = None  # exact .gguf filename inside the repo
+    gguf_n_gpu_layers: Optional[int] = None  # -1 = all layers on GPU
+    gguf_n_ctx: Optional[int] = None  # context window override
+
     def __post_init__(self) -> None:
         """Validate configuration."""
         if self.is_moe and not self.num_experts:
@@ -89,6 +97,32 @@ class ModelConfig:
 
         if self.num_kv_heads is None:
             self.num_kv_heads = self.num_attention_heads
+
+        if self.engine not in ("burn", "llamacpp"):
+            raise ValueError(f"Unknown engine '{self.engine}' (expected 'burn' or 'llamacpp')")
+
+        if self.engine == "llamacpp" and not (self.gguf_repo_id and self.gguf_file):
+            raise ValueError("llamacpp engine models must set gguf.repo_id and gguf.file")
+
+    def grpc_metadata(self) -> Dict[str, str]:
+        """Engine-routing metadata carried in the gRPC ModelConfig.metadata map.
+
+        The worker's model loader reads these string keys to route the model to
+        the llama.cpp engine. Burn models send an empty map (zero proto change,
+        fully backwards compatible).
+        """
+        if self.engine != "llamacpp":
+            return {}
+        metadata: Dict[str, str] = {
+            "engine": "llamacpp",
+            "gguf_repo_id": self.gguf_repo_id or "",
+            "gguf_file": self.gguf_file or "",
+        }
+        if self.gguf_n_gpu_layers is not None:
+            metadata["n_gpu_layers"] = str(self.gguf_n_gpu_layers)
+        if self.gguf_n_ctx is not None:
+            metadata["n_ctx"] = str(self.gguf_n_ctx)
+        return metadata
 
 
 class ModelRegistry:
@@ -325,6 +359,7 @@ class ModelRegistry:
                 parallel = get_dict(final_data, "parallelism")
                 paths = get_dict(final_data, "paths")
                 hf = get_dict(final_data, "hf")
+                gguf = get_dict(final_data, "gguf")
 
                 # Determine supported quantizations
                 supported_quants = quants.get("supported")
@@ -371,6 +406,13 @@ class ModelRegistry:
                     weights_path=paths.get("weights"),
                     hf_repo_id=hf.get("repo_id"),
                     description=final_data.get("description", ""),
+                    engine=str(final_data.get("engine", "burn")),
+                    gguf_repo_id=gguf.get("repo_id"),
+                    gguf_file=gguf.get("file"),
+                    gguf_n_gpu_layers=(
+                        int(gguf["n_gpu_layers"]) if "n_gpu_layers" in gguf else None
+                    ),
+                    gguf_n_ctx=int(gguf["n_ctx"]) if "n_ctx" in gguf else None,
                 )
                 cls.MODELS[model_name] = model
             except Exception as e:

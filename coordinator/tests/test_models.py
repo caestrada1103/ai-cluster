@@ -1,6 +1,9 @@
 """Tests for coordinator.models — ModelRegistry, ModelConfig, and enums."""
 
+from pathlib import Path
+
 import pytest
+import toml
 
 from coordinator.models import (
     ModelConfig,
@@ -236,3 +239,121 @@ def test_qwen_coder_entry_matches_real_repo() -> None:
     assert cfg.hf_repo_id == "Qwen/Qwen2.5-Coder-32B-Instruct"
     assert cfg.vocab_size == 152064
     assert cfg.max_seq_len == 32768
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp engine / GGUF registry fields
+# ---------------------------------------------------------------------------
+
+
+def test_engine_defaults_to_burn() -> None:
+    cfg = ModelRegistry.get_model("llama3-8b")
+    assert cfg is not None
+    assert cfg.engine == "burn"
+    assert cfg.grpc_metadata() == {}
+
+
+def test_llamacpp_engine_requires_gguf_source() -> None:
+    with pytest.raises(ValueError, match="gguf"):
+        ModelConfig(
+            name="bad-gguf",
+            family=ModelFamily.QWEN,
+            parameters="0.5B",
+            min_memory_gb=1,
+            recommended_gpus=1,
+            max_gpus=1,
+            num_layers=0,
+            hidden_size=0,
+            num_attention_heads=0,
+            vocab_size=0,
+            max_seq_len=4096,
+            intermediate_size=0,
+            engine="llamacpp",  # no gguf_repo_id / gguf_file -> must raise
+        )
+
+
+def test_unknown_engine_rejected() -> None:
+    with pytest.raises(ValueError, match="engine"):
+        ModelConfig(
+            name="bad-engine",
+            family=ModelFamily.LLAMA,
+            parameters="7B",
+            min_memory_gb=8,
+            recommended_gpus=1,
+            max_gpus=1,
+            num_layers=0,
+            hidden_size=0,
+            num_attention_heads=0,
+            vocab_size=0,
+            max_seq_len=2048,
+            intermediate_size=0,
+            engine="vllm",
+        )
+
+
+def test_load_from_dict_parses_gguf_section() -> None:
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "registry-test-gguf": {
+                    "family": "qwen",
+                    "parameters": "0.5B",
+                    "min_memory_gb": 1,
+                    "engine": "llamacpp",
+                    "gguf": {
+                        "repo_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+                        "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+                        "n_gpu_layers": -1,
+                        "n_ctx": 4096,
+                    },
+                }
+            }
+        }
+    )
+    cfg = ModelRegistry.get_model("registry-test-gguf")
+    assert cfg is not None
+    assert cfg.engine == "llamacpp"
+    assert cfg.gguf_repo_id == "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+    assert cfg.gguf_file == "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+    assert cfg.gguf_n_gpu_layers == -1
+    assert cfg.gguf_n_ctx == 4096
+
+
+def test_grpc_metadata_for_llamacpp_model() -> None:
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "metadata-test-gguf": {
+                    "family": "qwen",
+                    "parameters": "0.5B",
+                    "min_memory_gb": 1,
+                    "engine": "llamacpp",
+                    "gguf": {
+                        "repo_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+                        "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+                        "n_gpu_layers": 20,
+                        "n_ctx": 2048,
+                    },
+                }
+            }
+        }
+    )
+    cfg = ModelRegistry.get_model("metadata-test-gguf")
+    assert cfg is not None
+    assert cfg.grpc_metadata() == {
+        "engine": "llamacpp",
+        "gguf_repo_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "gguf_file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        "n_gpu_layers": "20",
+        "n_ctx": "2048",
+    }
+
+
+def test_real_models_toml_gguf_entry_loads() -> None:
+    models_toml = Path(__file__).resolve().parents[2] / "config" / "models.toml"
+    ModelRegistry.load_from_dict(toml.load(models_toml))
+    cfg = ModelRegistry.get_model("qwen2.5-0.5b-gguf")
+    assert cfg is not None
+    assert cfg.engine == "llamacpp"
+    assert cfg.gguf_repo_id == "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+    assert cfg.gguf_file == "qwen2.5-0.5b-instruct-q4_k_m.gguf"
