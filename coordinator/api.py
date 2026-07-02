@@ -134,7 +134,7 @@ class WorkerInfoResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _get_coordinator(request: "Request[Any]") -> Any:
+def _get_coordinator(request: Request) -> Any:  # type: ignore[type-arg]
     """Retrieve the ClusterCoordinator stored in app state."""
     coordinator = getattr(request.app.state, "coordinator", None)
     if coordinator is None:
@@ -156,7 +156,7 @@ def _parse_model_and_worker(model_string: str) -> tuple[str, Optional[str]]:
 
 
 @router.post("/completions", response_model=CompletionResponse)
-async def create_completion(body: CompletionRequest, request: "Request[Any]") -> CompletionResponse:
+async def create_completion(body: CompletionRequest, request: Request) -> CompletionResponse:  # type: ignore[type-arg]
     """Run inference on the cluster."""
     coordinator = _get_coordinator(request)
 
@@ -260,9 +260,9 @@ async def _stream_chat_completion(
         coordinator.active_requests.pop(ctx.id, None)
 
 
-@router.post("/chat/completions")
+@router.post("/chat/completions", response_model=None)
 async def create_chat_completion(
-    body: ChatCompletionRequest, request: "Request[Any]"
+    body: ChatCompletionRequest, request: Request  # type: ignore[type-arg]
 ) -> Union[Dict[str, Any], StreamingResponse]:
     """OpenAI-compatible chat completions endpoint used by Open-WebUI."""
     logger.info(f"Received chat completion request for model: {body.model}")
@@ -328,7 +328,7 @@ async def create_chat_completion(
 
 
 @router.get("/models", response_model=ModelsResponse)
-async def list_models(request: "Request[Any]") -> ModelsResponse:
+async def list_models(request: Request) -> ModelsResponse:  # type: ignore[type-arg]
     """List all available models in OpenAI-compatible format."""
     coordinator = _get_coordinator(request)
     custom_models = await coordinator.list_models()
@@ -351,7 +351,7 @@ async def list_models(request: "Request[Any]") -> ModelsResponse:
 
 
 @router.post("/models/load", response_model=LoadModelResponse)
-async def load_model(body: LoadModelRequest, request: "Request[Any]") -> LoadModelResponse:
+async def load_model(body: LoadModelRequest, request: Request) -> LoadModelResponse:  # type: ignore[type-arg]
     """Load a model onto a worker."""
     coordinator = _get_coordinator(request)
 
@@ -403,7 +403,7 @@ async def load_model(body: LoadModelRequest, request: "Request[Any]") -> LoadMod
 
 @router.delete("/models/{model_name}")
 async def unload_model(
-    model_name: str, request: "Request[Any]", worker_id: Optional[str] = None
+    model_name: str, request: Request, worker_id: Optional[str] = None  # type: ignore[type-arg]
 ) -> Dict[str, Any]:
     """Unload a model and free its GPU memory (all workers, or one via ?worker_id=)."""
     coordinator = _get_coordinator(request)
@@ -418,7 +418,7 @@ async def unload_model(
 
 
 @router.get("/workers", response_model=List[WorkerInfoResponse])
-async def list_workers(request: "Request[Any]") -> List[Dict[str, Any]]:
+async def list_workers(request: Request) -> List[Dict[str, Any]]:  # type: ignore[type-arg]
     """List all connected workers."""
     coordinator = _get_coordinator(request)
     result: List[Dict[str, Any]] = await coordinator.list_workers()
@@ -427,7 +427,7 @@ async def list_workers(request: "Request[Any]") -> List[Dict[str, Any]]:
 
 @router.post("/workers/manual")
 async def add_manual_worker(
-    addresses: List[str], request: "Request[Any]"
+    addresses: List[str], request: Request  # type: ignore[type-arg]
 ) -> Dict[str, List[Dict[str, str]]]:
     """Manually add a worker by its host:port address."""
     coordinator = _get_coordinator(request)
