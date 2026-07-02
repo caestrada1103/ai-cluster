@@ -152,7 +152,13 @@ pub fn repeat_kv<B: Backend>(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
 /// Apply top-k and top-p (nucleus) filtering to logits, then sample.
 ///
 /// Returns the sampled token index.
-pub fn top_k_top_p_sample(logits: &[f32], temperature: f32, top_p: f32, top_k: usize) -> usize {
+pub fn top_k_top_p_sample(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    rng: &mut rand::rngs::StdRng,
+) -> usize {
     if logits.is_empty() {
         return 0;
     }
@@ -210,9 +216,18 @@ pub fn top_k_top_p_sample(logits: &[f32], temperature: f32, top_p: f32, top_k: u
         }
     }
 
-    // Sample (deterministic fallback: argmax)
-    // In production this would use a proper RNG; for now pick the most likely.
-    probs[0].0
+    // Sample from the re-normalised distribution.
+    use rand::Rng;
+    let r: f32 = rng.gen();
+    let mut acc = 0.0_f32;
+    for &(i, p) in &probs {
+        acc += p;
+        if r <= acc {
+            return i;
+        }
+    }
+    // Floating-point slack: fall back to the least-probable kept token.
+    probs.last().map(|&(i, _)| i).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -251,4 +266,46 @@ pub fn swiglu<B: Backend>(gate: Tensor<B, 3>, up: Tensor<B, 3>) -> Tensor<B, 3> 
     let sigmoid = gate.clone().neg().exp().add_scalar(1.0).recip();
     let silu = gate * sigmoid;
     silu * up
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    #[test]
+    fn test_sampling_is_not_always_argmax() {
+        // Two near-equal logits: over 1000 draws BOTH indices must appear.
+        let logits = [0.0_f32, 0.1_f32];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut seen = [false, false];
+        for _ in 0..1000 {
+            let idx = top_k_top_p_sample(&logits, 1.0, 1.0, 0, &mut rng);
+            seen[idx] = true;
+        }
+        assert!(seen[0] && seen[1], "sampler must draw both candidates, got {:?}", seen);
+    }
+
+    #[test]
+    fn test_top_k_one_is_argmax() {
+        let logits = [0.1_f32, 3.0, 0.2, 0.05];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        for _ in 0..100 {
+            assert_eq!(top_k_top_p_sample(&logits, 1.0, 1.0, 1, &mut rng), 1);
+        }
+    }
+
+    #[test]
+    fn test_seeded_sampling_is_deterministic() {
+        let logits = [0.3_f32, 0.2, 0.5, 0.1];
+        let a: Vec<usize> = {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+            (0..50).map(|_| top_k_top_p_sample(&logits, 1.0, 0.9, 0, &mut rng)).collect()
+        };
+        let b: Vec<usize> = {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+            (0..50).map(|_| top_k_top_p_sample(&logits, 1.0, 0.9, 0, &mut rng)).collect()
+        };
+        assert_eq!(a, b);
+    }
 }

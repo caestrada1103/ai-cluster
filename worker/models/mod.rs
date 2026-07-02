@@ -81,7 +81,7 @@ pub type TextStream = Pin<Box<dyn Stream<Item = Result<String, WorkerError>> + S
 
 /// Trait for type-erased text generation
 pub trait TextGeneration: Send {
-    /// Generate text stream
+    /// Generate text stream. `seed` = Some(n) gives deterministic sampling.
     fn generate(
         &self,
         prompt: &str,
@@ -89,6 +89,7 @@ pub trait TextGeneration: Send {
         temperature: f32,
         top_p: f32,
         top_k: usize,
+        seed: Option<u64>,
     ) -> Result<TextStream, WorkerError>;
 }
 
@@ -180,6 +181,7 @@ impl ModelInstance {
         temperature: f32,
         top_p: f32,
         top_k: usize,
+        seed: Option<u64>,
     ) -> Result<TextStream, WorkerError> {
         if let Some(model) = &self.model {
             let stream = {
@@ -187,7 +189,7 @@ impl ModelInstance {
                 let guard = model.lock()
                     .map_err(|e| WorkerError::Internal(format!("Lock error: {}", e)))?;
                 debug!("ModelInstance::generate acquired Mutex for {}", self.name);
-                let res = guard.generate(prompt, max_tokens, temperature, top_p, top_k);
+                let res = guard.generate(prompt, max_tokens, temperature, top_p, top_k, seed);
                 debug!("ModelInstance::generate trait call finished for {}", self.name);
                 res?
             }; // guard dropped here, stream is 'static

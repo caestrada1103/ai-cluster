@@ -708,6 +708,7 @@ impl<B: Backend> TextGeneration for DeepSeek<B> {
         temperature: f32,
         top_p: f32,
         top_k: usize,
+        seed: Option<u64>,
     ) -> Result<super::TextStream, WorkerError> {
         let tokens = self.tokenize_prompt(prompt)?;
         let prompt_len = tokens.len();
@@ -724,14 +725,21 @@ impl<B: Backend> TextGeneration for DeepSeek<B> {
                 .reshape([1, prompt_len]);
             let (logits_vec, mut kv_cache) = model.prefill(input);
 
-            let sample = |logits: &[f32]| -> u32 {
+            use rand::SeedableRng;
+            let mut rng = match seed {
+                Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+                None => rand::rngs::StdRng::from_entropy(),
+            };
+            let mut sample = |logits: &[f32]| -> u32 {
                 if temperature < 0.01 {
+                    // Deterministic argmax for temperature ~ 0
                     logits.iter().enumerate()
                         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                         .map(|(i, _)| i as u32)
                         .unwrap_or(0)
                 } else {
-                    super::common::top_k_top_p_sample(logits, temperature, top_p, top_k) as u32
+                    super::common::top_k_top_p_sample(logits, temperature, top_p, top_k, &mut rng)
+                        as u32
                 }
             };
 

@@ -245,6 +245,8 @@ impl Worker for WorkerService {
             let start_time = Instant::now();
             let mut tokens_generated: u32 = 0;
 
+            // proto: seed == 0 means "random"
+            let seed = if req.seed == 0 { None } else { Some(req.seed as u64) };
             // Run inference
             let inference_result = timeout(
                 timeout_duration,
@@ -254,6 +256,7 @@ impl Worker for WorkerService {
                     req.temperature,
                     req.top_p,
                     req.top_k as usize,
+                    seed,
                 )
             ).await;
 
