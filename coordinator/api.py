@@ -7,6 +7,7 @@ Endpoints:
     POST /models/load  - Load a model onto a worker
     GET  /workers      - List connected workers
 """
+import asyncio
 import json
 import logging
 import time
@@ -170,7 +171,7 @@ async def create_completion(body: CompletionRequest, request: "Request[Any]") ->
             temperature=body.temperature,
             top_p=body.top_p,
             top_k=body.top_k,
-            stream=body.stream,
+            stream=False,  # /v1/completions is buffered; only /v1/chat/completions streams
             worker_id=worker_id,
             session_id=body.session_id,
         )
@@ -206,14 +207,31 @@ def _build_flat_response(result: Dict[str, Any], model: str) -> Dict[str, Any]:
     }
 
 
-async def _stream_chat_completion(ctx: Any, model: str) -> AsyncGenerator[str, None]:
-    """Generator for OpenAI-compatible Server-Sent Events (SSE)."""
+async def _stream_chat_completion(
+    coordinator: Any, ctx: Any, model: str, timeout: float
+) -> AsyncGenerator[str, None]:
+    """Stream chunks live from the request's token queue as the worker produces them."""
+    deadline = time.time() + timeout
     try:
         while True:
-            # Wait for next token from the queue
-            response = await ctx.token_queue.get()
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                error_chunk = {"error": {"message": "request timed out", "type": "timeout"}}
+                yield f"data: {json.dumps(error_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+                break
+            try:
+                response = await asyncio.wait_for(
+                    ctx.token_queue.get(), timeout=min(remaining, 1.0)
+                )
+            except asyncio.TimeoutError:
+                if ctx.error:
+                    error_chunk = {"error": {"message": ctx.error, "type": "internal_error"}}
+                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    break
+                continue  # still generating — poll again
 
-            # Build SSE chunk
             chunk = {
                 "id": ctx.id,
                 "object": "chat.completion.chunk",
@@ -222,12 +240,12 @@ async def _stream_chat_completion(ctx: Any, model: str) -> AsyncGenerator[str, N
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {"content": response.text if not response.finished else ""},
+                        # Emit the text even on the final chunk (proto allows text+finished)
+                        "delta": {"content": response.text},
                         "finish_reason": "stop" if response.finished else None,
                     }
                 ],
             }
-
             yield f"data: {json.dumps(chunk)}\n\n"
 
             if response.finished:
@@ -238,6 +256,8 @@ async def _stream_chat_completion(ctx: Any, model: str) -> AsyncGenerator[str, N
         error_chunk = {"error": {"message": str(e), "type": "internal_error"}}
         yield f"data: {json.dumps(error_chunk)}\n\n"
         yield "data: [DONE]\n\n"
+    finally:
+        coordinator.active_requests.pop(ctx.id, None)
 
 
 @router.post("/chat/completions")
@@ -267,6 +287,25 @@ async def create_chat_completion(
     prompt += "<|assistant|>\n"
 
     try:
+        if body.stream:
+            # Return immediately and stream tokens as the worker produces them.
+            ctx = await coordinator.submit_request(
+                model_name=model_name,
+                prompt=prompt,
+                max_tokens=body.max_tokens or 512,
+                temperature=body.temperature or 0.7,
+                top_p=body.top_p or 0.95,
+                top_k=body.top_k or 40,
+                stream=True,
+                worker_id=worker_id,
+                session_id=body.session_id,
+            )
+            timeout = coordinator.settings.request_timeout
+            return StreamingResponse(
+                _stream_chat_completion(coordinator, ctx, body.model, timeout),
+                media_type="text/event-stream",
+            )
+
         result = await coordinator.infer(
             model_name=model_name,
             prompt=prompt,
@@ -274,21 +313,10 @@ async def create_chat_completion(
             temperature=body.temperature or 0.7,
             top_p=body.top_p or 0.95,
             top_k=body.top_k or 40,
-            stream=body.stream or False,
+            stream=False,
             worker_id=worker_id,
             session_id=body.session_id,
         )
-
-        if body.stream:
-            request_context = coordinator.active_requests.pop(result["request_id"], None)
-            if not request_context:
-                # Fallback to flat result if somehow lost from context
-                return _build_flat_response(result, body.model)
-
-            return StreamingResponse(
-                _stream_chat_completion(request_context, body.model), media_type="text/event-stream"
-            )
-
         return _build_flat_response(result, body.model)
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc

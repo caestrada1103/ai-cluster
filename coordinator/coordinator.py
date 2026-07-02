@@ -107,6 +107,9 @@ class RequestContext:
     token_queue: "asyncio.Queue[Any]" = field(default_factory=asyncio.Queue)
     accumulated_text: str = ""
 
+    # Set exactly once when the request reaches a terminal state (success or error)
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+
 
 class ClusterCoordinator:
     """Main coordinator that manages workers and routes requests."""
@@ -304,6 +307,7 @@ class ClusterCoordinator:
     async def _request_processor(self) -> None:
         """Background task for processing queued requests."""
         while self.is_running:
+            ctx: Optional[RequestContext] = None
             try:
                 # Get next request from queue
                 request_id = await self.request_queue.get()
@@ -320,7 +324,9 @@ class ClusterCoordinator:
                         worker = self.workers.get(ctx.target_worker_id)
                     if not worker or not worker.is_available:
                         ctx.error = f"Target worker '{ctx.target_worker_id}' is not available"
-                        self.request_counter.labels(model=ctx.model_name, status="failed").inc()
+                        ctx.completed_at = time.time()
+                        ctx.done.set()
+                        self.request_counter.labels(model=ctx.model_name, status="error").inc()
                         continue
                 else:
                     # Default load balancing logic if no explicit target
@@ -330,7 +336,8 @@ class ClusterCoordinator:
                     logger.warning(f"No worker available for model {ctx.model_name}")
                     ctx.error = "No available workers"
                     ctx.completed_at = time.time()
-                    self.request_counter.labels(model=ctx.model_name, status="failed").inc()
+                    ctx.done.set()
+                    self.request_counter.labels(model=ctx.model_name, status="error").inc()
                     continue
 
                 logger.debug(f"Selected worker {worker.id} for request {request_id}")
@@ -339,7 +346,14 @@ class ClusterCoordinator:
                 asyncio.create_task(self._execute_request(ctx, worker))
 
             except asyncio.CancelledError:
-                break
+                # Propagate — stop() awaits this task expecting CancelledError.
+                # Mark any request already picked up so infer()/SSE callers don't
+                # hang until their own timeout during coordinator shutdown.
+                if ctx is not None and not ctx.done.is_set():
+                    ctx.error = "Coordinator is shutting down"
+                    ctx.completed_at = time.time()
+                    ctx.done.set()
+                raise
             except Exception as e:
                 logger.error(f"Error in request processor: {e}")
 
@@ -412,6 +426,7 @@ class ClusterCoordinator:
             logger.error(f"Request {ctx.id} failed: {e}")
 
         finally:
+            ctx.done.set()
             worker.active_requests -= 1
             self.active_requests_gauge.set(len(self.active_requests))
 
@@ -482,10 +497,8 @@ class ClusterCoordinator:
             logger.exception(f"Error loading model on worker {worker.id}: {e}")
             return False
 
-    async def infer(self, model_name: str, prompt: str, **kwargs: Any) -> Dict[str, Any]:
-        """Submit an inference request."""
-
-        # Create request context
+    async def submit_request(self, model_name: str, prompt: str, **kwargs: Any) -> RequestContext:
+        """Create a request context and enqueue it. Returns immediately (streaming path)."""
         request_id = str(uuid.uuid4())
         ctx = RequestContext(
             id=request_id,
@@ -499,42 +512,41 @@ class ClusterCoordinator:
         self.active_requests[request_id] = ctx
         self.active_requests_gauge.set(len(self.active_requests))
 
-        # Queue for processing
         try:
             await asyncio.wait_for(self.request_queue.put(request_id), timeout=5)
         except asyncio.TimeoutError as exc:
             self.active_requests.pop(request_id, None)
             self.active_requests_gauge.set(len(self.active_requests))
             raise RuntimeError("Request queue full, try again later") from exc
+        return ctx
 
-        # Wait for completion
+    async def infer(self, model_name: str, prompt: str, **kwargs: Any) -> Dict[str, Any]:
+        """Submit an inference request and wait for the full result."""
+        ctx = await self.submit_request(model_name, prompt, **kwargs)
         timeout = kwargs.get("timeout", self.settings.request_timeout)
-        start_time = time.time()
 
-        while time.time() - start_time < timeout:
-            if ctx.completed_at is not None:
-                if ctx.error:
-                    self.active_requests.pop(request_id, None)
-                    raise RuntimeError(ctx.error)
+        try:
+            await asyncio.wait_for(ctx.done.wait(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(f"Request {ctx.id} timed out") from exc
+        finally:
+            # Buffered path always cleans up here; the streaming path uses
+            # submit_request() directly and cleans up in api.py's generator.
+            self.active_requests.pop(ctx.id, None)
+            self.active_requests_gauge.set(len(self.active_requests))
 
-                result = {
-                    "request_id": ctx.id,
-                    "text": getattr(ctx, "accumulated_text", ""),
-                    "tokens_generated": ctx.tokens_generated,
-                    "processing_time_ms": (ctx.completed_at - ctx.created_at) * 1000,
-                    "worker_id": ctx.worker_id,
-                }
-                # For non-streaming requests clean up immediately.
-                # Streaming requests are cleaned up in api.py via .pop() on the context.
-                if not kwargs.get("stream", False):
-                    self.active_requests.pop(request_id, None)
-                return result
+        if ctx.error:
+            raise RuntimeError(ctx.error)
 
-            await asyncio.sleep(0.1)
-
-        # Timeout
-        self.active_requests.pop(request_id, None)
-        raise TimeoutError(f"Request {request_id} timed out")
+        return {
+            "request_id": ctx.id,
+            "text": ctx.accumulated_text,
+            "tokens_generated": ctx.tokens_generated,
+            "processing_time_ms": (
+                (ctx.completed_at - ctx.created_at) * 1000 if ctx.completed_at else 0.0
+            ),
+            "worker_id": ctx.worker_id,
+        }
 
     async def list_workers(self) -> List[Dict[str, Any]]:
         """List all connected workers."""
