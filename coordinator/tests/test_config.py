@@ -86,3 +86,31 @@ def test_load_models_config_unsupported_extension(tmp_path):
     s = Settings(models_config=bad_file, _env_file=None)
     with pytest.raises(ValueError, match="Unsupported"):
         s.load_models_config()
+
+
+def test_settings_ignores_unknown_dotenv_keys(tmp_path):
+    """The shared .env ships worker vars (GPU_COUNT, HF_TOKEN, ...); Settings must ignore them."""
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "GPU_COUNT=1\nHF_TOKEN=hf_dummy\nRUST_LOG=info\nGPU_INDEX=0\n"
+        "COORDINATOR_PORT=8123\n"
+    )
+    s = Settings(_env_file=str(env_file))
+    assert s.port == 8123
+
+
+def test_cors_origins_star_from_env(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("COORDINATOR_CORS_ORIGINS=*\n")
+    s = Settings(_env_file=str(env_file))
+    assert s.cors_origins == ["*"]
+
+
+def test_cors_origins_comma_separated():
+    s = Settings(cors_origins="https://a.example,https://b.example", _env_file=None)
+    assert s.cors_origins == ["https://a.example", "https://b.example"]
+
+
+def test_cors_origins_list_passthrough():
+    s = Settings(cors_origins=["https://a.example"], _env_file=None)
+    assert s.cors_origins == ["https://a.example"]

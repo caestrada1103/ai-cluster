@@ -2,12 +2,12 @@
 
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Annotated, Dict, List, Union
 
 import toml
 import yaml
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class DiscoveryMethod(str, Enum):
@@ -33,7 +33,7 @@ class Settings(BaseSettings):
         env_prefix="COORDINATOR_",
         env_file=".env",
         env_file_encoding="utf-8",
-        env_priority="core",  # Prefer env vars over file
+        extra="ignore",  # the shared .env also carries worker vars (HF_TOKEN, GPU_INDEX, ...)
         json_schema_extra = {
             "example": {
                 "host": "0.0.0.0",
@@ -96,7 +96,9 @@ class Settings(BaseSettings):
     )
     
     # CORS
-    cors_origins: list = Field(
+    # NoDecode: pydantic-settings otherwise JSON-decodes any complex-typed env
+    # value before our validator runs, which rejects non-JSON strings like "*".
+    cors_origins: Annotated[List[str], NoDecode] = Field(
         default_factory=lambda: ["*"],
         description="Allowed CORS origins. Use specific origins in production.",
     )
@@ -144,7 +146,15 @@ class Settings(BaseSettings):
             # Parse comma-separated list
             return [addr.strip() for addr in v.split(",") if addr.strip()]
         return v
-    
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def validate_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
+        """Accept '*' or comma-separated strings from env vars (not just JSON)."""
+        if isinstance(v, str):
+            return [origin.strip() for origin in v.split(",") if origin.strip()]
+        return v
+
     def load_models_config(self) -> Dict:
         """Load models configuration from file."""
         if not self.models_config.exists():
