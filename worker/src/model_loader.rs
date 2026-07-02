@@ -63,6 +63,8 @@ impl Default for ModelLoaderConfig {
 pub struct ModelLoader {
     gpu_manager: Arc<GPUManager>,
     loaded_models: Arc<DashMap<String, ModelInstance>>,
+    /// Serializes loads of the SAME model (the global semaphore only limits cross-model concurrency).
+    loading_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     load_semaphore: Arc<Semaphore>,
     hf_api: Option<Api>,
 }
@@ -92,6 +94,7 @@ impl ModelLoader {
         Ok(Self {
             gpu_manager,
             loaded_models: Arc::new(DashMap::new()),
+            loading_locks: Arc::new(DashMap::new()),
             load_semaphore: Arc::new(Semaphore::new(config.max_concurrent_loads)),
             hf_api,
         })
@@ -111,109 +114,143 @@ impl ModelLoader {
             return Ok(entry.value().clone());
         }
 
-        let _permit = self.load_semaphore.acquire().await.map_err(|e| {
-            WorkerError::Resource(format!("Failed to acquire load permit: {}", e))
-        })?;
+        // Per-model lock: two concurrent requests for the SAME model serialize here,
+        // so exactly one performs the multi-GB load.
+        let model_lock = self
+            .loading_locks
+            .entry(model_name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _model_guard = model_lock.lock().await;
 
-        // Re-check after acquiring semaphore — another task may have loaded it concurrently.
         if let Some(entry) = self.loaded_models.get(model_name) {
             info!("Model {} loaded by concurrent task", model_name);
             return Ok(entry.value().clone());
         }
 
+        let _permit = self.load_semaphore.acquire().await.map_err(|e| {
+            WorkerError::Resource(format!("Failed to acquire load permit: {}", e))
+        })?;
+
         info!("Loading model {}...", model_name);
         let model_path = self.get_model_path(model_name).await?;
         let config = self.load_model_config(model_name, model_config, &model_path).await?;
-        
+
         let memory_used = self.calculate_memory_usage(&config, quantization);
+        let mut reserved_gpus: Vec<usize> = Vec::new();
         for &gpu_id in gpu_ids {
-            self.gpu_manager
+            match self
+                .gpu_manager
                 .allocate_memory(gpu_id as usize, memory_used as u64, model_name)
-                .await?;
+                .await
+            {
+                Ok(()) => reserved_gpus.push(gpu_id as usize),
+                Err(e) => {
+                    // Roll back reservations made so far — no leak on partial failure.
+                    for &g in &reserved_gpus {
+                        self.gpu_manager.free_memory(g, model_name).await;
+                    }
+                    return Err(e);
+                }
+            }
         }
 
-        let device = if let Some(&id) = gpu_ids.first() {
-            WgpuDevice::DiscreteGpu(id as usize)
-        } else {
-            // WgpuDevice::default() is the modern replacement for the deprecated BestAvailable;
-            // it selects the best adapter the wgpu backend can find (DX12/Vulkan/Metal).
-            WgpuDevice::default()
-        };
+        let build_result: Result<Arc<Mutex<dyn TextGeneration + Send>>, WorkerError> = async {
+            let device = if let Some(&id) = gpu_ids.first() {
+                WgpuDevice::DiscreteGpu(id as usize)
+            } else {
+                // WgpuDevice::default() is the modern replacement for the deprecated BestAvailable;
+                // it selects the best adapter the wgpu backend can find (DX12/Vulkan/Metal).
+                WgpuDevice::default()
+            };
 
-        // Load weights
-        let mut weights = self.load_safetensors(model_name, &device).await?;
+            // Load weights
+            let mut weights = self.load_safetensors(model_name, &device).await?;
 
-        // Get model directory (tokenizer.json lives here)
-        let model_path = self.get_model_path(model_name).await?;
-        // Ensure tokenizer.json is downloaded
-        if let Some(api) = &self.hf_api {
-            let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
-            let _ = repo.get("tokenizer.json").await
-                .map_err(|e| WorkerError::ModelLoad(format!("Failed to download tokenizer.json: {}", e)))?;
-            info!("Tokenizer downloaded to: {:?}", model_path);
+            // Get model directory (tokenizer.json lives here)
+            let model_path = self.get_model_path(model_name).await?;
+            // Ensure tokenizer.json is downloaded
+            if let Some(api) = &self.hf_api {
+                let repo = api.repo(Repo::new(model_name.to_string(), RepoType::Model));
+                let _ = repo.get("tokenizer.json").await
+                    .map_err(|e| WorkerError::ModelLoad(format!("Failed to download tokenizer.json: {}", e)))?;
+                info!("Tokenizer downloaded to: {:?}", model_path);
+            }
+
+            // Instantiate model
+            let model: Arc<Mutex<dyn TextGeneration + Send>> = match config.architecture.as_str() {
+                "llama" => {
+                    let llama_config = LlamaConfig {
+                        hidden_size: config.hidden_size,
+                        num_layers: config.num_layers,
+                        num_attention_heads: config.num_attention_heads,
+                        num_kv_heads: config.num_kv_heads,
+                        head_dim: config.hidden_size / config.num_attention_heads,
+                        intermediate_size: config.intermediate_size,
+                        vocab_size: config.vocab_size,
+                        max_seq_len: config.max_seq_len,
+                        rms_norm_eps: config.rms_norm_eps,
+                        rope_theta: config.rope_theta,
+                    };
+
+                    info!("Mapping weights to LlamaRecord...");
+                    let record = create_llama_record(&mut weights, &llama_config, &device)?;
+                    info!("Record created. Initializing Llama...");
+
+                    let model = Llama::new(&llama_config, &device, &model_path)?.load_record(record);
+                    Arc::new(Mutex::new(model))
+                }
+                "qwen" => {
+                    let qwen_config = QwenConfig {
+                        hidden_size: config.hidden_size,
+                        num_layers: config.num_layers,
+                        num_attention_heads: config.num_attention_heads,
+                        num_kv_heads: config.num_kv_heads,
+                        head_dim: config.hidden_size / config.num_attention_heads,
+                        intermediate_size: config.intermediate_size,
+                        vocab_size: config.vocab_size,
+                        max_seq_len: config.max_seq_len,
+                        rms_norm_eps: config.rms_norm_eps,
+                        rope_theta: config.rope_theta,
+                    };
+
+                    info!("Mapping weights to QwenRecord...");
+                    let record = create_qwen_record(&mut weights, &qwen_config, &device)?;
+                    info!("Record created. Initializing Qwen...");
+
+                    let model = Qwen::new(&qwen_config, &device, &model_path)?.load_record(record);
+                    Arc::new(Mutex::new(model))
+                }
+                "deepseek" => {
+                    let ds_config = if model_name.to_lowercase().contains("v3") {
+                        DeepSeekConfig::deepseek_v3()
+                    } else if model_name.to_lowercase().contains("67b") {
+                        DeepSeekConfig::deepseek_67b()
+                    } else {
+                        DeepSeekConfig::deepseek_7b()
+                    };
+
+                    info!("Mapping weights to DeepSeekRecord...");
+                    let record = create_deepseek_record(&mut weights, &ds_config, &device)?;
+                    info!("Record created. Initializing DeepSeek...");
+
+                    let model = DeepSeek::new(ds_config, &device, &model_path)?.load_record(record);
+                    Arc::new(Mutex::new(model))
+                }
+                other => return Err(WorkerError::ModelLoad(format!("Unsupported architecture: {}", other))),
+            };
+            Ok(model)
         }
+        .await;
 
-        // Instantiate model
-        let model: Arc<Mutex<dyn TextGeneration + Send>> = match config.architecture.as_str() {
-            "llama" => {
-                let llama_config = LlamaConfig {
-                    hidden_size: config.hidden_size,
-                    num_layers: config.num_layers,
-                    num_attention_heads: config.num_attention_heads,
-                    num_kv_heads: config.num_kv_heads,
-                    head_dim: config.hidden_size / config.num_attention_heads,
-                    intermediate_size: config.intermediate_size,
-                    vocab_size: config.vocab_size,
-                    max_seq_len: config.max_seq_len,
-                    rms_norm_eps: config.rms_norm_eps,
-                    rope_theta: config.rope_theta,
-                };
-
-                info!("Mapping weights to LlamaRecord...");
-                let record = create_llama_record(&mut weights, &llama_config, &device)?;
-                info!("Record created. Initializing Llama...");
-
-                let model = Llama::new(&llama_config, &device, &model_path)?.load_record(record);
-                Arc::new(Mutex::new(model))
+        let model = match build_result {
+            Ok(m) => m,
+            Err(e) => {
+                for &g in &reserved_gpus {
+                    self.gpu_manager.free_memory(g, model_name).await;
+                }
+                return Err(e);
             }
-            "qwen" => {
-                let qwen_config = QwenConfig {
-                    hidden_size: config.hidden_size,
-                    num_layers: config.num_layers,
-                    num_attention_heads: config.num_attention_heads,
-                    num_kv_heads: config.num_kv_heads,
-                    head_dim: config.hidden_size / config.num_attention_heads,
-                    intermediate_size: config.intermediate_size,
-                    vocab_size: config.vocab_size,
-                    max_seq_len: config.max_seq_len,
-                    rms_norm_eps: config.rms_norm_eps,
-                    rope_theta: config.rope_theta,
-                };
-
-                info!("Mapping weights to QwenRecord...");
-                let record = create_qwen_record(&mut weights, &qwen_config, &device)?;
-                info!("Record created. Initializing Qwen...");
-
-                let model = Qwen::new(&qwen_config, &device, &model_path)?.load_record(record);
-                Arc::new(Mutex::new(model))
-            }
-            "deepseek" => {
-                let ds_config = if model_name.to_lowercase().contains("v3") {
-                    DeepSeekConfig::deepseek_v3()
-                } else if model_name.to_lowercase().contains("67b") {
-                    DeepSeekConfig::deepseek_67b()
-                } else {
-                    DeepSeekConfig::deepseek_7b()
-                };
-
-                info!("Mapping weights to DeepSeekRecord...");
-                let record = create_deepseek_record(&mut weights, &ds_config, &device)?;
-                info!("Record created. Initializing DeepSeek...");
-
-                let model = DeepSeek::new(ds_config, &device, &model_path)?.load_record(record);
-                Arc::new(Mutex::new(model))
-            }
-            other => return Err(WorkerError::ModelLoad(format!("Unsupported architecture: {}", other))),
         };
 
         let instance = ModelInstance::new(
@@ -229,6 +266,20 @@ impl ModelLoader {
         info!("Model {} loaded successfully", model_name);
 
         Ok(instance)
+    }
+
+    /// Remove a model from the registry and release its GPU memory reservations.
+    /// Returns true when the model was loaded.
+    pub async fn unload(&self, model_name: &str) -> bool {
+        let Some((_, instance)) = self.loaded_models.remove(model_name) else {
+            return false;
+        };
+        for &gpu_id in instance.gpu_ids() {
+            let freed = self.gpu_manager.free_memory(gpu_id as usize, model_name).await;
+            info!("Unload {}: freed {} bytes on GPU {}", model_name, freed, gpu_id);
+        }
+        // instance drops here — last Arc clone (worker.rs removed its copy first) frees the weights.
+        true
     }
 
     async fn load_safetensors(&self, model_name: &str, device: &WgpuDevice) -> Result<HashMap<String, Tensor<WorkerBackend, 1>>, WorkerError> {

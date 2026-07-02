@@ -90,15 +90,15 @@ impl Worker for WorkerService {
         let req = request.into_inner();
         info!("Loading model: {}", req.model_name);
 
-        // Check if already loaded
+        // Check if already loaded — report the REAL instance data, not zeros.
         {
             let models = self.loaded_models.read().await;
-            if models.contains_key(&req.model_name) {
+            if let Some(instance) = models.get(&req.model_name) {
                 return Ok(Response::new(LoadModelResponse {
                     success: true,
                     message: "Model already loaded".to_string(),
-                    memory_used: 0,
-                    loaded_on_gpus: vec![],
+                    memory_used: instance.memory_used() as u64,
+                    loaded_on_gpus: instance.gpu_ids().iter().map(|&id| id as i32).collect(),
                 }));
             }
         }
@@ -350,15 +350,15 @@ impl Worker for WorkerService {
         let req = request.into_inner();
         info!("Unloading model: {}", req.model_name);
 
-        let mut models = self.loaded_models.write().await;
+        let removed_from_service = {
+            let mut models = self.loaded_models.write().await;
+            models.remove(&req.model_name).is_some()
+        };
+        // The loader's DashMap holds the other Arc clone AND owns the GPU reservations.
+        let removed_from_loader = self.model_loader.unload(&req.model_name).await;
 
-        if let Some(model) = models.remove(&req.model_name) {
-            // Drop model to free GPU memory
-            drop(model);
-
-            // Update metrics
+        if removed_from_service || removed_from_loader {
             self.metrics.remove_model_metrics(&req.model_name);
-
             info!("Model {} unloaded successfully", req.model_name);
             Ok(Response::new(Empty {}))
         } else {
