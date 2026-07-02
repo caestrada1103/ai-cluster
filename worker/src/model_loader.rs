@@ -156,6 +156,18 @@ impl ModelLoader {
             WorkerError::Resource(format!("Failed to acquire load permit: {}", e))
         })?;
 
+        // Engine routing: GGUF/llama.cpp models bypass the entire
+        // safetensors + config.json path below (GGUF repos often ship no
+        // config.json; llama.cpp reads architecture from GGUF metadata).
+        if let Some(spec) = gguf_spec_from_metadata(
+            model_config.map(|c| &c.metadata),
+            self.llamacpp_default_n_gpu_layers,
+        )? {
+            return self
+                .load_llamacpp_model(model_name, spec, gpu_ids, quantization, parallelism)
+                .await;
+        }
+
         info!("Loading model {}...", model_name);
         let model_path = self.get_model_path(repo_id).await?;
         let config = self.load_model_config(model_name, model_config, &model_path).await?;
@@ -492,6 +504,97 @@ impl ModelLoader {
         let norm = (config.num_layers * 2 + 1) * config.hidden_size;
         let params = embed + attn + ffn + norm;
         params * 4
+    }
+
+    /// Load a GGUF model via the llama.cpp engine (feature `llamacpp`).
+    #[cfg(feature = "llamacpp")]
+    async fn load_llamacpp_model(
+        &self,
+        model_name: &str,
+        spec: GgufLoadSpec,
+        gpu_ids: &[u32],
+        quantization: crate::cluster::Quantization,
+        parallelism: crate::cluster::ParallelismStrategy,
+    ) -> Result<ModelInstance, WorkerError> {
+        use crate::llamacpp_engine::LlamaCppEngine;
+
+        info!(
+            "Loading GGUF model {} via llama.cpp ({}/{})",
+            model_name, spec.repo_id, spec.file
+        );
+
+        // Download the GGUF with the same hf-hub API pattern as safetensors.
+        let api = self
+            .hf_api
+            .as_ref()
+            .ok_or_else(|| WorkerError::ModelLoad("HF API not initialized".to_string()))?;
+        let repo = api.repo(Repo::new(spec.repo_id.clone(), RepoType::Model));
+        let gguf_path = repo.get(&spec.file).await.map_err(|e| {
+            WorkerError::ModelLoad(format!(
+                "Failed to download GGUF {}/{}: {}",
+                spec.repo_id, spec.file, e
+            ))
+        })?;
+
+        // Honest VRAM estimate: the GGUF file size. llama.cpp uses the
+        // quantized weights as-is; the per-request KV cache is not counted.
+        let file_size = tokio::fs::metadata(&gguf_path)
+            .await
+            .map_err(|e| WorkerError::ModelLoad(format!("Failed to stat GGUF: {}", e)))?
+            .len();
+        for &gpu_id in gpu_ids {
+            self.gpu_manager
+                .allocate_memory(gpu_id as usize, file_size, model_name)
+                .await?;
+        }
+
+        // Model load is blocking (mmap + optional GPU upload) — one
+        // spawn_blocking, same as the safetensors dtype-conversion path.
+        let n_gpu_layers = spec.n_gpu_layers;
+        let n_ctx = spec.n_ctx;
+        let n_threads = self.llamacpp_n_threads;
+        let path_for_load = gguf_path.clone();
+        let engine = tokio::task::spawn_blocking(move || {
+            LlamaCppEngine::load(&path_for_load, n_gpu_layers, n_ctx, n_threads)
+        })
+        .await
+        .map_err(|e| WorkerError::Internal(format!("spawn_blocking join error: {e}")))??;
+
+        // Explicit trait-object coercion, same style as the Burn branches above.
+        let model: Arc<Mutex<dyn TextGeneration + Send>> = Arc::new(Mutex::new(engine));
+
+        // Note: the Quantization proto enum describes the Burn pipeline; the
+        // GGUF file carries its real quantization (e.g. Q4_K_M) internally.
+        let instance = ModelInstance::new(
+            model_name.to_string(),
+            file_size as usize,
+            gpu_ids.to_vec(),
+            quantization as i32,
+            parallelism as i32,
+            Some(model),
+        );
+
+        self.loaded_models
+            .insert(model_name.to_string(), instance.clone());
+        info!("GGUF model {} loaded successfully via llama.cpp", model_name);
+        Ok(instance)
+    }
+
+    /// Stub used when the worker binary was built without `llamacpp`.
+    #[cfg(not(feature = "llamacpp"))]
+    async fn load_llamacpp_model(
+        &self,
+        model_name: &str,
+        _spec: GgufLoadSpec,
+        _gpu_ids: &[u32],
+        _quantization: crate::cluster::Quantization,
+        _parallelism: crate::cluster::ParallelismStrategy,
+    ) -> Result<ModelInstance, WorkerError> {
+        Err(WorkerError::ModelLoad(format!(
+            "Model {} requires the llama.cpp engine, but this worker was built \
+             without the 'llamacpp' cargo feature (rebuild with --features llamacpp)",
+            model_name
+        )))
     }
 
 }
