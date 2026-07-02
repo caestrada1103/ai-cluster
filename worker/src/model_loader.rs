@@ -45,6 +45,10 @@ pub struct ModelLoaderConfig {
     pub hf_token: Option<String>,
     /// Override for the HF hub cache directory (defaults to cache_dir).
     pub hf_cache_dir: Option<PathBuf>,
+    /// CPU threads for llama.cpp generation (0 = auto). See config/worker.toml.
+    pub llamacpp_n_threads: i32,
+    /// Default GPU layer offload for llama.cpp models (-1 = all layers).
+    pub llamacpp_default_n_gpu_layers: i32,
 }
 
 impl Default for ModelLoaderConfig {
@@ -55,6 +59,8 @@ impl Default for ModelLoaderConfig {
             max_concurrent_loads: 2,
             hf_token: None,
             hf_cache_dir: None,
+            llamacpp_n_threads: 0,
+            llamacpp_default_n_gpu_layers: -1,
         }
     }
 }
@@ -67,6 +73,11 @@ pub struct ModelLoader {
     loading_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     load_semaphore: Arc<Semaphore>,
     hf_api: Option<Api>,
+    /// CPU threads for llama.cpp generation (0 = auto).
+    #[allow(dead_code)] // read only when built with --features llamacpp
+    llamacpp_n_threads: i32,
+    /// Default GPU layer offload for llama.cpp models (-1 = all).
+    llamacpp_default_n_gpu_layers: i32,
 }
 
 impl ModelLoader {
@@ -97,6 +108,8 @@ impl ModelLoader {
             loading_locks: Arc::new(DashMap::new()),
             load_semaphore: Arc::new(Semaphore::new(config.max_concurrent_loads)),
             hf_api,
+            llamacpp_n_threads: config.llamacpp_n_threads,
+            llamacpp_default_n_gpu_layers: config.llamacpp_default_n_gpu_layers,
         })
     }
 
@@ -481,6 +494,158 @@ impl ModelLoader {
         params * 4
     }
 
+}
+
+// ---------------------------------------------------------------------------
+// llama.cpp engine routing (always compiled — the parse layer has no
+// llama.cpp dependency; only the loader in `load_llamacpp_model` is gated)
+// ---------------------------------------------------------------------------
+
+/// GGUF model source parsed from the `ModelConfig.metadata` map the
+/// coordinator sends in `LoadModelRequest` (see coordinator/models.py
+/// `ModelConfig.grpc_metadata`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GgufLoadSpec {
+    /// HuggingFace repo containing the GGUF file, e.g. "Qwen/Qwen2.5-0.5B-Instruct-GGUF".
+    pub repo_id: String,
+    /// Exact .gguf filename inside the repo.
+    pub file: String,
+    /// Transformer layers to offload to the GPU (-1 = all).
+    pub n_gpu_layers: i32,
+    /// Optional per-model context window override.
+    pub n_ctx: Option<u32>,
+}
+
+/// Parse engine-routing metadata.
+///
+/// * `Ok(None)` — no metadata, no `engine` key, or `engine == "burn"`: use the
+///   default Burn path (fully backwards compatible).
+/// * `Ok(Some(spec))` — `engine == "llamacpp"` with a complete GGUF source.
+/// * `Err(..)` — unknown engine name or an incomplete/invalid GGUF spec.
+pub fn gguf_spec_from_metadata(
+    metadata: Option<&HashMap<String, String>>,
+    default_n_gpu_layers: i32,
+) -> Result<Option<GgufLoadSpec>, WorkerError> {
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    match metadata.get("engine").map(String::as_str) {
+        None | Some("burn") => Ok(None),
+        Some("llamacpp") => {
+            let repo_id = metadata
+                .get("gguf_repo_id")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    WorkerError::Configuration(
+                        "llamacpp engine requires metadata key 'gguf_repo_id'".to_string(),
+                    )
+                })?
+                .clone();
+            let file = metadata
+                .get("gguf_file")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    WorkerError::Configuration(
+                        "llamacpp engine requires metadata key 'gguf_file'".to_string(),
+                    )
+                })?
+                .clone();
+            let n_gpu_layers = match metadata.get("n_gpu_layers") {
+                Some(v) => v.parse::<i32>().map_err(|e| {
+                    WorkerError::Configuration(format!("invalid n_gpu_layers '{v}': {e}"))
+                })?,
+                None => default_n_gpu_layers,
+            };
+            let n_ctx = match metadata.get("n_ctx") {
+                Some(v) => Some(v.parse::<u32>().map_err(|e| {
+                    WorkerError::Configuration(format!("invalid n_ctx '{v}': {e}"))
+                })?),
+                None => None,
+            };
+            Ok(Some(GgufLoadSpec {
+                repo_id,
+                file,
+                n_gpu_layers,
+                n_ctx,
+            }))
+        }
+        Some(other) => Err(WorkerError::Configuration(format!(
+            "Unknown inference engine '{other}' (expected 'burn' or 'llamacpp')"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn gguf_spec_none_without_metadata() {
+        assert_eq!(gguf_spec_from_metadata(None, -1).unwrap(), None);
+    }
+
+    #[test]
+    fn gguf_spec_none_for_burn_or_absent_engine() {
+        let burn = meta(&[("engine", "burn")]);
+        assert_eq!(gguf_spec_from_metadata(Some(&burn), -1).unwrap(), None);
+        let empty = meta(&[]);
+        assert_eq!(gguf_spec_from_metadata(Some(&empty), -1).unwrap(), None);
+    }
+
+    #[test]
+    fn gguf_spec_parses_full_llamacpp_metadata() {
+        let m = meta(&[
+            ("engine", "llamacpp"),
+            ("gguf_repo_id", "Qwen/Qwen2.5-0.5B-Instruct-GGUF"),
+            ("gguf_file", "qwen2.5-0.5b-instruct-q4_k_m.gguf"),
+            ("n_gpu_layers", "20"),
+            ("n_ctx", "4096"),
+        ]);
+        let spec = gguf_spec_from_metadata(Some(&m), -1).unwrap().unwrap();
+        assert_eq!(spec.repo_id, "Qwen/Qwen2.5-0.5B-Instruct-GGUF");
+        assert_eq!(spec.file, "qwen2.5-0.5b-instruct-q4_k_m.gguf");
+        assert_eq!(spec.n_gpu_layers, 20);
+        assert_eq!(spec.n_ctx, Some(4096));
+    }
+
+    #[test]
+    fn gguf_spec_applies_worker_default_gpu_layers() {
+        let m = meta(&[
+            ("engine", "llamacpp"),
+            ("gguf_repo_id", "some/repo"),
+            ("gguf_file", "model.gguf"),
+        ]);
+        let spec = gguf_spec_from_metadata(Some(&m), -1).unwrap().unwrap();
+        assert_eq!(spec.n_gpu_layers, -1);
+        assert_eq!(spec.n_ctx, None);
+    }
+
+    #[test]
+    fn gguf_spec_rejects_incomplete_or_unknown() {
+        let missing_file = meta(&[("engine", "llamacpp"), ("gguf_repo_id", "some/repo")]);
+        assert!(gguf_spec_from_metadata(Some(&missing_file), -1).is_err());
+
+        let missing_repo = meta(&[("engine", "llamacpp"), ("gguf_file", "model.gguf")]);
+        assert!(gguf_spec_from_metadata(Some(&missing_repo), -1).is_err());
+
+        let unknown = meta(&[("engine", "vllm")]);
+        assert!(gguf_spec_from_metadata(Some(&unknown), -1).is_err());
+
+        let bad_layers = meta(&[
+            ("engine", "llamacpp"),
+            ("gguf_repo_id", "some/repo"),
+            ("gguf_file", "model.gguf"),
+            ("n_gpu_layers", "many"),
+        ]);
+        assert!(gguf_spec_from_metadata(Some(&bad_layers), -1).is_err());
+    }
 }
 
 /// Helper to transpose Linear weights (HF [out, in] -> Burn [in, out])

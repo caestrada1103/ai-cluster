@@ -193,6 +193,8 @@ async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Re
         max_concurrent_loads: config.max_concurrent_loads,
         hf_token: config.hf_token.clone(),
         hf_cache_dir: config.hf_cache_dir.clone(),
+        llamacpp_n_threads: config.llamacpp_n_threads,
+        llamacpp_default_n_gpu_layers: config.llamacpp_default_n_gpu_layers,
     };
     let model_loader = Arc::new(ModelLoader::new(loader_config, gpu_manager.clone())?);
 
