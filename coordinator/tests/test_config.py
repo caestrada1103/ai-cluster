@@ -114,3 +114,11 @@ def test_cors_origins_comma_separated():
 def test_cors_origins_list_passthrough():
     s = Settings(cors_origins=["https://a.example"], _env_file=None)
     assert s.cors_origins == ["https://a.example"]
+
+
+def test_cors_origins_json_array_string_from_env(tmp_path):
+    """Backward-compat: values written as a JSON array string still work."""
+    env_file = tmp_path / ".env"
+    env_file.write_text('COORDINATOR_CORS_ORIGINS=["https://a.example","https://b.example"]\n')
+    s = Settings(_env_file=str(env_file))
+    assert s.cors_origins == ["https://a.example", "https://b.example"]

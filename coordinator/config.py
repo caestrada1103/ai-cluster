@@ -1,5 +1,6 @@
 """Configuration management for the coordinator."""
 
+import json
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Dict, List, Union
@@ -150,8 +151,19 @@ class Settings(BaseSettings):
     @field_validator("cors_origins", mode="before")
     @classmethod
     def validate_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
-        """Accept '*' or comma-separated strings from env vars (not just JSON)."""
+        """Accept '*', comma-separated strings, or JSON array strings from env vars.
+
+        NoDecode (see the field annotation) means we always receive the raw
+        value here — a list already built by the caller, or the untouched
+        env-var string.
+        """
         if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(origin).strip() for origin in parsed if str(origin).strip()]
             return [origin.strip() for origin in v.split(",") if origin.strip()]
         return v
 
