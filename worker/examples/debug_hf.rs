@@ -1,4 +1,4 @@
-use hf_hub::{api::tokio::Api, Repo, RepoType};
+use hf_hub::{Repo, RepoType};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

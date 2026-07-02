@@ -1,22 +1,19 @@
 //! Build script for compiling protobuf files
 
+// Only used inside the cfg(feature = "cuda"/"rocm") blocks below — unused with
+// the default wgpu-only feature set.
+#[allow(unused_imports)]
 use std::env;
-use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
-    
-    // Configure tonic build
+    // Configure tonic build (emit_rerun_if_changed covers the proto path —
+    // no manual rerun-if-changed line, no reflection descriptor: nothing registers it)
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
         .emit_rerun_if_changed(true)
-        .file_descriptor_set_path(out_dir.join("cluster_descriptor.bin"))
         .compile(&["../proto/cluster.proto"], &["../proto"])?;
-    
-    // Rerun if protobuf changes
-    println!("cargo:rerun-if-changed=../proto/cluster.proto");
-    
+
     // Detect GPU backend
     #[cfg(feature = "rocm")]
     {
@@ -38,7 +35,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     #[cfg(feature = "cuda")]
     {
-        println!("cargo:rustc-cfg=feature=\"cuda\"");
         println!("cargo:rerun-if-env-changed=CUDA_PATH");
         
         // Check for CUDA installation
