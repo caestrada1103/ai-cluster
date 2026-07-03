@@ -17,6 +17,12 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# Allowed ggml KV-cache quantization type names for `gguf_cache_type_k` /
+# `gguf_cache_type_v` (llama.cpp's `--cache-type-k`/`--cache-type-v` flags).
+# `f16` is llama.cpp's own default (today's behavior); the rest trade VRAM for
+# precision — see Plan 11 Task 2b / Appendix D.
+_ALLOWED_KV_CACHE_TYPES = frozenset({"f16", "q8_0", "q4_0", "q5_0", "q5_1", "q4_1"})
+
 
 class ModelFamily(str, Enum):
     """Supported model families."""
@@ -100,6 +106,13 @@ class ModelConfig:
     gguf_n_gpu_layers: Optional[int] = None  # -1 = all layers on GPU
     gguf_n_ctx: Optional[int] = None  # context window override
 
+    # KV-cache quantization (Plan 11 Task 2b / Appendix D): halves (q8_0) or
+    # quarters (q4_0) the KV-cache VRAM footprint vs today's fp16 KV, which is
+    # the biggest lever for fitting large `n_ctx` in limited VRAM. Both None
+    # (the default) is today's behavior — llama.cpp's own fp16 KV cache.
+    gguf_cache_type_k: Optional[str] = None
+    gguf_cache_type_v: Optional[str] = None
+
     # Level 1 — local multi-GPU split (llama.cpp splitting a model across a
     # single node's OWN same-vendor GPUs, in-process, no network). Both None
     # (the default) is today's behavior: the coordinator picks
@@ -134,6 +147,21 @@ class ModelConfig:
         if self.engine == "llamacpp" and not (self.gguf_repo_id and self.gguf_file):
             raise ValueError("llamacpp engine models must set gguf.repo_id and gguf.file")
 
+        if self.gguf_cache_type_k is not None and self.gguf_cache_type_k not in (
+            _ALLOWED_KV_CACHE_TYPES
+        ):
+            raise ValueError(
+                f"gguf_cache_type_k must be one of {sorted(_ALLOWED_KV_CACHE_TYPES)} "
+                f"(got {self.gguf_cache_type_k!r})"
+            )
+        if self.gguf_cache_type_v is not None and self.gguf_cache_type_v not in (
+            _ALLOWED_KV_CACHE_TYPES
+        ):
+            raise ValueError(
+                f"gguf_cache_type_v must be one of {sorted(_ALLOWED_KV_CACHE_TYPES)} "
+                f"(got {self.gguf_cache_type_v!r})"
+            )
+
         if self.local_tensor_split is not None:
             if self.local_gpu_ids is None or len(self.local_tensor_split) != len(
                 self.local_gpu_ids
@@ -167,6 +195,10 @@ class ModelConfig:
             metadata["n_gpu_layers"] = str(self.gguf_n_gpu_layers)
         if self.gguf_n_ctx is not None:
             metadata["n_ctx"] = str(self.gguf_n_ctx)
+        if self.gguf_cache_type_k is not None:
+            metadata["cache_type_k"] = self.gguf_cache_type_k
+        if self.gguf_cache_type_v is not None:
+            metadata["cache_type_v"] = self.gguf_cache_type_v
         return metadata
 
     def grpc_metadata(self) -> Dict[str, str]:
@@ -675,6 +707,8 @@ class ModelRegistry:
                         int(gguf["n_gpu_layers"]) if "n_gpu_layers" in gguf else None
                     ),
                     gguf_n_ctx=int(gguf["n_ctx"]) if "n_ctx" in gguf else None,
+                    gguf_cache_type_k=gguf.get("cache_type_k"),
+                    gguf_cache_type_v=gguf.get("cache_type_v"),
                     local_gpu_ids=(
                         [int(x) for x in final_data["local_gpu_ids"]]
                         if "local_gpu_ids" in final_data

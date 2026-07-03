@@ -703,9 +703,18 @@ impl ModelLoader {
         let n_gpu_layers = spec.n_gpu_layers;
         let n_ctx = spec.n_ctx;
         let n_threads = self.llamacpp_n_threads;
+        let cache_type_k = spec.cache_type_k.clone();
+        let cache_type_v = spec.cache_type_v.clone();
         let path_for_load = gguf_path.clone();
         let engine = tokio::task::spawn_blocking(move || {
-            LlamaCppEngine::load(&path_for_load, n_gpu_layers, n_ctx, n_threads)
+            LlamaCppEngine::load(
+                &path_for_load,
+                n_gpu_layers,
+                n_ctx,
+                n_threads,
+                cache_type_k,
+                cache_type_v,
+            )
         })
         .await
         .map_err(|e| WorkerError::Internal(format!("spawn_blocking join error: {e}")))??;
@@ -776,6 +785,35 @@ pub struct GgufLoadSpec {
     #[allow(dead_code)]
     // consumed by the Level-1 load() wiring in a later increment (Task 0-gated)
     pub tensor_split: Option<Vec<f32>>,
+    /// KV-cache quantization type for K, e.g. "q8_0"/"q4_0" (Task 2b). `None`
+    /// leaves llama.cpp's own default (f16) — byte-for-byte today's behavior.
+    /// Validated against [`ALLOWED_KV_CACHE_TYPES`] at parse time; the
+    /// string→`KvCacheType` mapping itself lives in `llamacpp_engine.rs`
+    /// (feature `llamacpp`) since the crate enum isn't available here.
+    pub cache_type_k: Option<String>,
+    /// KV-cache quantization type for V. See `cache_type_k`.
+    pub cache_type_v: Option<String>,
+}
+
+/// ggml type names accepted for `cache_type_k`/`cache_type_v` metadata (Task
+/// 2b metadata contract). `f16` is llama.cpp's own default — accepted
+/// explicitly too so a config can be self-documenting.
+const ALLOWED_KV_CACHE_TYPES: &[&str] = &["f16", "q8_0", "q4_0", "q5_0", "q5_1", "q4_1"];
+
+/// Parse one KV-cache-type metadata key, validating it against
+/// [`ALLOWED_KV_CACHE_TYPES`]. `Ok(None)` when the key is absent.
+fn parse_cache_type(
+    metadata: &HashMap<String, String>,
+    key: &str,
+) -> Result<Option<String>, WorkerError> {
+    match metadata.get(key) {
+        None => Ok(None),
+        Some(v) if ALLOWED_KV_CACHE_TYPES.contains(&v.as_str()) => Ok(Some(v.clone())),
+        Some(v) => Err(WorkerError::Configuration(format!(
+            "invalid {key} '{v}' (expected one of {})",
+            ALLOWED_KV_CACHE_TYPES.join(", ")
+        ))),
+    }
 }
 
 /// Parse the shared `tensor_split` metadata key: comma-separated f32 weights.
@@ -842,12 +880,16 @@ pub fn gguf_spec_from_metadata(
                 None => None,
             };
             let tensor_split = parse_tensor_split(metadata)?;
+            let cache_type_k = parse_cache_type(metadata, "cache_type_k")?;
+            let cache_type_v = parse_cache_type(metadata, "cache_type_v")?;
             Ok(Some(GgufLoadSpec {
                 repo_id,
                 file,
                 n_gpu_layers,
                 n_ctx,
                 tensor_split,
+                cache_type_k,
+                cache_type_v,
             }))
         }
         Some(other) => Err(WorkerError::Configuration(format!(
@@ -1045,6 +1087,65 @@ mod tests {
             ("tensor_split", "0.6,not-a-float"),
         ]);
         assert!(gguf_spec_from_metadata(Some(&m), -1).is_err());
+    }
+
+    #[test]
+    fn gguf_spec_parses_cache_types_when_present() {
+        let m = meta(&[
+            ("engine", "llamacpp"),
+            ("gguf_repo_id", "some/repo"),
+            ("gguf_file", "model.gguf"),
+            ("cache_type_k", "q8_0"),
+            ("cache_type_v", "q4_0"),
+        ]);
+        let spec = gguf_spec_from_metadata(Some(&m), -1).unwrap().unwrap();
+        assert_eq!(spec.cache_type_k, Some("q8_0".to_string()));
+        assert_eq!(spec.cache_type_v, Some("q4_0".to_string()));
+    }
+
+    #[test]
+    fn gguf_spec_cache_types_absent_is_none() {
+        let m = meta(&[
+            ("engine", "llamacpp"),
+            ("gguf_repo_id", "some/repo"),
+            ("gguf_file", "model.gguf"),
+        ]);
+        let spec = gguf_spec_from_metadata(Some(&m), -1).unwrap().unwrap();
+        assert_eq!(spec.cache_type_k, None);
+        assert_eq!(spec.cache_type_v, None);
+    }
+
+    #[test]
+    fn gguf_spec_accepts_every_allowed_cache_type() {
+        for ty in ALLOWED_KV_CACHE_TYPES {
+            let m = meta(&[
+                ("engine", "llamacpp"),
+                ("gguf_repo_id", "some/repo"),
+                ("gguf_file", "model.gguf"),
+                ("cache_type_k", ty),
+            ]);
+            let spec = gguf_spec_from_metadata(Some(&m), -1).unwrap().unwrap();
+            assert_eq!(spec.cache_type_k, Some(ty.to_string()));
+        }
+    }
+
+    #[test]
+    fn gguf_spec_rejects_invalid_cache_type() {
+        let bad_k = meta(&[
+            ("engine", "llamacpp"),
+            ("gguf_repo_id", "some/repo"),
+            ("gguf_file", "model.gguf"),
+            ("cache_type_k", "int8"),
+        ]);
+        assert!(gguf_spec_from_metadata(Some(&bad_k), -1).is_err());
+
+        let bad_v = meta(&[
+            ("engine", "llamacpp"),
+            ("gguf_repo_id", "some/repo"),
+            ("gguf_file", "model.gguf"),
+            ("cache_type_v", "fp16"), // close but not the accepted spelling
+        ]);
+        assert!(gguf_spec_from_metadata(Some(&bad_v), -1).is_err());
     }
 
     #[test]

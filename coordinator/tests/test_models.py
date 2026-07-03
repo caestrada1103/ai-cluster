@@ -813,3 +813,156 @@ def test_real_models_toml_distributed_reference_entry_loads() -> None:
         "amd-node-2": [0],
         "amd-node-3": [0],
     }
+
+
+# ---------------------------------------------------------------------------
+# Plan 11 Task 2b — KV-cache quantization (cache_type_k / cache_type_v)
+# ---------------------------------------------------------------------------
+
+
+def test_gguf_cache_type_defaults_to_none() -> None:
+    cfg = ModelConfig(**_llamacpp_kwargs())
+    assert cfg.gguf_cache_type_k is None
+    assert cfg.gguf_cache_type_v is None
+    assert "cache_type_k" not in cfg.grpc_metadata()
+    assert "cache_type_v" not in cfg.grpc_metadata()
+
+
+@pytest.mark.parametrize("cache_type", ["f16", "q8_0", "q4_0", "q5_0", "q5_1", "q4_1"])
+def test_gguf_cache_type_accepts_allowed_values(cache_type: str) -> None:
+    cfg = ModelConfig(
+        **_llamacpp_kwargs(gguf_cache_type_k=cache_type, gguf_cache_type_v=cache_type)
+    )
+    assert cfg.gguf_cache_type_k == cache_type
+    assert cfg.gguf_cache_type_v == cache_type
+
+
+def test_gguf_cache_type_k_rejects_invalid_value() -> None:
+    with pytest.raises(ValueError, match="gguf_cache_type_k"):
+        ModelConfig(**_llamacpp_kwargs(gguf_cache_type_k="q2_k"))
+
+
+def test_gguf_cache_type_v_rejects_invalid_value() -> None:
+    with pytest.raises(ValueError, match="gguf_cache_type_v"):
+        ModelConfig(**_llamacpp_kwargs(gguf_cache_type_v="fp16"))  # ggml name is "f16", not "fp16"
+
+
+def test_grpc_metadata_includes_cache_type_when_set() -> None:
+    cfg = ModelConfig(**_llamacpp_kwargs(gguf_cache_type_k="q8_0", gguf_cache_type_v="q4_0"))
+    metadata = cfg.grpc_metadata()
+    assert metadata["cache_type_k"] == "q8_0"
+    assert metadata["cache_type_v"] == "q4_0"
+
+
+def test_grpc_metadata_lead_includes_cache_type_when_set() -> None:
+    cfg = ModelConfig(
+        **_llamacpp_kwargs(
+            distributed=True,
+            distributed_lead="amd-node-1",
+            distributed_peers=["amd-node-2"],
+            gguf_cache_type_k="q8_0",
+            gguf_cache_type_v="q8_0",
+        )
+    )
+    metadata = cfg.grpc_metadata_lead(peer_endpoints=["10.0.0.2:50151"], tensor_split=None)
+    assert metadata["cache_type_k"] == "q8_0"
+    assert metadata["cache_type_v"] == "q8_0"
+
+
+def test_grpc_metadata_rpc_server_includes_cache_type_when_set() -> None:
+    cfg = ModelConfig(
+        **_llamacpp_kwargs(
+            distributed=True,
+            distributed_lead="amd-node-1",
+            distributed_peers=["amd-node-2"],
+            gguf_cache_type_k="q4_0",
+            gguf_cache_type_v="q4_0",
+        )
+    )
+    metadata = cfg.grpc_metadata_rpc_server(base_port=50151)
+    assert metadata["cache_type_k"] == "q4_0"
+    assert metadata["cache_type_v"] == "q4_0"
+
+
+def test_metadata_producers_omit_cache_type_when_unset() -> None:
+    """All three llama.cpp metadata helpers must stay byte-for-byte unchanged
+    for models that don't set cache_type_k/v (back-compat)."""
+    cfg = ModelConfig(
+        **_llamacpp_kwargs(
+            distributed=True,
+            distributed_lead="amd-node-1",
+            distributed_peers=["amd-node-2"],
+        )
+    )
+    assert "cache_type_k" not in cfg.grpc_metadata()
+    assert "cache_type_v" not in cfg.grpc_metadata()
+
+    lead_metadata = cfg.grpc_metadata_lead(peer_endpoints=["10.0.0.2:50151"], tensor_split=None)
+    assert "cache_type_k" not in lead_metadata
+    assert "cache_type_v" not in lead_metadata
+
+    rpc_server_metadata = cfg.grpc_metadata_rpc_server(base_port=50151)
+    assert "cache_type_k" not in rpc_server_metadata
+    assert "cache_type_v" not in rpc_server_metadata
+
+
+def test_load_from_dict_parses_cache_type_keys() -> None:
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "cache-type-test-gguf": {
+                    "family": "qwen",
+                    "parameters": "32B",
+                    "min_memory_gb": 20,
+                    "engine": "llamacpp",
+                    "gguf": {
+                        "repo_id": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+                        "file": "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+                        "cache_type_k": "q8_0",
+                        "cache_type_v": "q8_0",
+                    },
+                }
+            }
+        }
+    )
+    cfg = ModelRegistry.get_model("cache-type-test-gguf")
+    assert cfg is not None
+    assert cfg.gguf_cache_type_k == "q8_0"
+    assert cfg.gguf_cache_type_v == "q8_0"
+
+
+def test_load_from_dict_cache_type_absent_by_default() -> None:
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "no-cache-type-gguf": {
+                    "family": "qwen",
+                    "parameters": "7B",
+                    "min_memory_gb": 6,
+                    "engine": "llamacpp",
+                    "gguf": {
+                        "repo_id": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+                        "file": "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+                    },
+                }
+            }
+        }
+    )
+    cfg = ModelRegistry.get_model("no-cache-type-gguf")
+    assert cfg is not None
+    assert cfg.gguf_cache_type_k is None
+    assert cfg.gguf_cache_type_v is None
+
+
+def test_real_models_toml_cache_type_example_loads() -> None:
+    """config/models.toml's qwen2.5-coder-32b-gguf.gguf cache_type_k/v example
+    (Plan 11 Task 2b) parses and flows into grpc_metadata()."""
+    models_toml = Path(__file__).resolve().parents[2] / "config" / "models.toml"
+    ModelRegistry.load_from_dict(toml.load(models_toml))
+    cfg = ModelRegistry.get_model("qwen2.5-coder-32b-gguf")
+    assert cfg is not None
+    assert cfg.gguf_cache_type_k == "q8_0"
+    assert cfg.gguf_cache_type_v == "q8_0"
+    metadata = cfg.grpc_metadata()
+    assert metadata["cache_type_k"] == "q8_0"
+    assert metadata["cache_type_v"] == "q8_0"

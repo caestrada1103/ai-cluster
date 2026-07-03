@@ -126,6 +126,12 @@ repo_id = "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF"
 file = "qwen2.5-coder-32b-instruct-q4_k_m.gguf"
 n_gpu_layers = -1  # -1 = offload all layers to the GPU
 n_ctx = 8192
+# KV-cache quantization (Plan 11 Task 2b / Appendix D): q8_0 halves the
+# KV-cache VRAM footprint vs the fp16 default, so a much larger n_ctx fits in
+# the same VRAM budget on this, the biggest/flagship model in this file —
+# exactly the long-context/large-codebase case this knob targets.
+cache_type_k = "q8_0"
+cache_type_v = "q8_0"
 
 # Level 2 — distributed (cross-node ggml-RPC) reference entry. This is the
 # flagship "split across 3 AMD nodes" showcase from pending-work/11. NOT
