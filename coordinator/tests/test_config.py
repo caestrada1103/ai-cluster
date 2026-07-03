@@ -135,6 +135,35 @@ def test_non_static_discovery_fails_fast_with_clear_error() -> None:
         WorkerDiscovery(settings)
 
 
+def test_context_compression_defaults() -> None:
+    from coordinator.tests.conftest import make_settings
+
+    settings = make_settings()
+    assert settings.context_compression_enabled is False
+    assert settings.context_compression_token_budget == 8192
+    assert settings.context_compression_safety_margin == 0.20
+    assert settings.context_compression_active_segments == 1
+    assert settings.context_compression_techniques == ["skeletonize"]
+    assert settings.context_compression_summarizer_model == "qwen2.5-0.5b-gguf"
+    assert settings.context_compression_llmlingua_enabled is False
+
+
+def test_context_compression_techniques_rejects_unknown() -> None:
+    import pytest
+
+    from coordinator.tests.conftest import make_settings
+
+    with pytest.raises(Exception, match="Unknown context_compression technique"):
+        make_settings(context_compression_techniques="skeletonize,teleport")
+
+
+def test_context_compression_techniques_accepts_comma_string() -> None:
+    from coordinator.tests.conftest import make_settings
+
+    settings = make_settings(context_compression_techniques="skeletonize,summarize")
+    assert settings.context_compression_techniques == ["skeletonize", "summarize"]
+
+
 def test_dead_settings_fields_removed() -> None:
     s = make_settings()
     for dead in (

@@ -98,6 +98,62 @@ class Settings(BaseSettings):
         600.0, description="How long a session sticks to a worker (affinity strategy)", gt=0
     )
 
+    # Context compression middleware (coordinator/context_compression/) — see
+    # pending-work/12-context-compression-pipeline.md. Off by default: a
+    # request is only ever touched when (a) this is True or the request sets
+    # `compress_context: true`, AND (b) its estimated prompt tokens exceed
+    # context_compression_token_budget. Tune the budget per deployment —
+    # roughly `n_ctx - max_tokens - 512` for whatever model you route to.
+    context_compression_enabled: bool = Field(
+        False, description="Server-wide default: compress oversized prompts before forwarding"
+    )
+    context_compression_token_budget: int = Field(
+        8192,
+        description="Estimated-token threshold that triggers compression",
+        ge=1,
+    )
+    context_compression_safety_margin: float = Field(
+        0.20,
+        description="Fractional inflation applied to the token estimate before comparing to budget",
+        ge=0.0,
+        le=1.0,
+    )
+    context_compression_active_segments: int = Field(
+        1,
+        description=(
+            "Most-recent code segments kept fully intact (never compressed); 0 protects none"
+        ),
+        ge=0,
+    )
+    context_compression_techniques: Annotated[List[str], NoDecode] = Field(
+        default_factory=lambda: ["skeletonize"],
+        description=(
+            "Ordered techniques to try in priority order: skeletonize, summarize, llmlingua"
+        ),
+    )
+    context_compression_summarizer_model: str = Field(
+        "qwen2.5-0.5b-gguf",
+        description="Registry model name used to summarize NL history (Phase 2)",
+    )
+    context_compression_summarizer_max_tokens: int = Field(
+        256, description="max_tokens budget for each summarizer sub-call", ge=16
+    )
+    context_compression_llmlingua_enabled: bool = Field(
+        False, description="Opt-in LLMLingua token compression for NL segments only (Phase 3)"
+    )
+    context_compression_llmlingua_model: str = Field(
+        "microsoft/llmlingua-2-xlm-roberta-large-meetingbank",
+        description=(
+            "LLMLingua compressor model (downloaded from HF on first use unless pre-cached)"
+        ),
+    )
+    context_compression_llmlingua_rate: float = Field(
+        0.5,
+        description="LLMLingua target compression rate (fraction of tokens kept)",
+        gt=0.0,
+        lt=1.0,
+    )
+
     @field_validator("static_workers", mode="before")
     @classmethod
     def validate_static_workers(cls, v: Union[str, List[str]]) -> List[str]:
@@ -105,6 +161,21 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             # Parse comma-separated list
             return [addr.strip() for addr in v.split(",") if addr.strip()]
+        return v
+
+    @field_validator("context_compression_techniques", mode="before")
+    @classmethod
+    def validate_context_compression_techniques(cls, v: Union[str, List[str]]) -> List[str]:
+        """Accept a comma-separated env-var string or a list; reject unknown names."""
+        if isinstance(v, str):
+            v = [t.strip() for t in v.split(",") if t.strip()]
+        allowed = {"skeletonize", "summarize", "llmlingua"}
+        unknown = [t for t in v if t not in allowed]
+        if unknown:
+            raise ValueError(
+                f"Unknown context_compression technique(s) {unknown}; "
+                f"expected any of {sorted(allowed)}"
+            )
         return v
 
     @field_validator("cors_origins", mode="before")

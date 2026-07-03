@@ -47,6 +47,13 @@ class ChatCompletionRequest(BaseModel):
     session_id: Optional[str] = Field(
         None, description="Sticky-session key for affinity routing (optional)"
     )
+    compress_context: Optional[bool] = Field(
+        None,
+        description=(
+            "Override the server's context-compression default for this request only "
+            "(true forces it on, false forces it off, omitted uses the server default)"
+        ),
+    )
 
 
 class CompletionRequest(BaseModel):
@@ -64,6 +71,13 @@ class CompletionRequest(BaseModel):
     )
     session_id: Optional[str] = Field(
         None, description="Sticky-session key for affinity routing (optional)"
+    )
+    compress_context: Optional[bool] = Field(
+        None,
+        description=(
+            "Override the server's context-compression default for this request only "
+            "(true forces it on, false forces it off, omitted uses the server default)"
+        ),
     )
 
 
@@ -163,10 +177,16 @@ async def create_completion(body: CompletionRequest, request: Request) -> Comple
     model_name, target_worker = _parse_model_and_worker(body.model)
     worker_id = body.worker_id or target_worker
 
+    from coordinator.context_compression import maybe_compress_prompt
+
+    prompt = await maybe_compress_prompt(
+        body.prompt, coordinator=coordinator, override_enabled=body.compress_context
+    )
+
     try:
         result = await coordinator.infer(
             model_name=model_name,
-            prompt=body.prompt,
+            prompt=prompt,
             max_tokens=body.max_tokens,
             temperature=body.temperature,
             top_p=body.top_p,
@@ -270,10 +290,16 @@ async def create_chat_completion(
 
     model_name, worker_id = _parse_model_and_worker(body.model)
 
+    from coordinator.context_compression import maybe_compress_chat_messages
+
+    messages = await maybe_compress_chat_messages(
+        body.messages, coordinator=coordinator, override_enabled=body.compress_context
+    )
+
     # Convert chat history to a raw prompt
     # A simple chat template, can be expanded later for specific models (llama3, chatml, etc)
     prompt = ""
-    for msg in body.messages:
+    for msg in messages:
         role = msg.role.lower()
         content = msg.content
         if role == "system":
