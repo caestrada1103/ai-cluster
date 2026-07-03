@@ -9,6 +9,15 @@
 llamacpp_n_threads = 0              # 0 = llama.cpp auto-detects thread count
 llamacpp_default_n_gpu_layers = -1  # -1 = offload all layers to the GPU
 
+# ggml-RPC peer ("rpc_server") role for distributed (Level 2, cross-node)
+# GGUF splits — see pending-work/11-distributed-multi-node-inference.md.
+# Defaulted off: leave commented on every node that never lends a GPU to a
+# distributed model's lead. Trusted-LAN only — ggml-RPC has no auth/encryption;
+# never set rpc_server_bind_host to a public interface.
+# rpc_server_enabled = false        # true on nodes that lend local GPU(s) as an RPC peer
+# rpc_server_port = 50151           # base port; one rpc-server process per lent GPU, port+i
+# rpc_server_bind_host = "0.0.0.0"  # bind interface for the rpc-server process(es)
+
 # worker_id = "my-worker"        # optional; auto-generated when absent everywhere
 grpc_port = 50051
 metrics_port = 9091

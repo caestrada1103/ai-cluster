@@ -472,9 +472,15 @@ class ClusterCoordinator:
                     # these string keys to select the llama.cpp GGUF path.
                     metadata=model_config.grpc_metadata(),
                 )
-                gpu_ids = [g.id for g in worker.gpus[: model_config.recommended_gpus]]
-                if not gpu_ids and worker.gpus:
-                    gpu_ids = [worker.gpus[0].id]
+                if model_config.local_gpu_ids is not None:
+                    # Level 1 — local multi-GPU split: send the exact GPU ids
+                    # the registry pins this model to (tensor_split metadata
+                    # above tells the worker how to apportion layers).
+                    gpu_ids = list(model_config.local_gpu_ids)
+                else:
+                    gpu_ids = [g.id for g in worker.gpus[: model_config.recommended_gpus]]
+                    if not gpu_ids and worker.gpus:
+                        gpu_ids = [worker.gpus[0].id]
             else:
                 # If unknown, it's a HuggingFace pull.
                 # The Rust worker model_loader.rs will download config.json from HF

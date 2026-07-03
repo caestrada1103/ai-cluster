@@ -7,7 +7,7 @@ needed. These tests prove (a) the metadata survives a protobuf round-trip and
 """
 
 from types import SimpleNamespace
-from typing import Any, Optional, cast
+from typing import Any, List, Optional, cast
 
 import pytest
 
@@ -88,3 +88,68 @@ async def test_load_model_on_worker_sends_empty_metadata_for_burn() -> None:
     assert ok is True
     assert stub.request is not None
     assert dict(stub.request.config.metadata) == {}
+
+
+# ---------------------------------------------------------------------------
+# Plan 11 Task 1 — Level 1 local multi-GPU split transport
+# ---------------------------------------------------------------------------
+
+_LOCAL_MULTI_GPU_REGISTRY = {
+    "models": {
+        "local-multi-gpu-gguf": {
+            "family": "qwen",
+            "parameters": "32B",
+            "min_memory_gb": 20,
+            "recommended_gpus": 1,
+            "max_gpus": 4,
+            "engine": "llamacpp",
+            "gguf": {
+                "repo_id": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+                "file": "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+            },
+            "local_gpu_ids": [2, 3],
+            "local_tensor_split": [0.6, 0.4],
+        }
+    }
+}
+
+
+def _fake_worker_with_gpus(stub: _FakeLoadStub, gpu_ids: List[int]) -> WorkerInfo:
+    """Duck-typed WorkerInfo with an arbitrary local GPU set."""
+    return cast(
+        WorkerInfo,
+        SimpleNamespace(
+            id="worker-multi-gpu",
+            gpus=[SimpleNamespace(id=i) for i in gpu_ids],
+            stub=stub,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_load_model_on_worker_sends_local_gpu_ids_and_tensor_split() -> None:
+    ModelRegistry.load_from_dict(_LOCAL_MULTI_GPU_REGISTRY)
+    stub = _FakeLoadStub()
+    coordinator = ClusterCoordinator.__new__(ClusterCoordinator)
+    worker = _fake_worker_with_gpus(stub, [0, 1, 2, 3])
+    ok = await coordinator._load_model_on_worker(worker, "local-multi-gpu-gguf")
+    assert ok is True
+    assert stub.request is not None
+    # local_gpu_ids overrides the default worker.gpus[:recommended_gpus] slice
+    # (recommended_gpus=1 would otherwise pick just gpu 0).
+    assert list(stub.request.gpu_ids) == [2, 3]
+    assert stub.request.config.metadata["tensor_split"] == "0.6,0.4"
+
+
+@pytest.mark.asyncio
+async def test_load_model_on_worker_default_gpu_selection_unchanged_without_local_gpu_ids() -> (
+    None
+):
+    ModelRegistry.load_from_dict(_GGUF_REGISTRY)
+    stub = _FakeLoadStub()
+    coordinator = ClusterCoordinator.__new__(ClusterCoordinator)
+    ok = await coordinator._load_model_on_worker(_fake_worker(stub), "transport-test-gguf")
+    assert ok is True
+    assert stub.request is not None
+    assert list(stub.request.gpu_ids) == [0]
+    assert "tensor_split" not in stub.request.config.metadata

@@ -1,6 +1,7 @@
 """Tests for coordinator.models — ModelRegistry, ModelConfig, and enums."""
 
 from pathlib import Path
+from typing import Any, Dict
 
 import pytest
 import toml
@@ -438,3 +439,377 @@ def test_hardcoded_gguf_models_match_models_toml() -> None:
         assert hardcoded.min_memory_gb == pytest.approx(float(toml_entry["min_memory_gb"]))
         assert hardcoded.recommended_gpus == toml_entry["recommended_gpus"]
         assert hardcoded.max_gpus == toml_entry["max_gpus"]
+
+
+# ---------------------------------------------------------------------------
+# Plan 11 Task 1 — Level 1: local multi-GPU split (local_gpu_ids / local_tensor_split)
+# ---------------------------------------------------------------------------
+
+
+def _llamacpp_kwargs(**overrides: Any) -> Dict[str, Any]:
+    """Minimal required ModelConfig kwargs for an engine='llamacpp' model."""
+    base: Dict[str, Any] = dict(
+        name="local-split-test",
+        family=ModelFamily.QWEN,
+        parameters="32B",
+        min_memory_gb=20,
+        recommended_gpus=1,
+        max_gpus=4,
+        num_layers=0,
+        hidden_size=0,
+        num_attention_heads=0,
+        vocab_size=0,
+        max_seq_len=8192,
+        intermediate_size=0,
+        engine="llamacpp",
+        gguf_repo_id="Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+        gguf_file="qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+    )
+    base.update(overrides)
+    return base
+
+
+def test_local_gpu_ids_and_tensor_split_default_to_none() -> None:
+    cfg = ModelConfig(**_llamacpp_kwargs())
+    assert cfg.local_gpu_ids is None
+    assert cfg.local_tensor_split is None
+    assert cfg.grpc_metadata() == {
+        "engine": "llamacpp",
+        "gguf_repo_id": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+        "gguf_file": "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+    }
+
+
+def test_local_tensor_split_length_must_match_local_gpu_ids() -> None:
+    with pytest.raises(ValueError, match="length"):
+        ModelConfig(**_llamacpp_kwargs(local_gpu_ids=[0, 1], local_tensor_split=[0.5]))
+
+
+def test_local_tensor_split_requires_local_gpu_ids() -> None:
+    with pytest.raises(ValueError, match="length"):
+        ModelConfig(**_llamacpp_kwargs(local_tensor_split=[0.5, 0.5]))
+
+
+def test_local_tensor_split_rejects_non_positive_values() -> None:
+    with pytest.raises(ValueError, match="must all be"):
+        ModelConfig(**_llamacpp_kwargs(local_gpu_ids=[0, 1], local_tensor_split=[0.5, 0.0]))
+
+
+def test_local_gpu_ids_without_tensor_split_is_valid() -> None:
+    # Equal-weight split across the pinned GPUs is a valid Level-1 config.
+    cfg = ModelConfig(**_llamacpp_kwargs(local_gpu_ids=[0, 1]))
+    assert cfg.local_gpu_ids == [0, 1]
+    assert cfg.local_tensor_split is None
+    assert "tensor_split" not in cfg.grpc_metadata()
+
+
+def test_grpc_metadata_includes_tensor_split_when_local_split_set() -> None:
+    cfg = ModelConfig(**_llamacpp_kwargs(local_gpu_ids=[0, 1], local_tensor_split=[0.6, 0.4]))
+    assert cfg.grpc_metadata() == {
+        "engine": "llamacpp",
+        "gguf_repo_id": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+        "gguf_file": "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+        "tensor_split": "0.6,0.4",
+    }
+
+
+def test_load_from_dict_parses_local_multi_gpu_keys() -> None:
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "local-multi-gpu-gguf": {
+                    "family": "qwen",
+                    "parameters": "32B",
+                    "min_memory_gb": 20,
+                    "engine": "llamacpp",
+                    "gguf": {
+                        "repo_id": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+                        "file": "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+                    },
+                    "local_gpu_ids": [1, 2],
+                    "local_tensor_split": [0.7, 0.3],
+                }
+            }
+        }
+    )
+    cfg = ModelRegistry.get_model("local-multi-gpu-gguf")
+    assert cfg is not None
+    assert cfg.local_gpu_ids == [1, 2]
+    assert cfg.local_tensor_split == [0.7, 0.3]
+
+
+def test_load_from_dict_local_multi_gpu_keys_absent_by_default() -> None:
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "no-local-split-gguf": {
+                    "family": "qwen",
+                    "parameters": "7B",
+                    "min_memory_gb": 6,
+                    "engine": "llamacpp",
+                    "gguf": {
+                        "repo_id": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+                        "file": "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+                    },
+                }
+            }
+        }
+    )
+    cfg = ModelRegistry.get_model("no-local-split-gguf")
+    assert cfg is not None
+    assert cfg.local_gpu_ids is None
+    assert cfg.local_tensor_split is None
+
+
+# ---------------------------------------------------------------------------
+# Plan 11 Task 4 — Level 2: distributed registry schema (ggml-RPC)
+# ---------------------------------------------------------------------------
+
+
+def test_distributed_fields_default_off() -> None:
+    cfg = ModelConfig(**_llamacpp_kwargs())
+    assert cfg.distributed is False
+    assert cfg.distributed_lead is None
+    assert cfg.distributed_peers == []
+    assert cfg.distributed_split is None
+    assert cfg.distributed_rpc_port == 50151
+    assert cfg.distributed_gpu_ids == {}
+
+
+def test_distributed_requires_llamacpp_engine() -> None:
+    with pytest.raises(ValueError, match="engine"):
+        ModelConfig(
+            name="bad-distributed-engine",
+            family=ModelFamily.QWEN,
+            parameters="32B",
+            min_memory_gb=20,
+            recommended_gpus=1,
+            max_gpus=4,
+            num_layers=0,
+            hidden_size=0,
+            num_attention_heads=0,
+            vocab_size=0,
+            max_seq_len=8192,
+            intermediate_size=0,
+            engine="burn",  # distributed requires llamacpp
+            distributed=True,
+            distributed_lead="node-1",
+            distributed_peers=["node-2"],
+        )
+
+
+def test_distributed_requires_lead() -> None:
+    with pytest.raises(ValueError, match="distributed_lead"):
+        ModelConfig(**_llamacpp_kwargs(distributed=True, distributed_peers=["node-2"]))
+
+
+def test_distributed_requires_at_least_one_peer() -> None:
+    with pytest.raises(ValueError, match="peer"):
+        ModelConfig(**_llamacpp_kwargs(distributed=True, distributed_lead="node-1"))
+
+
+def test_distributed_valid_config() -> None:
+    cfg = ModelConfig(
+        **_llamacpp_kwargs(
+            distributed=True,
+            distributed_lead="amd-node-1",
+            distributed_peers=["amd-node-2", "amd-node-3"],
+            distributed_rpc_port=50151,
+            distributed_gpu_ids={"amd-node-1": [0], "amd-node-2": [0]},
+        )
+    )
+    assert cfg.distributed is True
+    assert cfg.distributed_lead == "amd-node-1"
+    assert cfg.distributed_peers == ["amd-node-2", "amd-node-3"]
+    assert cfg.distributed_gpu_ids == {"amd-node-1": [0], "amd-node-2": [0]}
+
+
+def test_grpc_metadata_lead_shape() -> None:
+    cfg = ModelConfig(
+        **_llamacpp_kwargs(
+            distributed=True,
+            distributed_lead="amd-node-1",
+            distributed_peers=["amd-node-2", "amd-node-3"],
+        )
+    )
+    metadata = cfg.grpc_metadata_lead(
+        peer_endpoints=["10.0.0.2:50151", "10.0.0.3:50151"],
+        tensor_split=[0.4, 0.3, 0.3],
+    )
+    assert metadata == {
+        "engine": "llamacpp",
+        "gguf_repo_id": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+        "gguf_file": "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+        "distributed_role": "lead",
+        "rpc_peers": "10.0.0.2:50151,10.0.0.3:50151",
+        "tensor_split": "0.4,0.3,0.3",
+    }
+
+
+def test_grpc_metadata_lead_omits_tensor_split_when_not_given() -> None:
+    cfg = ModelConfig(
+        **_llamacpp_kwargs(
+            distributed=True,
+            distributed_lead="amd-node-1",
+            distributed_peers=["amd-node-2"],
+        )
+    )
+    metadata = cfg.grpc_metadata_lead(peer_endpoints=["10.0.0.2:50151"], tensor_split=None)
+    assert metadata == {
+        "engine": "llamacpp",
+        "gguf_repo_id": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+        "gguf_file": "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+        "distributed_role": "lead",
+        "rpc_peers": "10.0.0.2:50151",
+    }
+
+
+def test_grpc_metadata_rpc_server_shape() -> None:
+    cfg = ModelConfig(
+        **_llamacpp_kwargs(
+            distributed=True,
+            distributed_lead="amd-node-1",
+            distributed_peers=["amd-node-2"],
+        )
+    )
+    metadata = cfg.grpc_metadata_rpc_server(base_port=50151)
+    assert metadata == {
+        "engine": "llamacpp",
+        "gguf_repo_id": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+        "gguf_file": "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+        "distributed_role": "rpc_server",
+        "rpc_bind_port": "50151",
+    }
+
+
+def test_grpc_metadata_stays_unchanged_for_distributed_models() -> None:
+    """grpc_metadata() (the non-distributed transport helper) must never grow
+    distributed_role/rpc_peers/rpc_bind_port keys — those live exclusively on
+    grpc_metadata_lead / grpc_metadata_rpc_server."""
+    cfg = ModelConfig(
+        **_llamacpp_kwargs(
+            distributed=True,
+            distributed_lead="amd-node-1",
+            distributed_peers=["amd-node-2", "amd-node-3"],
+        )
+    )
+    assert cfg.grpc_metadata() == {
+        "engine": "llamacpp",
+        "gguf_repo_id": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+        "gguf_file": "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+    }
+
+
+def test_load_from_dict_parses_distributed_section() -> None:
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "distributed-test-gguf": {
+                    "family": "qwen",
+                    "parameters": "32B",
+                    "min_memory_gb": 20,
+                    "engine": "llamacpp",
+                    "gguf": {
+                        "repo_id": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+                        "file": "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+                    },
+                    "distributed": {
+                        "enabled": True,
+                        "lead": "amd-node-1",
+                        "peers": ["amd-node-2", "amd-node-3"],
+                        "split": "auto",
+                        "rpc_port": 50151,
+                        "gpu_ids": {
+                            "amd-node-1": [0],
+                            "amd-node-2": [0],
+                            "amd-node-3": [0],
+                        },
+                    },
+                }
+            }
+        }
+    )
+    cfg = ModelRegistry.get_model("distributed-test-gguf")
+    assert cfg is not None
+    assert cfg.distributed is True
+    assert cfg.distributed_lead == "amd-node-1"
+    assert cfg.distributed_peers == ["amd-node-2", "amd-node-3"]
+    assert cfg.distributed_split is None  # "auto" is not a fixed weight list
+    assert cfg.distributed_rpc_port == 50151
+    assert cfg.distributed_gpu_ids == {
+        "amd-node-1": [0],
+        "amd-node-2": [0],
+        "amd-node-3": [0],
+    }
+
+
+def test_load_from_dict_parses_distributed_explicit_split() -> None:
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "distributed-explicit-split-gguf": {
+                    "family": "qwen",
+                    "parameters": "32B",
+                    "min_memory_gb": 20,
+                    "engine": "llamacpp",
+                    "gguf": {
+                        "repo_id": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+                        "file": "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+                    },
+                    "distributed": {
+                        "enabled": True,
+                        "lead": "amd-node-1",
+                        "peers": ["amd-node-2"],
+                        "split": [0.6, 0.4],
+                    },
+                }
+            }
+        }
+    )
+    cfg = ModelRegistry.get_model("distributed-explicit-split-gguf")
+    assert cfg is not None
+    assert cfg.distributed_split == [0.6, 0.4]
+
+
+def test_load_from_dict_distributed_absent_by_default() -> None:
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "no-distributed-gguf": {
+                    "family": "qwen",
+                    "parameters": "7B",
+                    "min_memory_gb": 6,
+                    "engine": "llamacpp",
+                    "gguf": {
+                        "repo_id": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+                        "file": "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+                    },
+                }
+            }
+        }
+    )
+    cfg = ModelRegistry.get_model("no-distributed-gguf")
+    assert cfg is not None
+    assert cfg.distributed is False
+    assert cfg.distributed_lead is None
+    assert cfg.distributed_peers == []
+    assert cfg.distributed_gpu_ids == {}
+
+
+def test_real_models_toml_distributed_reference_entry_loads() -> None:
+    """config/models.toml's qwen2.5-coder-32b-gguf.distributed reference block
+    (Plan 11 Task 4) parses into a valid, fully populated distributed schema."""
+    models_toml = Path(__file__).resolve().parents[2] / "config" / "models.toml"
+    ModelRegistry.load_from_dict(toml.load(models_toml))
+    cfg = ModelRegistry.get_model("qwen2.5-coder-32b-gguf")
+    assert cfg is not None
+    assert cfg.distributed is True
+    assert cfg.distributed_lead == "amd-node-1"
+    assert cfg.distributed_peers == ["amd-node-2", "amd-node-3"]
+    assert cfg.distributed_split is None  # "auto"
+    assert cfg.distributed_rpc_port == 50151
+    assert cfg.distributed_gpu_ids == {
+        "amd-node-1": [0],
+        "amd-node-2": [0],
+        "amd-node-3": [0],
+    }

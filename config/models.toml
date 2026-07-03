@@ -127,6 +127,24 @@ file = "qwen2.5-coder-32b-instruct-q4_k_m.gguf"
 n_gpu_layers = -1  # -1 = offload all layers to the GPU
 n_ctx = 8192
 
+# Level 2 — distributed (cross-node ggml-RPC) reference entry. This is the
+# flagship "split across 3 AMD nodes" showcase from pending-work/11. NOT
+# usable until Phase 2: it needs the worker's `llamacpp-rpc` feature built
+# and a running `rpc-server` process on each peer node (amd-node-2/3). Until
+# then this block is inert config-only schema (coordinator Task 6, which
+# reads it, is not implemented yet either).
+[models."qwen2.5-coder-32b-gguf".distributed]
+enabled = true
+lead = "amd-node-1"
+peers = ["amd-node-2", "amd-node-3"]
+split = "auto"  # "auto" = derive per-GPU weights from live VRAM at load time
+rpc_port = 50151
+
+[models."qwen2.5-coder-32b-gguf".distributed.gpu_ids]
+amd-node-1 = [0]
+amd-node-2 = [0]
+amd-node-3 = [0]
+
 # Burn / safetensors Models (experimental — FP32 reference engine)
 # ===================================================================
 # `engine` defaults to "burn" for the models below (worker built with default

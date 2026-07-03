@@ -100,6 +100,26 @@ class ModelConfig:
     gguf_n_gpu_layers: Optional[int] = None  # -1 = all layers on GPU
     gguf_n_ctx: Optional[int] = None  # context window override
 
+    # Level 1 — local multi-GPU split (llama.cpp splitting a model across a
+    # single node's OWN same-vendor GPUs, in-process, no network). Both None
+    # (the default) is today's behavior: the coordinator picks
+    # `worker.gpus[:recommended_gpus]` and no split metadata is sent.
+    local_gpu_ids: Optional[List[int]] = None
+    local_tensor_split: Optional[List[float]] = None  # weights, same order/len as local_gpu_ids
+
+    # Level 2 — distributed (cross-node ggml-RPC) registry schema. A model
+    # splits pipeline layers across a "lead" node (owns the real llama.cpp
+    # context) and one or more "rpc_server" peer nodes that lend local GPUs.
+    # `distributed=False` (the default) is today's single-node behavior.
+    distributed: bool = False
+    distributed_lead: Optional[str] = None  # worker_id of the lead node
+    distributed_peers: List[str] = field(default_factory=list)  # worker_ids of rpc_server peers
+    distributed_split: Optional[List[float]] = None  # None = auto-derive at load time (Task 6)
+    distributed_rpc_port: int = 50151  # base ggml-RPC port each peer binds from
+    distributed_gpu_ids: Dict[str, List[int]] = field(
+        default_factory=dict
+    )  # worker_id -> local GPU ids that node contributes
+
     def __post_init__(self) -> None:
         """Validate configuration."""
         if self.is_moe and not self.num_experts:
@@ -114,15 +134,30 @@ class ModelConfig:
         if self.engine == "llamacpp" and not (self.gguf_repo_id and self.gguf_file):
             raise ValueError("llamacpp engine models must set gguf.repo_id and gguf.file")
 
-    def grpc_metadata(self) -> Dict[str, str]:
-        """Engine-routing metadata carried in the gRPC ModelConfig.metadata map.
+        if self.local_tensor_split is not None:
+            if self.local_gpu_ids is None or len(self.local_tensor_split) != len(
+                self.local_gpu_ids
+            ):
+                raise ValueError(
+                    "local_tensor_split length must equal local_gpu_ids length "
+                    f"(got {len(self.local_tensor_split)} weights vs "
+                    f"{len(self.local_gpu_ids) if self.local_gpu_ids is not None else 0} gpu ids)"
+                )
+            if any(weight <= 0 for weight in self.local_tensor_split):
+                raise ValueError("local_tensor_split values must all be > 0")
 
-        The worker's model loader reads these string keys to route the model to
-        the llama.cpp engine. Burn models send an empty map (zero proto change,
-        fully backwards compatible).
-        """
-        if self.engine != "llamacpp":
-            return {}
+        if self.distributed:
+            if self.engine != "llamacpp":
+                raise ValueError("distributed models must use engine='llamacpp'")
+            if not self.distributed_lead:
+                raise ValueError("distributed models must set distributed_lead")
+            if not self.distributed_peers:
+                raise ValueError("distributed models must set at least one distributed peer")
+
+    def _gguf_metadata(self) -> Dict[str, str]:
+        """Base engine + GGUF-source metadata shared by every llama.cpp
+        transport helper (single-node, distributed lead, and distributed
+        rpc_server all need the same model source keys)."""
         metadata: Dict[str, str] = {
             "engine": "llamacpp",
             "gguf_repo_id": self.gguf_repo_id or "",
@@ -132,6 +167,53 @@ class ModelConfig:
             metadata["n_gpu_layers"] = str(self.gguf_n_gpu_layers)
         if self.gguf_n_ctx is not None:
             metadata["n_ctx"] = str(self.gguf_n_ctx)
+        return metadata
+
+    def grpc_metadata(self) -> Dict[str, str]:
+        """Engine-routing metadata carried in the gRPC ModelConfig.metadata map.
+
+        The worker's model loader reads these string keys to route the model to
+        the llama.cpp engine. Burn models send an empty map (zero proto change,
+        fully backwards compatible). When `local_tensor_split` is set (Level 1
+        — local multi-GPU split), a `tensor_split` key rides along so the
+        worker can apportion layers across this node's own GPUs.
+        """
+        if self.engine != "llamacpp":
+            return {}
+        metadata = self._gguf_metadata()
+        if self.local_tensor_split is not None:
+            metadata["tensor_split"] = ",".join(str(w) for w in self.local_tensor_split)
+        return metadata
+
+    def grpc_metadata_lead(
+        self, peer_endpoints: List[str], tensor_split: Optional[List[float]]
+    ) -> Dict[str, str]:
+        """Metadata for the LEAD node of a Level-2 distributed load.
+
+        Rides the same base engine/gguf keys as `grpc_metadata()` plus the
+        distributed-role keys the worker parses: `distributed_role="lead"`,
+        `rpc_peers` (ordered, comma-joined "host:port" — SAME order as the
+        peer-portion of `tensor_split`), and `tensor_split` (the combined
+        [lead gpu_ids..., peer_1 lent gpus..., ...] weights) when given.
+        """
+        metadata = self._gguf_metadata()
+        metadata["distributed_role"] = "lead"
+        metadata["rpc_peers"] = ",".join(peer_endpoints)
+        if tensor_split is not None:
+            metadata["tensor_split"] = ",".join(str(w) for w in tensor_split)
+        return metadata
+
+    def grpc_metadata_rpc_server(self, base_port: int) -> Dict[str, str]:
+        """Metadata for an RPC_SERVER peer node of a Level-2 distributed load.
+
+        Carries the same base engine/gguf keys (the peer needs the identical
+        GGUF source to fetch/serve the same model) plus
+        `distributed_role="rpc_server"` and `rpc_bind_port` — the base port; a
+        node lending k GPUs binds `rpc_bind_port..+k-1`.
+        """
+        metadata = self._gguf_metadata()
+        metadata["distributed_role"] = "rpc_server"
+        metadata["rpc_bind_port"] = str(base_port)
         return metadata
 
 
@@ -538,6 +620,8 @@ class ModelRegistry:
                 paths = get_dict(final_data, "paths")
                 hf = get_dict(final_data, "hf")
                 gguf = get_dict(final_data, "gguf")
+                distributed_cfg = get_dict(final_data, "distributed")
+                distributed_gpu_ids_raw = get_dict(distributed_cfg, "gpu_ids")
 
                 # Determine supported quantizations
                 supported_quants = quants.get("supported")
@@ -591,6 +675,29 @@ class ModelRegistry:
                         int(gguf["n_gpu_layers"]) if "n_gpu_layers" in gguf else None
                     ),
                     gguf_n_ctx=int(gguf["n_ctx"]) if "n_ctx" in gguf else None,
+                    local_gpu_ids=(
+                        [int(x) for x in final_data["local_gpu_ids"]]
+                        if "local_gpu_ids" in final_data
+                        else None
+                    ),
+                    local_tensor_split=(
+                        [float(x) for x in final_data["local_tensor_split"]]
+                        if "local_tensor_split" in final_data
+                        else None
+                    ),
+                    distributed=bool(distributed_cfg.get("enabled", False)),
+                    distributed_lead=distributed_cfg.get("lead"),
+                    distributed_peers=[str(p) for p in distributed_cfg.get("peers", [])],
+                    distributed_split=(
+                        [float(x) for x in distributed_cfg["split"]]
+                        if isinstance(distributed_cfg.get("split"), list)
+                        else None
+                    ),
+                    distributed_rpc_port=int(distributed_cfg.get("rpc_port", 50151)),
+                    distributed_gpu_ids={
+                        str(worker_id): [int(x) for x in gpu_ids]
+                        for worker_id, gpu_ids in distributed_gpu_ids_raw.items()
+                    },
                 )
                 cls.MODELS[model_name] = model
             except Exception as e:

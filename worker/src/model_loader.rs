@@ -165,6 +165,22 @@ impl ModelLoader {
                 WorkerError::Resource(format!("Failed to acquire load permit: {}", e))
             })?;
 
+        // Level-2 distributed routing: an rpc_server peer reserves VRAM for
+        // a lead elsewhere and holds no directly-servable model — checked
+        // BEFORE gguf/Burn routing so a peer's metadata never has to carry a
+        // (fake) GGUF source. STUB this increment: no subprocess/real
+        // ggml-RPC yet (Task 8 in pending-work/11-distributed-multi-node-inference.md).
+        // A "lead" spec falls through to the normal routing below unchanged
+        // this increment (Task 9 wires the real proxy engine).
+        if let Some(dist_spec) = distributed_spec_from_metadata(model_config.map(|c| &c.metadata))?
+        {
+            if dist_spec.role == DistributedRole::RpcServer {
+                return self
+                    .load_rpc_server_stub(model_name, gpu_ids, quantization, parallelism)
+                    .await;
+            }
+        }
+
         // Engine routing: GGUF/llama.cpp models bypass the entire
         // safetensors + config.json path below (GGUF repos often ship no
         // config.json; llama.cpp reads architecture from GGUF metadata).
@@ -363,6 +379,77 @@ impl ModelLoader {
             .insert(model_name.to_string(), instance.clone());
         info!("Model {} loaded successfully", model_name);
 
+        Ok(instance)
+    }
+
+    /// Register this node as an `rpc_server` peer for a distributed model —
+    /// STUB (Task 5 of pending-work/11-distributed-multi-node-inference.md).
+    ///
+    /// An rpc_server peer lends its whole local GPU(s) to a lead node
+    /// elsewhere, so this reserves everything currently free on each
+    /// requested device (an honest "this GPU is spoken for" signal even
+    /// though no real `rpc-server` process is running yet) and inserts a
+    /// [`ModelInstance`] with no attached model — the existing "no model
+    /// attached" placeholder also used elsewhere. No subprocess, no real
+    /// ggml-RPC this increment; Task 8 replaces this with the real
+    /// `rpc-server` supervisor + a synthetic allocation sized to what that
+    /// process actually consumes.
+    async fn load_rpc_server_stub(
+        &self,
+        model_name: &str,
+        gpu_ids: &[u32],
+        quantization: crate::cluster::Quantization,
+        parallelism: crate::cluster::ParallelismStrategy,
+    ) -> Result<ModelInstance, WorkerError> {
+        info!(
+            "Registering {} as an rpc_server peer stub on GPU(s) {:?} (no subprocess yet)",
+            model_name, gpu_ids
+        );
+
+        let mut reserved_gpus: Vec<usize> = Vec::new();
+        let mut total_reserved: u64 = 0;
+        for &gpu_id in gpu_ids {
+            let gpu_id = gpu_id as usize;
+            let available = self.gpu_manager.get_available_memory(gpu_id).await;
+            match self
+                .gpu_manager
+                .allocate_memory(gpu_id, available, model_name)
+                .await
+            {
+                Ok(()) => {
+                    reserved_gpus.push(gpu_id);
+                    total_reserved += available;
+                }
+                Err(e) => {
+                    // Roll back reservations made so far — no leak on partial failure.
+                    for &g in &reserved_gpus {
+                        self.gpu_manager.free_memory(g, model_name).await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        // `model: None` — the existing "no model attached" placeholder. A
+        // stray Infer against this instance hits `ModelInstance::generate`'s
+        // `Err(WorkerError::Internal(...))` path, not a panic.
+        let instance = ModelInstance::new(
+            model_name.to_string(),
+            total_reserved as usize,
+            gpu_ids.to_vec(),
+            quantization as i32,
+            parallelism as i32,
+            None,
+        );
+
+        self.loaded_models
+            .insert(model_name.to_string(), instance.clone());
+        info!(
+            "rpc_server peer stub {} registered ({} bytes reserved across {} GPU(s))",
+            model_name,
+            total_reserved,
+            reserved_gpus.len()
+        );
         Ok(instance)
     }
 
@@ -682,6 +769,30 @@ pub struct GgufLoadSpec {
     pub n_gpu_layers: i32,
     /// Optional per-model context window override.
     pub n_ctx: Option<u32>,
+    /// Level-1 (local multi-GPU) split weights for THIS node's own
+    /// `gpu_ids`, in order — len == len(gpu_ids) when present. Parsed from
+    /// the comma-separated `tensor_split` metadata key (see the metadata key
+    /// contract in pending-work/11-distributed-multi-node-inference.md).
+    #[allow(dead_code)]
+    // consumed by the Level-1 load() wiring in a later increment (Task 0-gated)
+    pub tensor_split: Option<Vec<f32>>,
+}
+
+/// Parse the shared `tensor_split` metadata key: comma-separated f32 weights.
+/// Used by both [`gguf_spec_from_metadata`] (Level-1, local) and
+/// [`distributed_spec_from_metadata`] (Level-2, cross-node combined split).
+fn parse_tensor_split(metadata: &HashMap<String, String>) -> Result<Option<Vec<f32>>, WorkerError> {
+    match metadata.get("tensor_split") {
+        None => Ok(None),
+        Some(v) => {
+            let parsed: Result<Vec<f32>, _> =
+                v.split(',').map(|s| s.trim().parse::<f32>()).collect();
+            let parsed = parsed.map_err(|e| {
+                WorkerError::Configuration(format!("invalid tensor_split '{v}': {e}"))
+            })?;
+            Ok(Some(parsed))
+        }
+    }
 }
 
 /// Parse engine-routing metadata.
@@ -730,17 +841,104 @@ pub fn gguf_spec_from_metadata(
                 })?),
                 None => None,
             };
+            let tensor_split = parse_tensor_split(metadata)?;
             Ok(Some(GgufLoadSpec {
                 repo_id,
                 file,
                 n_gpu_layers,
                 n_ctx,
+                tensor_split,
             }))
         }
         Some(other) => Err(WorkerError::Configuration(format!(
             "Unknown inference engine '{other}' (expected 'burn' or 'llamacpp')"
         ))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Distributed (Level-2, cross-node ggml-RPC) metadata routing — always
+// compiled, no llama.cpp dependency. See the metadata key contract in
+// pending-work/11-distributed-multi-node-inference.md. `Ok(None)` when the
+// `distributed_role` key is absent means byte-for-byte today's single-node
+// behavior; only the STUB `rpc_server` role is wired into a load path this
+// increment (Task 5) — the real `lead` engine ships in Task 9.
+// ---------------------------------------------------------------------------
+
+/// Which side of a Level-2 (cross-node) ggml-RPC split this node plays for
+/// one distributed model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistributedRole {
+    /// Owns the real llama.cpp context for the model and dials out to
+    /// `rpc_peers` (Task 9 — not implemented this increment).
+    Lead,
+    /// Lends this node's local GPU(s) compute+VRAM to a lead; holds no
+    /// directly-servable model (Task 5 STUB, this increment).
+    RpcServer,
+}
+
+/// Level-2 distributed-load metadata parsed from `ModelConfig.metadata`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistributedSpec {
+    /// This node's role for the distributed model.
+    pub role: DistributedRole,
+    /// Lead only: comma-separated "host:port" peers, GPU-granular.
+    ///
+    /// Ordering invariant (do not break without updating both sides):
+    /// `rpc_peers[i]` and `tensor_split[len(lead_gpu_ids) + i]` refer to the
+    /// SAME (node, GPU) — the peer-portion of `tensor_split` must be laid out
+    /// in the exact same order as `rpc_peers`.
+    pub rpc_peers: Vec<String>,
+    /// rpc_server only: base port its `rpc-server` process(es) bind to.
+    pub rpc_bind_port: Option<u16>,
+    /// Lead only: combined flat split weights — [lead's own gpu_ids...,
+    /// peer_1's lent GPUs..., peer_2's...].
+    pub tensor_split: Option<Vec<f32>>,
+}
+
+/// Parse Level-2 distributed-role metadata.
+///
+/// * `Ok(None)` — no metadata or no `distributed_role` key: today's
+///   single-node path, fully backwards compatible.
+/// * `Ok(Some(spec))` — `distributed_role` is `"lead"` or `"rpc_server"`.
+/// * `Err(..)` — unknown role, or a malformed `rpc_bind_port`/`tensor_split`.
+pub fn distributed_spec_from_metadata(
+    metadata: Option<&HashMap<String, String>>,
+) -> Result<Option<DistributedSpec>, WorkerError> {
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    let role = match metadata.get("distributed_role").map(String::as_str) {
+        None => return Ok(None),
+        Some("lead") => DistributedRole::Lead,
+        Some("rpc_server") => DistributedRole::RpcServer,
+        Some(other) => {
+            return Err(WorkerError::Configuration(format!(
+                "Unknown distributed_role '{other}' (expected 'lead' or 'rpc_server')"
+            )))
+        }
+    };
+
+    let rpc_peers = match metadata.get("rpc_peers") {
+        Some(v) if !v.is_empty() => v.split(',').map(|s| s.trim().to_string()).collect(),
+        _ => Vec::new(),
+    };
+
+    let rpc_bind_port = match metadata.get("rpc_bind_port") {
+        Some(v) => Some(v.parse::<u16>().map_err(|e| {
+            WorkerError::Configuration(format!("invalid rpc_bind_port '{v}': {e}"))
+        })?),
+        None => None,
+    };
+
+    let tensor_split = parse_tensor_split(metadata)?;
+
+    Ok(Some(DistributedSpec {
+        role,
+        rpc_peers,
+        rpc_bind_port,
+        tensor_split,
+    }))
 }
 
 #[cfg(test)]
@@ -813,6 +1011,193 @@ mod tests {
             ("n_gpu_layers", "many"),
         ]);
         assert!(gguf_spec_from_metadata(Some(&bad_layers), -1).is_err());
+    }
+
+    #[test]
+    fn gguf_spec_parses_tensor_split_when_present() {
+        let m = meta(&[
+            ("engine", "llamacpp"),
+            ("gguf_repo_id", "some/repo"),
+            ("gguf_file", "model.gguf"),
+            ("tensor_split", "0.6,0.4"),
+        ]);
+        let spec = gguf_spec_from_metadata(Some(&m), -1).unwrap().unwrap();
+        assert_eq!(spec.tensor_split, Some(vec![0.6, 0.4]));
+    }
+
+    #[test]
+    fn gguf_spec_tensor_split_absent_is_none() {
+        let m = meta(&[
+            ("engine", "llamacpp"),
+            ("gguf_repo_id", "some/repo"),
+            ("gguf_file", "model.gguf"),
+        ]);
+        let spec = gguf_spec_from_metadata(Some(&m), -1).unwrap().unwrap();
+        assert_eq!(spec.tensor_split, None);
+    }
+
+    #[test]
+    fn gguf_spec_rejects_malformed_tensor_split() {
+        let m = meta(&[
+            ("engine", "llamacpp"),
+            ("gguf_repo_id", "some/repo"),
+            ("gguf_file", "model.gguf"),
+            ("tensor_split", "0.6,not-a-float"),
+        ]);
+        assert!(gguf_spec_from_metadata(Some(&m), -1).is_err());
+    }
+
+    #[test]
+    fn distributed_spec_none_without_metadata_or_role() {
+        assert_eq!(distributed_spec_from_metadata(None).unwrap(), None);
+        let empty = meta(&[]);
+        assert_eq!(distributed_spec_from_metadata(Some(&empty)).unwrap(), None);
+        let no_role = meta(&[("engine", "llamacpp")]);
+        assert_eq!(
+            distributed_spec_from_metadata(Some(&no_role)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn distributed_spec_parses_lead_role() {
+        let m = meta(&[
+            ("distributed_role", "lead"),
+            ("rpc_peers", "10.0.0.2:50151,10.0.0.3:50151"),
+            ("tensor_split", "0.5,0.3,0.2"),
+        ]);
+        let spec = distributed_spec_from_metadata(Some(&m)).unwrap().unwrap();
+        assert_eq!(spec.role, DistributedRole::Lead);
+        assert_eq!(
+            spec.rpc_peers,
+            vec!["10.0.0.2:50151".to_string(), "10.0.0.3:50151".to_string()]
+        );
+        assert_eq!(spec.tensor_split, Some(vec![0.5, 0.3, 0.2]));
+        assert_eq!(spec.rpc_bind_port, None);
+    }
+
+    #[test]
+    fn distributed_spec_parses_rpc_server_role() {
+        let m = meta(&[
+            ("distributed_role", "rpc_server"),
+            ("rpc_bind_port", "50151"),
+        ]);
+        let spec = distributed_spec_from_metadata(Some(&m)).unwrap().unwrap();
+        assert_eq!(spec.role, DistributedRole::RpcServer);
+        assert_eq!(spec.rpc_bind_port, Some(50151));
+        assert!(spec.rpc_peers.is_empty());
+        assert_eq!(spec.tensor_split, None);
+    }
+
+    #[test]
+    fn distributed_spec_rejects_unknown_role() {
+        let unknown = meta(&[("distributed_role", "follower")]);
+        assert!(distributed_spec_from_metadata(Some(&unknown)).is_err());
+    }
+
+    #[test]
+    fn distributed_spec_rejects_malformed_bind_port_or_tensor_split() {
+        let bad_port = meta(&[
+            ("distributed_role", "rpc_server"),
+            ("rpc_bind_port", "not-a-port"),
+        ]);
+        assert!(distributed_spec_from_metadata(Some(&bad_port)).is_err());
+
+        let bad_split = meta(&[("distributed_role", "lead"), ("tensor_split", "abc")]);
+        assert!(distributed_spec_from_metadata(Some(&bad_split)).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // rpc_server STUB role (Task 5): exercised through the real
+    // `ModelLoader::load_model` entrypoint — the same path the worker.rs
+    // `LoadModel` gRPC handler calls — so these double as an integration
+    // check of the routing order, without needing a live gRPC harness.
+    // -----------------------------------------------------------------
+
+    fn test_loader(gpu_manager: Arc<GPUManager>) -> (ModelLoader, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let loader_config = ModelLoaderConfig {
+            cache_dir: dir.path().join("models"),
+            download_dir: dir.path().join("downloads"),
+            ..ModelLoaderConfig::default()
+        };
+        let loader = ModelLoader::new(loader_config, gpu_manager).unwrap();
+        (loader, dir)
+    }
+
+    #[tokio::test]
+    async fn rpc_server_stub_reserves_vram_and_leaves_no_model_attached() {
+        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        let (loader, _dir) = test_loader(gpu_manager.clone());
+
+        let metadata = meta(&[
+            ("distributed_role", "rpc_server"),
+            ("rpc_bind_port", "50151"),
+        ]);
+        let model_config = crate::cluster::ModelConfig {
+            metadata,
+            ..Default::default()
+        };
+
+        let instance = loader
+            .load_model(
+                "peer-stub",
+                None,
+                Some(&model_config),
+                &[0],
+                crate::cluster::Quantization::None,
+                crate::cluster::ParallelismStrategy::Auto,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(instance.gpu_ids(), &[0]);
+        // The stub reserved everything free on GPU 0 — available_memory drops.
+        assert_eq!(gpu_manager.get_available_memory(0).await, 0);
+
+        // A stray Infer against the placeholder returns the existing clean
+        // "no model attached" error (ModelInstance::generate), not a panic.
+        // (TextStream isn't Debug, so match instead of unwrap_err().)
+        match instance.generate("hello", 4, 0.7, 0.9, 40, None).await {
+            Err(e) => assert!(e.to_string().contains("holds no runnable model")),
+            Ok(_) => panic!("expected 'no model attached' error, got a stream"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_server_role_routes_before_gguf_metadata_is_consulted() {
+        // Ordering invariant: the distributed rpc_server branch must run
+        // BEFORE the gguf/Burn routing. Prove it by attaching `engine`/
+        // `gguf_repo_id`/`gguf_file` metadata that would trigger a network
+        // download if the gguf branch ran first — the stub must short-circuit
+        // before ever looking at those keys.
+        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        let (loader, _dir) = test_loader(gpu_manager.clone());
+
+        let metadata = meta(&[
+            ("distributed_role", "rpc_server"),
+            ("rpc_bind_port", "50151"),
+            ("engine", "llamacpp"),
+            ("gguf_repo_id", "does-not/exist"),
+            ("gguf_file", "does-not-exist.gguf"),
+        ]);
+        let model_config = crate::cluster::ModelConfig {
+            metadata,
+            ..Default::default()
+        };
+
+        let instance = loader
+            .load_model(
+                "peer-stub-2",
+                None,
+                Some(&model_config),
+                &[0],
+                crate::cluster::Quantization::None,
+                crate::cluster::ParallelismStrategy::Auto,
+            )
+            .await
+            .unwrap();
+        assert_eq!(instance.gpu_ids(), &[0]);
     }
 }
 

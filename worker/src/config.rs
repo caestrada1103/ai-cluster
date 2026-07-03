@@ -54,6 +54,22 @@ pub struct WorkerConfig {
     /// llama.cpp models (-1 = all layers). Per-model `n_gpu_layers` metadata
     /// from the registry overrides this.
     pub llamacpp_default_n_gpu_layers: i32,
+
+    /// Whether this node lends its local GPU(s) to a distributed model's
+    /// "lead" node as a ggml-RPC peer (Level 2, `distributed_role=rpc_server`
+    /// metadata). Default `false` — no `worker.toml` edits needed on nodes
+    /// that never act as an RPC peer.
+    pub rpc_server_enabled: bool,
+
+    /// Base TCP port this node's `rpc-server` process(es) bind to when
+    /// `rpc_server_enabled=true`. One GPU per port, starting here.
+    pub rpc_server_port: u16,
+
+    /// Bind interface for the `rpc-server` process(es). `None` defaults to
+    /// the loopback/LAN interface the (future) subprocess supervisor picks.
+    /// ggml-RPC has no auth — never bind this to a public interface
+    /// (trusted-LAN only).
+    pub rpc_server_bind_host: Option<String>,
 }
 
 impl Default for WorkerConfig {
@@ -72,6 +88,9 @@ impl Default for WorkerConfig {
             hf_cache_dir: None,
             llamacpp_n_threads: 0,
             llamacpp_default_n_gpu_layers: -1,
+            rpc_server_enabled: false,
+            rpc_server_port: 50151,
+            rpc_server_bind_host: None,
         }
     }
 }
@@ -161,5 +180,22 @@ mod tests {
         let config: WorkerConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.llamacpp_n_threads, 8);
         assert_eq!(config.llamacpp_default_n_gpu_layers, 20);
+    }
+
+    #[test]
+    fn test_rpc_server_defaults() {
+        let config = WorkerConfig::default();
+        assert!(!config.rpc_server_enabled);
+        assert_eq!(config.rpc_server_port, 50151);
+        assert_eq!(config.rpc_server_bind_host, None);
+    }
+
+    #[test]
+    fn test_rpc_server_keys_parse_from_flat_toml() {
+        let toml_str = "rpc_server_enabled = true\nrpc_server_port = 60000\nrpc_server_bind_host = \"0.0.0.0\"\n";
+        let config: WorkerConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.rpc_server_enabled);
+        assert_eq!(config.rpc_server_port, 60000);
+        assert_eq!(config.rpc_server_bind_host, Some("0.0.0.0".to_string()));
     }
 }
