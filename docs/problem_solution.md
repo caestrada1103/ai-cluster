@@ -1,33 +1,76 @@
 # Why AI Cluster?
 
-## The Problem: Modern AI is Too Resource-Intensive
+## The Problem: Your GPU Is Sitting Idle, and the Model Doesn't Fit Anyway
 
-Running modern Large Language Models (LLMs) like Llama 3 or DeepSeek requires massive computational resources. A single high-end consumer GPU is often insufficient to load these models, let alone run them efficiently.
+Most people don't have a single high-end AI accelerator — they have a
+gaming PC (or two) with a consumer NVIDIA or AMD card in the 8–16 GB VRAM
+range, often sitting idle outside of gaming sessions. A full-precision LLM
+checkpoint routinely needs far more VRAM than that, so the card goes
+unused for inference even though it's perfectly capable of running a
+right-sized, quantized model.
 
 ### Key Challenges for Individuals and Small Teams:
-1.  **Hardware Limitations:** State-of-the-art models require more VRAM than a standard GPU (like an RTX 3090 or 4090) possesses.
-2.  **High Costs:** Enterprise-grade GPUs (like A100s or H100s) are prohibitively expensive for most developers and startups.
-3.  **Complexity:** Setting up a distributed inference system manually is technically daunting, involving complex networking, synchronization, and software compatibility issues.
-4.  **Hardware Fragmentation:** Users often have a mix of different GPUs (e.g., an older NVIDIA card on one machine and a newer one on another) or even different brands (AMD and NVIDIA), making unified utilization difficult.
+1.  **VRAM Limits:** A full-precision (FP32/FP16) checkpoint of a useful
+    model often doesn't fit an 8–16 GB consumer card.
+2.  **High Costs:** Enterprise-grade GPUs (like A100s or H100s) are
+    prohibitively expensive for most developers and startups.
+3.  **Complexity:** Setting up quantized inference and/or a distributed
+    setup manually is technically daunting — picking the right GGUF quant,
+    wiring up GPU drivers, exposing an API.
+4.  **Hardware Fragmentation:** Users often have a mix of different GPUs
+    (e.g., an older NVIDIA card on one machine and a newer AMD card on
+    another), making unified utilization difficult.
 
 ## The Solution: AI Cluster
 
-**AI Cluster** democratizes access to large-scale AI inference by allowing you to pool together the resources you already have. It turns a collection of consumer-grade GPUs across multiple machines into a single, powerful AI supercomputer.
+**AI Cluster** lets you run inference on the consumer GPU(s) you already
+own — NVIDIA or AMD, including a card that would otherwise sit idle — using
+a **quantized GGUF model** via the built-in llama.cpp engine, sized to fit
+in the VRAM you actually have. A Python coordinator gives you a single
+OpenAI-compatible API in front of one or more Rust workers, so you don't
+have to hand-roll the GPU driver, quantization, and serving plumbing
+yourself.
 
 ### How It Works (Simplified)
-Imagine you have a large book (the AI Model) that is too heavy for one person to hold.
-- **Without AI Cluster:** You can't read the book because you can't pick it up.
-- **With AI Cluster:** You tear the book into chapters and give one chapter to each of your friends (Workers). When you need to read the story, the "Coordinator" directs the flow, asking each friend to read their part in the correct order. The result is a smooth, continuous story, even though no single person holds the entire book.
+Imagine your GPU is a small bookshelf, and the AI Model is a book that's
+too thick to fit on it at full size.
+- **Without AI Cluster:** You can't fit the book on the shelf, so it stays
+  in the box.
+- **With AI Cluster:** You get an abridged edition of the book (a quantized
+  GGUF file — same story, smaller footprint) that fits comfortably on your
+  shelf. The "Coordinator" hands you a single front door (an OpenAI-style
+  API) regardless of which shelf (worker/GPU) is holding the book. If the
+  book is too thick even in abridged form, splitting it across a few
+  shelves (multi-GPU model split) is the direction this project is headed
+  next — not yet available through the worker today.
 
 ### Key Benefits
-*   **Run Bigger Models:** Combine VRAM from multiple cards to load models that wouldn't fit on any single device (e.g., running Llama-3-70B on home hardware).
-*   **Cost Efficiency:** Use the hardware you already own. No need to buy an A100; just connect your gaming PC, your old workstation, and your laptop.
-*   **Mixed Hardware Support:** Mix and match different GPUs. AI Cluster handles the complexity of making them work together.
-*   **Plug-and-Play:** Designed to be easy to set up. Detailed guides help you get started quickly, whether you are on a single machine or a network of devices.
+*   **Fit Bigger Models in Small VRAM:** A quantized GGUF checkpoint
+    (Q4_K_M/Q5_K_M/Q8_0/…) can shrink a model enough to run inference on a
+    single ~8–16 GB consumer card that couldn't hold the full-precision
+    weights.
+*   **Cost Efficiency:** Use the hardware you already own — no need to buy
+    an A100, just point AI Cluster at your gaming PC's idle GPU.
+*   **Mixed Hardware Support:** NVIDIA and AMD cards both work (CUDA/ROCm/
+    Vulkan), including in the same cluster, so an older card and a newer
+    one from different vendors can both serve requests.
+*   **One API, Two Engines:** An OpenAI-compatible REST API in front of
+    either the primary llama.cpp/GGUF engine (quantized, recommended) or
+    the experimental Burn engine (FP32 reference, single GPU).
+
+Splitting one model across several consumer GPUs — the other half of "make
+big models fit" — rides on parallelism work that exists in the codebase
+(`worker/src/parallelism.rs` for the Burn engine, upstream llama.cpp's
+native multi-GPU split for GGUF) but isn't wired into the inference path
+yet; see [architecture.md](architecture.md#parallelism-strategies) for
+current status. Today, "does it fit" is decided per-GPU, by quantization.
 
 ### Who is this for?
-*   **Researchers & Students:** Experiment with SOTA models without university-scale budgets.
-*   **Startups:** Prototype and deploy private AI services without relying on expensive cloud APIs or dedicated enterprise hardware.
-*   **Hobbyists:** Put your spare hardware to productive use.
+*   **Researchers & Students:** Experiment with capable open models without
+    university-scale budgets.
+*   **Startups:** Prototype and deploy private AI services without relying
+    on expensive cloud APIs or dedicated enterprise hardware.
+*   **Hobbyists:** Put a spare or idle gaming GPU to productive use.
 
-AI Cluster bridges the gap between consumer hardware and cutting-edge AI capabilities.
+AI Cluster bridges the gap between the consumer hardware you already have
+and running real LLMs on it.

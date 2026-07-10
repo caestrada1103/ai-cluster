@@ -7,10 +7,11 @@ Endpoints:
     POST /models/load  - Load a model onto a worker
     GET  /workers      - List connected workers
 """
+import asyncio
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -25,14 +26,17 @@ router = APIRouter()
 # Request / Response schemas
 # ---------------------------------------------------------------------------
 
+
 class ChatMessage(BaseModel):
     """Schema for a single chat message."""
+
     role: str
     content: str
 
 
 class ChatCompletionRequest(BaseModel):
     """Body for the POST /chat/completions endpoint (OpenAI compatible)."""
+
     model: str
     messages: List[ChatMessage]
     max_tokens: Optional[int] = Field(512, ge=1, le=32768)
@@ -40,6 +44,16 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = Field(0.95, ge=0.0, le=1.0)
     top_k: Optional[int] = Field(40, ge=0)
     stream: Optional[bool] = False
+    session_id: Optional[str] = Field(
+        None, description="Sticky-session key for affinity routing (optional)"
+    )
+    compress_context: Optional[bool] = Field(
+        None,
+        description=(
+            "Override the server's context-compression default for this request only "
+            "(true forces it on, false forces it off, omitted uses the server default)"
+        ),
+    )
 
 
 class CompletionRequest(BaseModel):
@@ -52,7 +66,19 @@ class CompletionRequest(BaseModel):
     top_p: float = Field(0.95, ge=0.0, le=1.0)
     top_k: int = Field(40, ge=0)
     stream: bool = False
-    worker_id: Optional[str] = Field(None, description="Optional worker ID to force routing to a specific GPU")
+    worker_id: Optional[str] = Field(
+        None, description="Optional worker ID to force routing to a specific GPU"
+    )
+    session_id: Optional[str] = Field(
+        None, description="Sticky-session key for affinity routing (optional)"
+    )
+    compress_context: Optional[bool] = Field(
+        None,
+        description=(
+            "Override the server's context-compression default for this request only "
+            "(true forces it on, false forces it off, omitted uses the server default)"
+        ),
+    )
 
 
 class CompletionResponse(BaseModel):
@@ -70,7 +96,7 @@ class LoadModelRequest(BaseModel):
 
     model_name: str
     worker_id: Optional[str] = None
-    quantization: str = "fp16"
+    quantization: str = "none"  # only "none" is accepted by workers today; others are planned
 
 
 class LoadModelResponse(BaseModel):
@@ -90,7 +116,7 @@ class ModelInfo(BaseModel):
     object: str = "model"
     created: int = 0
     owned_by: str = "custom"
-    
+
     # Custom AI Cluster extensions
     family: Optional[str] = None
     parameters: Optional[str] = None
@@ -98,8 +124,10 @@ class ModelInfo(BaseModel):
     loaded_on: List[Dict[str, Any]] = []
     supports_quantization: List[str] = []
 
+
 class ModelsResponse(BaseModel):
     """Schema for the /models response, compatible with OpenAI API."""
+
     object: str = "list"
     data: List[ModelInfo]
 
@@ -119,7 +147,8 @@ class WorkerInfoResponse(BaseModel):
 # Helper to get the coordinator from the request
 # ---------------------------------------------------------------------------
 
-def _get_coordinator(request: Request):
+
+def _get_coordinator(request: Request) -> Any:  # type: ignore[type-arg]
     """Retrieve the ClusterCoordinator stored in app state."""
     coordinator = getattr(request.app.state, "coordinator", None)
     if coordinator is None:
@@ -131,6 +160,7 @@ def _get_coordinator(request: Request):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+
 def _parse_model_and_worker(model_string: str) -> tuple[str, Optional[str]]:
     """Parse 'model@worker_id' syntax."""
     if "@" in model_string:
@@ -140,32 +170,39 @@ def _parse_model_and_worker(model_string: str) -> tuple[str, Optional[str]]:
 
 
 @router.post("/completions", response_model=CompletionResponse)
-async def create_completion(body: CompletionRequest, request: Request):
+async def create_completion(body: CompletionRequest, request: Request) -> CompletionResponse:  # type: ignore[type-arg]
     """Run inference on the cluster."""
     coordinator = _get_coordinator(request)
 
     model_name, target_worker = _parse_model_and_worker(body.model)
     worker_id = body.worker_id or target_worker
 
+    from coordinator.context_compression import maybe_compress_prompt
+
+    prompt = await maybe_compress_prompt(
+        body.prompt, coordinator=coordinator, override_enabled=body.compress_context
+    )
+
     try:
         result = await coordinator.infer(
             model_name=model_name,
-            prompt=body.prompt,
+            prompt=prompt,
             max_tokens=body.max_tokens,
             temperature=body.temperature,
             top_p=body.top_p,
             top_k=body.top_k,
-            stream=body.stream,
+            stream=False,  # /v1/completions is buffered; only /v1/chat/completions streams
             worker_id=worker_id,
+            session_id=body.session_id,
         )
         return CompletionResponse(**result)
     except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail=str(exc))
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Inference failed")
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 def _build_flat_response(result: Dict[str, Any], model: str) -> Dict[str, Any]:
@@ -175,45 +212,62 @@ def _build_flat_response(result: Dict[str, Any], model: str) -> Dict[str, Any]:
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": result["text"]
-            },
-            "finish_reason": "stop"
-        }],
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": result["text"]},
+                "finish_reason": "stop",
+            }
+        ],
         "usage": {
             "prompt_tokens": 0,
             "completion_tokens": result["tokens_generated"],
-            "total_tokens": result["tokens_generated"]
-        }
+            "total_tokens": result["tokens_generated"],
+        },
     }
 
-async def _stream_chat_completion(ctx: Any, model: str):
-    """Generator for OpenAI-compatible Server-Sent Events (SSE)."""
+
+async def _stream_chat_completion(
+    coordinator: Any, ctx: Any, model: str, timeout: float
+) -> AsyncGenerator[str, None]:
+    """Stream chunks live from the request's token queue as the worker produces them."""
+    deadline = time.time() + timeout
     try:
         while True:
-            # Wait for next token from the queue
-            response = await ctx.token_queue.get()
-            
-            # Build SSE chunk
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                error_chunk = {"error": {"message": "request timed out", "type": "timeout"}}
+                yield f"data: {json.dumps(error_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+                break
+            try:
+                response = await asyncio.wait_for(
+                    ctx.token_queue.get(), timeout=min(remaining, 1.0)
+                )
+            except asyncio.TimeoutError:
+                if ctx.error:
+                    error_chunk = {"error": {"message": ctx.error, "type": "internal_error"}}
+                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    break
+                continue  # still generating — poll again
+
             chunk = {
                 "id": ctx.id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "content": response.text if not response.finished else ""
-                    },
-                    "finish_reason": "stop" if response.finished else None
-                }]
+                "choices": [
+                    {
+                        "index": 0,
+                        # Emit the text even on the final chunk (proto allows text+finished)
+                        "delta": {"content": response.text},
+                        "finish_reason": "stop" if response.finished else None,
+                    }
+                ],
             }
-            
             yield f"data: {json.dumps(chunk)}\n\n"
-            
+
             if response.finished:
                 yield "data: [DONE]\n\n"
                 break
@@ -222,19 +276,30 @@ async def _stream_chat_completion(ctx: Any, model: str):
         error_chunk = {"error": {"message": str(e), "type": "internal_error"}}
         yield f"data: {json.dumps(error_chunk)}\n\n"
         yield "data: [DONE]\n\n"
+    finally:
+        coordinator.active_requests.pop(ctx.id, None)
 
-@router.post("/chat/completions")
-async def create_chat_completion(body: ChatCompletionRequest, request: Request):
+
+@router.post("/chat/completions", response_model=None)
+async def create_chat_completion(
+    body: ChatCompletionRequest, request: Request  # type: ignore[type-arg]
+) -> Union[Dict[str, Any], StreamingResponse]:
     """OpenAI-compatible chat completions endpoint used by Open-WebUI."""
     logger.info(f"Received chat completion request for model: {body.model}")
     coordinator = _get_coordinator(request)
 
     model_name, worker_id = _parse_model_and_worker(body.model)
 
+    from coordinator.context_compression import maybe_compress_chat_messages
+
+    messages = await maybe_compress_chat_messages(
+        body.messages, coordinator=coordinator, override_enabled=body.compress_context
+    )
+
     # Convert chat history to a raw prompt
     # A simple chat template, can be expanded later for specific models (llama3, chatml, etc)
     prompt = ""
-    for msg in body.messages:
+    for msg in messages:
         role = msg.role.lower()
         content = msg.content
         if role == "system":
@@ -248,6 +313,25 @@ async def create_chat_completion(body: ChatCompletionRequest, request: Request):
     prompt += "<|assistant|>\n"
 
     try:
+        if body.stream:
+            # Return immediately and stream tokens as the worker produces them.
+            ctx = await coordinator.submit_request(
+                model_name=model_name,
+                prompt=prompt,
+                max_tokens=body.max_tokens or 512,
+                temperature=body.temperature or 0.7,
+                top_p=body.top_p or 0.95,
+                top_k=body.top_k or 40,
+                stream=True,
+                worker_id=worker_id,
+                session_id=body.session_id,
+            )
+            timeout = coordinator.settings.request_timeout
+            return StreamingResponse(
+                _stream_chat_completion(coordinator, ctx, body.model, timeout),
+                media_type="text/event-stream",
+            )
+
         result = await coordinator.infer(
             model_name=model_name,
             prompt=prompt,
@@ -255,87 +339,74 @@ async def create_chat_completion(body: ChatCompletionRequest, request: Request):
             temperature=body.temperature or 0.7,
             top_p=body.top_p or 0.95,
             top_k=body.top_k or 40,
-            stream=body.stream or False,
+            stream=False,
             worker_id=worker_id,
+            session_id=body.session_id,
         )
-        
-        if body.stream:
-            request_context = coordinator.active_requests.pop(result["request_id"], None)
-            if not request_context:
-                # Fallback to flat result if somehow lost from context
-                return _build_flat_response(result, body.model)
-            
-            return StreamingResponse(
-                _stream_chat_completion(request_context, body.model),
-                media_type="text/event-stream"
-            )
-
         return _build_flat_response(result, body.model)
     except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail=str(exc))
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Inference failed")
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/models", response_model=ModelsResponse)
-async def list_models(request: Request):
+async def list_models(request: Request) -> ModelsResponse:  # type: ignore[type-arg]
     """List all available models in OpenAI-compatible format."""
     coordinator = _get_coordinator(request)
     custom_models = await coordinator.list_models()
-    
+
     # Convert custom format to OpenAI compatible format
     openai_models = []
     for model in custom_models:
-        openai_models.append(ModelInfo(
-            id=model["name"],
-            family=model.get("family"),
-            parameters=model.get("parameters"),
-            min_memory_gb=model.get("min_memory_gb"),
-            loaded_on=model.get("loaded_on", []),
-            supports_quantization=model.get("supports_quantization", [])
-        ))
-        
+        openai_models.append(
+            ModelInfo(
+                id=model["name"],
+                family=model.get("family"),
+                parameters=model.get("parameters"),
+                min_memory_gb=model.get("min_memory_gb"),
+                loaded_on=model.get("loaded_on", []),
+                supports_quantization=model.get("supports_quantization", []),
+            )
+        )
+
     return ModelsResponse(data=openai_models)
 
 
 @router.post("/models/load", response_model=LoadModelResponse)
-async def load_model(body: LoadModelRequest, request: Request):
+async def load_model(body: LoadModelRequest, request: Request) -> LoadModelResponse:  # type: ignore[type-arg]
     """Load a model onto a worker."""
     coordinator = _get_coordinator(request)
 
-    # Pick a specific worker or let the coordinator decide
-    workers = await coordinator.list_workers()
-    if not workers:
-        raise HTTPException(status_code=503, detail="No workers available")
-
-    target_worker = None
-    if body.worker_id:
-        for w in workers:
-            if w["id"] == body.worker_id:
-                target_worker = w
-                break
-        if target_worker is None:
-            raise HTTPException(status_code=404, detail=f"Worker {body.worker_id} not found")
+    from coordinator.models import Quantization
 
     try:
-        # Delegate to coordinator's internal loading mechanism
-        first_worker_id = next(iter(coordinator.workers), None)
-        target_id = body.worker_id or first_worker_id
-        if target_id is None:
-            raise HTTPException(status_code=503, detail="No workers available")
-        worker_info = coordinator.workers.get(target_id)
-        if worker_info is None:
-            raise HTTPException(status_code=503, detail="No workers available")
+        quantization = Quantization(body.quantization)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid quantization '{body.quantization}'. "
+            f"Valid values: {[q.value for q in Quantization]} (only 'none' is loadable today)",
+        ) from exc
 
-        from coordinator.models import Quantization
+    try:
+        if body.worker_id is not None:
+            worker_info = coordinator.workers.get(body.worker_id)
+            if worker_info is None:
+                raise HTTPException(status_code=404, detail=f"Worker {body.worker_id} not found")
+        else:
+            first_worker_id = next(iter(coordinator.workers), None)
+            if first_worker_id is None:
+                raise HTTPException(status_code=503, detail="No workers available")
+            worker_info = coordinator.workers[first_worker_id]
 
         success = await coordinator._load_model_on_worker(
             worker_info,
             body.model_name,
-            quantization=Quantization(body.quantization),
+            quantization=quantization,
         )
 
         if success:
@@ -344,31 +415,49 @@ async def load_model(body: LoadModelRequest, request: Request):
                 model_name=body.model_name,
                 worker_id=worker_info.id,
             )
-        else:
-            return LoadModelResponse(
-                status="failed",
-                model_name=body.model_name,
-                message="Model loading failed on the worker",
-            )
+        return LoadModelResponse(
+            status="failed",
+            model_name=body.model_name,
+            message="Model loading failed on the worker",
+        )
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception("Model load failed")
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.delete("/models/{model_name}")
+async def unload_model(
+    model_name: str, request: Request, worker_id: Optional[str] = None  # type: ignore[type-arg]
+) -> Dict[str, Any]:
+    """Unload a model and free its GPU memory (all workers, or one via ?worker_id=)."""
+    coordinator = _get_coordinator(request)
+    try:
+        unloaded_from = await coordinator.unload_model(model_name, worker_id=worker_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Model unload failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"status": "unloaded", "model_name": model_name, "workers": unloaded_from}
 
 
 @router.get("/workers", response_model=List[WorkerInfoResponse])
-async def list_workers(request: Request):
+async def list_workers(request: Request) -> List[Dict[str, Any]]:  # type: ignore[type-arg]
     """List all connected workers."""
     coordinator = _get_coordinator(request)
-    return await coordinator.list_workers()
+    result: List[Dict[str, Any]] = await coordinator.list_workers()
+    return result
 
 
 @router.post("/workers/manual")
-async def add_manual_worker(addresses: List[str], request: Request):
+async def add_manual_worker(
+    addresses: List[str], request: Request  # type: ignore[type-arg]
+) -> Dict[str, List[Dict[str, str]]]:
     """Manually add a worker by its host:port address."""
     coordinator = _get_coordinator(request)
-    results = []
+    results: List[Dict[str, str]] = []
     for address in addresses:
         worker = await coordinator._connect_worker(address)
         if worker:

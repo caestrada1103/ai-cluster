@@ -23,10 +23,8 @@ from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
 import aiohttp
 import numpy as np
-from tqdm import tqdm
+from tqdm.asyncio import tqdm
 import yaml
-import matplotlib.pyplot as plt
-import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 import csv
 
@@ -419,10 +417,19 @@ class BenchmarkRunner:
     
     def plot_results(self, result: BenchmarkResult, output_file: Optional[Path] = None):
         """Generate plots from benchmark results."""
+        try:
+            import matplotlib.pyplot as plt  # optional heavy dep
+        except ImportError:
+            print(
+                "matplotlib not installed — skipping plot "
+                "(pip install -r scripts/requirements-scripts.txt)"
+            )
+            return
+
         if not result.latencies:
             print("No successful requests to plot")
             return
-        
+
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
         
         # Latency histogram
@@ -477,8 +484,10 @@ class BenchmarkRunner:
             plt.show()
 
 
-def compare_results(results_files: List[Path]) -> pd.DataFrame:
-    """Compare multiple benchmark results."""
+def compare_results(results_files: List[Path]) -> Any:
+    """Compare multiple benchmark result files (returns a pandas.DataFrame)."""
+    import pandas as pd  # optional heavy dep — scripts/requirements-scripts.txt
+
     data = []
     
     for file in results_files:
@@ -540,9 +549,9 @@ async def run_benchmark_suite(config: Dict):
         print(result.summary())
         
         # Save results
-        filename = bench_config.get("output_file")
+        filename = bench_config.get("output_file") or f"{bench_config.get('name', 'benchmark')}.json"
         runner.save_results(result, filename)
-        
+
         # Plot if requested
         if bench_config.get("plot", False):
             plot_file = output_dir / f"{filename.replace('.json', '.png')}"

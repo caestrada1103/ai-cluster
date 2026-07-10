@@ -8,7 +8,7 @@
 5. [Parallelism Strategies](#parallelism-strategies)
 6. [Deployment Architecture](#deployment-architecture)
 7. [Performance Considerations](#performance-considerations)
-8. [Security Architecture](#security-architecture)
+8. [Security Architecture](#security-architecture-roadmap)
 9. [Monitoring & Observability](#monitoring--observability)
 10. [Fault Tolerance](#fault-tolerance)
 
@@ -16,9 +16,25 @@
 
 ## System Overview
 
-The AI Cluster is a distributed system designed to run large language models (LLMs) across multiple GPUs and machines. It provides a unified interface for model inference while handling the complexities of distribution, parallelism, and resource management.
+The AI Cluster lets you run LLM inference on the **consumer GPUs you already
+own** — gaming-PC cards in the 8–16 GB VRAM range, including cards sitting
+idle in a second machine — across **both NVIDIA and AMD**. The core idea is
+a quantized GGUF model that fits in one card's VRAM, or one model split
+across several consumer cards when it doesn't. It provides a unified
+interface for model inference while handling the complexities of
+distribution, parallelism, and resource management. Datacenter-class
+hardware, 70B-class models, and multi-machine/InfiniBand setups are not the
+target — the architecture *also scales* in that direction, but it is not
+what the system is designed around.
 
 ### High-Level Architecture
+
+The diagram below shows the general, fully-scaled-out topology (multiple
+coordinator replicas, AMD and NVIDIA worker pools, many GPUs per worker) so
+every component has a place to live. The everyday deployment is a small
+slice of this: one coordinator, one or two workers, one to a few consumer
+GPUs — see [Deployment Architecture](#deployment-architecture) for that
+picture.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -83,11 +99,21 @@ The AI Cluster is a distributed system designed to run large language models (LL
 
 ### Key Design Principles
 
-1. **Decoupling**: Separates control plane (coordinator) from data plane (workers)
-2. **Hardware Agnostic**: Supports AMD, NVIDIA, and CPU with unified interfaces
-3. **Elastic Scaling**: Workers can join/leave dynamically
-4. **Fault Tolerance**: Automatic recovery from failures
-5. **Performance First**: Optimized for low latency and high throughput
+1. **Consumer Hardware First**: Built around gaming-PC GPUs (~8–16 GB VRAM),
+   including idle cards, not datacenter accelerators
+2. **Cross-Vendor**: Supports AMD and NVIDIA (plus CPU fallback) with a
+   unified interface — mix vendors in the same cluster
+3. **Fit or Split**: Run a quantized model that fits in one card's VRAM, or
+   split one model across several consumer cards when it doesn't
+4. **Decoupling**: Separates control plane (coordinator) from data plane (workers)
+5. **Elastic Scaling**: Workers can join/leave dynamically
+6. **Fault Tolerance**: Automatic recovery from failures
+7. **Performance First**: Optimized for low latency and high throughput
+   within consumer VRAM/bandwidth limits
+
+The same architecture also scales to multi-machine, higher-VRAM setups (see
+[Deployment Architecture](#deployment-architecture)), but that is not the
+headline use case.
 
 ---
 
@@ -103,7 +129,7 @@ The coordinator is the brain of the cluster, written in Python using FastAPI.
 - **Load Balancing**: Distribute load across workers
 - **Health Monitoring**: Track worker health and availability
 - **Model Registry**: Manage available models and their locations
-- **Authentication**: API key validation and rate limiting
+- **API request handling** (authentication/rate limiting are planned, not implemented)
 - **Metrics Collection**: Expose Prometheus metrics
 
 #### Internal Architecture:
@@ -135,13 +161,16 @@ The coordinator is the brain of the cluster, written in Python using FastAPI.
 
 ### 2. Worker
 
-Workers perform the actual inference, written in Rust using the Burn framework.
+Workers perform the actual inference, written in Rust. Each worker runs
+**one of two inference engines** against its GPU(s) — see
+[Model Layer](#3-model-layer) below for how they compare.
 
 #### Responsibilities:
 - **GPU Management**: Detect and manage GPU resources. Supports mixed-GPU environments (e.g., mixing NVIDIA and AMD cards).
 - **Model Loading**: Load models into GPU memory
 - **Inference Execution**: Run forward passes and generate text
-- **Parallelism**: Implement various parallelism strategies
+- **Parallelism**: Implement various parallelism strategies (current wiring
+  status in [Parallelism Strategies](#parallelism-strategies))
 - **Metrics**: Expose performance and resource metrics
 - **Health Checks**: Report status to coordinator
 
@@ -164,34 +193,65 @@ Workers perform the actual inference, written in Rust using the Burn framework.
 │          │                │                │             │
 │   ┌──────▼───────┐ ┌──────▼───────┐ ┌──────▼────────┐    │
 │   │ GPU Manager  │ │ Model Loader │ │ Parallelism   │    │
-│   │ • Detection  │ │ • Download   │ │ • Pipeline    │    │
-│   │ • Memory     │ │ • Convert    │ │ • Tensor      │    │
-│   │ • wgpu/CUDA  │ │ • Cache      │ │ • Data        │    │
-│   │ • ROCm/Metal │ │ • Quantize   │ │ • Expert(stub)│    │
+│   │ • Detection  │ │ • Download   │ │ (Burn only —  │    │
+│   │ • Memory     │ │ • Convert    │ │  not wired to │    │
+│   │ • wgpu/CUDA  │ │ • Cache      │ │  gRPC yet)    │    │
+│   │ • ROCm/Vulkan│ │              │ │ • Pipeline    │    │
+│   │              │ │              │ │ • Tensor      │    │
+│   │              │ │              │ │ • Data        │    │
+│   │              │ │              │ │ • Expert(stub)│    │
 │   └──────────────┘ └──────────────┘ └───────────────┘    │
-│           │               │               │              │
-│    ┌──────▼───────────────▼───────────────▼──────┐       │
-│    │              Model Implementations          │       │
-│    │  • DeepSeek (MoE)    • Llama (GQA)          │       │
-│    │  • Mistral           • Mixtral              │       │
-│    │  • Gemma             • Phi                  │       │
-│    └─────────────────────────────────────────────┘       │
+│           │               │                              │
+│    ┌──────▼───────────────▼──────────────────────┐       │
+│    │        Inference Engines (two, per model)    │       │
+│    │  ┌────────────────────┐ ┌──────────────────┐ │       │
+│    │  │ llama.cpp (GGUF)   │ │ Burn (safetensors)│ │       │
+│    │  │  PRIMARY            │ │  FP32 reference   │ │       │
+│    │  │ • Quantized weights │ │ • No quantization │ │       │
+│    │  │   (Q4_K_M/Q5_K_M/   │ │   (FP32 only)     │ │       │
+│    │  │   Q8_0, from disk)  │ │ • Llama/Qwen2.5/  │ │       │
+│    │  │ • NVIDIA + AMD      │ │   DeepSeek(dense) │ │       │
+│    │  │   (CUDA/ROCm/Vulkan)│ │ • Single GPU only │ │       │
+│    │  │ • Single-GPU offload│ │                    │ │       │
+│    │  │   today; upstream   │ │                    │ │       │
+│    │  │   multi-GPU split   │ │                    │ │       │
+│    │  │   not yet exposed   │ │                    │ │       │
+│    │  │ • opt-in build      │ │                    │ │       │
+│    │  │   (--features       │ │                    │ │       │
+│    │  │   llamacpp)         │ │                    │ │       │
+│    │  └────────────────────┘ └──────────────────┘ │       │
+│    └───────────────────────────────────────────────┘       │
 └──────────────────────────────────────────────────────────┘
 ```
 
+The `Parallelism` module (TP/PP/DP/Expert) only applies to the Burn engine
+path today. See [Parallelism Strategies](#parallelism-strategies).
+
 ### 3. Model Layer
 
-The model layer provides implementations for various architectures.
+#### Supported Models — GGUF / llama.cpp engine (recommended):
 
-#### Supported Models:
+This is the recommended way to run models on consumer GPUs: pick a
+pre-quantized GGUF checkpoint (Q4_K_M/Q5_K_M/Q8_0/…) from Hugging Face and
+point a registry entry at it with `engine = "llamacpp"` (see
+[configuration.md](configuration.md)). Architecture support comes from
+upstream llama.cpp itself — not a per-family reimplementation — so it covers
+Llama, Qwen, Mistral, Gemma, Phi, DeepSeek, Mixtral, and most other GGUF
+exports, at whatever quantization the file ships in. Requires the worker to
+be built with `--features llamacpp` (opt-in; see
+[deployment.md](deployment.md)).
 
-> **Implementation status**: Only the three architectures below have Rust implementations in `worker/models/`. The remaining model families listed in the README (Mixtral, Gemma, Phi, Qwen) are planned future additions.
+#### Supported Models — Burn engine (FP32 reference):
 
-| Model Family | Architecture | Parallelism (core algorithms) | Quantization |
-|--------------|--------------|-------------------------------|--------------|
-| DeepSeek | MoE (Mixture of Experts) with sparse top-k routing | Pipeline, Expert (stub) | FP16, INT8, INT4 |
-| Llama 3 | GQA (Grouped Query Attention) + KV cache | Pipeline, Tensor | FP16, INT8, INT4 |
-| Mistral | Sliding Window Attention | Pipeline | FP16, INT8 |
+The Burn engine loads full-precision safetensors checkpoints and needs a
+per-architecture implementation in `worker/models/`. Loadable today (worker
+`model_loader.rs`): **Llama** (reference), **Qwen 2.5** (GQA + biases; Qwen3
+rejected until q/k-norm lands), **DeepSeek dense** (Llama layout). DeepSeek
+MoE model code exists but V3-style routing/MLA is not implemented. Mistral
+model code exists but is not wired to the loader. Phi/Gemma/Mixtral: planned.
+This is the default cargo build target (`--features wgpu`), but treat it as
+the experimental/reference path — it always loads FP32, and runs on a single
+GPU per worker.
 
 ---
 
@@ -364,7 +424,17 @@ pub struct ModelConfig {
 
 ## Parallelism Strategies
 
-> **Note on Implementation Status**: The AI Cluster natively supports **Data Parallelism** (running independent models on multiple workers, either on the same machine or across the network). **Tensor and Pipeline Parallelism** core algorithms are implemented in `worker/src/parallelism.rs` but are not yet wired to the gRPC inference service — models currently run on a single GPU per worker. **Expert Parallelism** is a stub (returns an error). Wiring TP/PP into the service layer is the next development step.
+> **Note on Implementation Status**: The AI Cluster natively supports **Data Parallelism** (running independent models on multiple workers, either on the same machine or across the network). **Tensor and Pipeline Parallelism** core algorithms are implemented in `worker/src/parallelism.rs` (Burn engine) but are not yet wired to the gRPC inference service — models currently run on a single GPU per worker. **Expert Parallelism** is a stub (returns an error). Wiring TP/PP into the service layer is the next development step.
+>
+> **Practical path to "split one model across consumer GPUs" today**:
+> upstream llama.cpp natively supports splitting a single GGUF model across
+> multiple GPUs (layer-split or row-split) — this is the realistic way to
+> run a model too big for one consumer card. Our llama.cpp engine wrapper
+> currently only exposes single-device offload via `n_gpu_layers`; exposing
+> multi-GPU split through the worker is the next llama.cpp-engine feature,
+> not yet available. Until then, the model-fits-on-one-card case (a
+> quantized GGUF sized to a single ~8–16 GB card) is the well-supported
+> path.
 
 ### 1. Pipeline Parallelism (Core Implemented — Service Wiring Pending)
 
@@ -483,6 +553,13 @@ Distributes experts across GPUs for Mixture of Experts models.
 
 ## Deployment Architecture
 
+The common case this project targets: one machine (often a gaming PC) with
+one or more consumer GPUs — including a card that would otherwise sit idle —
+running a quantized GGUF model via the llama.cpp engine. The same worker/
+coordinator design also scales out to multiple machines and larger GPU
+counts (below), but multi-machine/InfiniBand setups are "also scales to,"
+not the common deployment.
+
 ### 1. Single Machine, Multiple GPUs
 
 ```
@@ -490,7 +567,7 @@ Distributes experts across GPUs for Mixture of Experts models.
 │                      Single Server                         │
 │    ┌─────────────────────────────────────────────────┐     │
 │    │              Coordinator Container              │     │
-│    │              Port: 8000, 9090                   │     │
+│    │              Port: 8000 (API + /metrics)         │     │
 │    └──────────────────────┬──────────────────────────┘     │
 │                           │                                │
 │  ┌─────────────┬──────────┴──┬─────────────┬─────────────┐ │
@@ -506,7 +583,11 @@ Distributes experts across GPUs for Mixture of Experts models.
 └────────────────────────────────────────────────────────────┘
 ```
 
-### 2. Multi-Machine Cluster
+### 2. Multi-Machine Cluster (also scales to)
+
+> The design also scales to multiple machines/10GbE/InfiniBand, but that is
+> a datacenter-style deployment, not the project's headline consumer-GPU
+> scenario above.
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
@@ -531,6 +612,8 @@ Distributes experts across GPUs for Mixture of Experts models.
 ```
 
 ### 3. Kubernetes Deployment
+
+> **Planned** — no manifests ship in this repo yet; the sketch below is a design target.
 
 ```yaml
 apiVersion: apps/v1
@@ -567,18 +650,37 @@ spec:
 
 ### 1. Memory Management
 
-- **Quantization (Implemented)**: INT8 reduces memory by 75%, INT4 by 87.5%
-- **Memory Pooling (Implemented)**: Reuses GPU memory allocations
+- **Quantization (Implemented — llama.cpp/GGUF engine only)**: GGUF models
+  carry their own quantization (Q4_K_M, Q5_K_M, Q8_0, …), baked in at
+  conversion time upstream; this is what lets a 7B–14B-class model fit an
+  8–16 GB consumer card. The Burn engine has **no quantization** — it always
+  loads FP32 safetensors, and `quantization != "none"` is rejected.
+- **Memory Pooling (Roadmap)**: Not implemented today. The worker's
+  `gpu_manager.rs` tracks allocations for OOM admission control only (a
+  counter, not a reusable buffer pool); any real pooling would have to come
+  from the Burn backend's own allocator, which ai-cluster does not control
+  or verify.
 - **Paged KV Cache (Roadmap)**: Planned implementation to reduce memory usage by 50-70% for long sequences
 
 ### 2. Latency Optimization
 
-- **Tensor Core Utilization (Implemented)**: 2x speedup on supported hardware
+- **Tensor Core Utilization (Roadmap)**: No FP16/BF16/mixed-precision or
+  tensor-core-specific code path exists yet — the Burn/wgpu backend runs
+  default f32 settings. Aspirational, not implemented.
 - **Continuous Batching (Roadmap)**: Planned to provide 2-3x throughput improvement
 - **Speculative Decoding (Roadmap)**: Planned logic for 2-3x speedup for generation
 - **Flash Attention (Roadmap)**: Planned integration for 2-4x faster attention computation
 
 ### 3. Throughput Scaling
+
+> **Projected goals, not measured benchmarks** (same disclaimer as the
+> README). The multi-GPU rows below additionally assume pipeline-parallel
+> service wiring that does not exist yet (see
+> [Parallelism Strategies](#parallelism-strategies) — TP/PP are implemented
+> in `parallelism.rs` but not wired to gRPC, so today every model runs on a
+> single GPU per worker). None of these numbers are specific to the
+> llama.cpp/GGUF engine's real quantized throughput on consumer cards either
+> — treat the whole table as a directional target, not a benchmark.
 
 | GPUs | Model | Batch Size | Throughput (tokens/s) | Scaling Efficiency |
 |------|-------|------------|----------------------|-------------------|
@@ -592,7 +694,9 @@ spec:
 
 ---
 
-## Security Architecture
+## Security Architecture (Roadmap)
+
+> None of the controls in this section are implemented yet: transport is plaintext gRPC/HTTP, there is no authN/Z, rate limiting, audit logging, or secure erasure. Deploy on trusted networks only.
 
 ### 1. Authentication & Authorization
 
@@ -776,13 +880,20 @@ async def infer_with_timeout(coordinator, request, timeout=30):
 
 ## Conclusion
 
-The AI Cluster architecture provides a robust, scalable platform for running large language models across heterogeneous hardware. Key features include:
+The AI Cluster architecture lets you run LLM inference on the consumer
+NVIDIA/AMD GPUs you already own — a quantized GGUF model via the primary
+llama.cpp engine when it fits one card, or the same design scaling out to
+more cards/machines when it doesn't. Honest status, as of this doc:
 
-- **Flexible Parallelism**: Multiple strategies for different model types
-- **Hardware Agnostic**: Support for AMD, NVIDIA, and CPU
-- **Production Ready**: Monitoring, fault tolerance, security
-- **High Performance**: Optimized for low latency and high throughput
-- **Easy Deployment**: Docker and Kubernetes support
+- **Cross-Vendor Today**: AMD, NVIDIA, and CPU fallback, unified interfaces
+- **Quantization Today**: via the llama.cpp/GGUF engine only (Burn stays FP32)
+- **Parallelism Partial**: Data Parallelism works; Tensor/Pipeline Parallelism
+  algorithms exist but aren't wired to inference yet (single GPU per worker
+  on the Burn path); multi-GPU GGUF split is not yet exposed either
+- **Deployment Today**: Docker Compose and native builds; Kubernetes manifests
+  are a design sketch, not shipped
+- **Not Production-Hardened**: no auth, no TLS by default — see
+  [Security Architecture](#security-architecture-roadmap)
 
 For more information, see:
 - [API Reference](api_reference.md)

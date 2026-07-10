@@ -4,15 +4,17 @@
 #
 # Worker image selection — uncomment the block that matches your GPU:
 #
-#   ┌─────────────────────────────────────────────────────────────────┐
-#   │  Dockerfile               Backend   AMD  NVIDIA  Intel  Perf   │
-#   │  Dockerfile.worker        wgpu      ✓    ✓       ✓      good   │ ← default
-#   │  Dockerfile.worker.amd    burn/rocm ✓    ✗       ✗      best   │
-#   │  Dockerfile.worker.nvidia burn/cuda ✗    ✓       ✗      best   │
-#   └─────────────────────────────────────────────────────────────────┘
+#   ┌───────────────────────────────────────────────────────────────────────┐
+#   │  Dockerfile               BACKEND arg   AMD  NVIDIA  Intel  Perf     │
+#   │  docker/Dockerfile.worker  wgpu (default) ✓    ✓       ✓      good   │ ← default
+#   │  docker/Dockerfile.worker  rocm           ✓    ✗       ✗      best   │
+#   │  docker/Dockerfile.worker  cuda           ✗    ✓       ✗      best   │
+#   └───────────────────────────────────────────────────────────────────────┘
 #
-# The default "worker" service uses the universal wgpu image with AMD
-# device passthrough.  NVIDIA and high-perf AMD alternatives are
+# One parameterized docker/Dockerfile.worker covers all three variants via
+# --build-arg BACKEND=wgpu|rocm|cuda (see the commented build.args blocks
+# below). The default "worker" service uses the universal wgpu image with
+# AMD device passthrough.  NVIDIA and high-perf AMD alternatives are
 # commented out below — swap the active "worker" block as needed.
 
 services:
@@ -28,11 +30,7 @@ services:
       - COORDINATOR_PORT=8000
       - COORDINATOR_DISCOVERY_METHOD=static
       - COORDINATOR_STATIC_WORKERS=["worker:50051"]
-      - COORDINATOR_API_KEYS=${COORDINATOR_API_KEYS:-}
-      - COORDINATOR_JWT_SECRET=${COORDINATOR_JWT_SECRET:-}
       - COORDINATOR_CORS_ORIGINS=${COORDINATOR_CORS_ORIGINS:-*}
-      - RUST_LOG=${RUST_LOG:-info}
-      - CONFIG_FILE=/app/config/coordinator.yaml
     volumes:
       - ./config:/app/config:ro
       - ./models:/app/models:ro
@@ -42,9 +40,6 @@ services:
       - ai-cluster-net
     ports:
       - "8000:8000" # HTTP API & Metrics
-    depends_on:
-      - prometheus
-      - grafana
     logging: &default-logging
       driver: json-file
       options:
@@ -75,6 +70,8 @@ services:
       - WORKER_ID=${WORKER_ID:-}
       - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
       - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
+      - GRPC_PORT=${GRPC_PORT:-}
+      - METRICS_PORT=${METRICS_PORT:-}
       - RUST_LOG=${RUST_LOG:-info}
       - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
       - HF_TOKEN=${HF_TOKEN:-}
@@ -89,7 +86,8 @@ services:
       - "${METRICS_PORT:-9091}:${METRICS_PORT:-9091}"
     logging: *default-logging
     depends_on:
-      - coordinator
+      coordinator:
+        condition: service_healthy
     # AMD Vulkan device passthrough — remove these three keys for NVIDIA
     devices:
       - /dev/kfd
@@ -148,7 +146,13 @@ services:
   # worker:
   #   build:
   #     context: .
-  #     dockerfile: docker/Dockerfile.worker.amd
+  #     dockerfile: docker/Dockerfile.worker
+  #     args:
+  #       BACKEND: rocm
+  #       BUILDER_IMAGE: rocm/dev-ubuntu-24.04:6.2.1
+  #       RUNTIME_IMAGE: rocm/dev-ubuntu-24.04:6.2.1
+  #       BUILDER_EXTRA_PKGS: ""
+  #       RUNTIME_EXTRA_PKGS: ""
   #   image: ai-worker-amd:latest
   #   environment:
   #     - GPU_INDEX=${GPU_INDEX:-0}
@@ -188,7 +192,13 @@ services:
   # worker:
   #   build:
   #     context: .
-  #     dockerfile: docker/Dockerfile.worker.nvidia
+  #     dockerfile: docker/Dockerfile.worker
+  #     args:
+  #       BACKEND: cuda
+  #       BUILDER_IMAGE: nvidia/cuda:12.6.3-devel-ubuntu24.04
+  #       RUNTIME_IMAGE: nvidia/cuda:12.6.3-runtime-ubuntu24.04
+  #       BUILDER_EXTRA_PKGS: ""
+  #       RUNTIME_EXTRA_PKGS: "libcublas-12-6"
   #   image: ai-worker-nvidia:latest
   #   environment:
   #     - GPU_INDEX=${GPU_INDEX:-0}
@@ -228,7 +238,7 @@ services:
   # worker-gpu-0:
   #   build:
   #     context: .
-  #     dockerfile: docker/Dockerfile.worker   # or .amd / .nvidia
+  #     dockerfile: docker/Dockerfile.worker   # add args: BACKEND: rocm|cuda for native variants
   #   image: ai-worker:latest
   #   environment:
   #     - GPU_INDEX=0
@@ -249,7 +259,7 @@ services:
   # worker-gpu-1:
   #   build:
   #     context: .
-  #     dockerfile: docker/Dockerfile.worker   # or .amd / .nvidia
+  #     dockerfile: docker/Dockerfile.worker   # add args: BACKEND: rocm|cuda for native variants
   #   image: ai-worker:latest
   #   environment:
   #     - GPU_INDEX=1
@@ -267,9 +277,14 @@ services:
   #   depends_on:
   #     - coordinator
 
+  # NOTE for multi-GPU: each extra worker needs (a) its own GPU passthrough block
+  # (devices/group_add for AMD or deploy.resources.reservations.devices for NVIDIA),
+  # (b) an entry in COORDINATOR_STATIC_WORKERS, e.g. ["worker-gpu-0:50051","worker-gpu-1:50052"],
+  # (c) a matching target in config/prometheus.yml (workers job).
+
   # Monitoring Stack
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.53.0
     container_name: ai-prometheus
     volumes:
       - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -287,7 +302,7 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.1.0
     container_name: ai-grafana
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
@@ -308,7 +323,7 @@ services:
 
   # Open-WebUI (Chat Interface)
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:v0.6.5
     container_name: ai-open-webui
     environment:
       - OPENAI_API_BASE_URLS=http://coordinator:8000/v1
@@ -322,7 +337,8 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      - coordinator
+      coordinator:
+        condition: service_healthy
     restart: unless-stopped
 
 networks:

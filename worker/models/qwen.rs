@@ -6,18 +6,18 @@
 
 #![allow(dead_code)]
 
+use super::common::{repeat_kv, swiglu, RMSNorm, RotaryEmbedding};
+use super::llama::{KvCache, KvEntry};
+use super::TextGeneration;
+use crate::error::WorkerError;
+use async_stream::stream;
 use burn::{
-    module::{Module, Ignored},
-    nn::{Linear, LinearConfig, Embedding, EmbeddingConfig},
+    module::{Ignored, Module},
+    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig},
     tensor::{backend::Backend, Tensor},
 };
-use super::TextGeneration;
-use super::common::{RMSNorm, RotaryEmbedding, swiglu, repeat_kv};
-use super::llama::{KvEntry, KvCache};
-use crate::error::WorkerError;
-use tokenizers::Tokenizer;
-use async_stream::stream;
 use std::path::Path;
+use tokenizers::Tokenizer;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -36,24 +36,7 @@ pub struct QwenConfig {
     pub max_seq_len: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
-}
-
-impl QwenConfig {
-    /// Default configuration for Qwen3-Coder-32B (Qwen/Qwen3-Coder-32B).
-    pub fn qwen3_coder_32b() -> Self {
-        Self {
-            hidden_size: 5120,
-            num_layers: 64,
-            num_attention_heads: 40,
-            num_kv_heads: 8,
-            head_dim: 128, // 5120 / 40
-            intermediate_size: 27648,
-            vocab_size: 151936,
-            max_seq_len: 131072,
-            rms_norm_eps: 1e-6,
-            rope_theta: 1_000_000.0,
-        }
-    }
+    pub attention_bias: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -81,15 +64,24 @@ impl<B: Backend> QwenAttention<B> {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        attention_bias: bool,
         device: &B::Device,
     ) -> Self {
         let q_out = num_heads * head_dim;
         let kv_out = num_kv_heads * head_dim;
         Self {
-            q_proj: LinearConfig::new(hidden_size, q_out).with_bias(false).init(device),
-            k_proj: LinearConfig::new(hidden_size, kv_out).with_bias(false).init(device),
-            v_proj: LinearConfig::new(hidden_size, kv_out).with_bias(false).init(device),
-            o_proj: LinearConfig::new(q_out, hidden_size).with_bias(false).init(device),
+            q_proj: LinearConfig::new(hidden_size, q_out)
+                .with_bias(attention_bias)
+                .init(device),
+            k_proj: LinearConfig::new(hidden_size, kv_out)
+                .with_bias(attention_bias)
+                .init(device),
+            v_proj: LinearConfig::new(hidden_size, kv_out)
+                .with_bias(attention_bias)
+                .init(device),
+            o_proj: LinearConfig::new(q_out, hidden_size)
+                .with_bias(false)
+                .init(device),
             num_heads,
             num_kv_heads,
             head_dim,
@@ -107,13 +99,19 @@ impl<B: Backend> QwenAttention<B> {
     ) -> (Tensor<B, 3>, KvEntry<B>) {
         let [batch, seq_len, _] = hidden.dims();
 
-        let q = self.q_proj.forward(hidden.clone())
+        let q = self
+            .q_proj
+            .forward(hidden.clone())
             .reshape([batch, seq_len, self.num_heads, self.head_dim])
             .swap_dims(1, 2);
-        let k = self.k_proj.forward(hidden.clone())
+        let k = self
+            .k_proj
+            .forward(hidden.clone())
             .reshape([batch, seq_len, self.num_kv_heads, self.head_dim])
             .swap_dims(1, 2);
-        let v = self.v_proj.forward(hidden)
+        let v = self
+            .v_proj
+            .forward(hidden)
             .reshape([batch, seq_len, self.num_kv_heads, self.head_dim])
             .swap_dims(1, 2);
 
@@ -132,9 +130,11 @@ impl<B: Backend> QwenAttention<B> {
         };
 
         let attn = burn::tensor::activation::softmax(scores, 3);
-        let output = attn.matmul(v_full)
-            .swap_dims(1, 2)
-            .reshape([batch, seq_len, self.num_heads * self.head_dim]);
+        let output = attn.matmul(v_full).swap_dims(1, 2).reshape([
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ]);
 
         (self.o_proj.forward(output), kv_entry)
     }
@@ -142,18 +142,24 @@ impl<B: Backend> QwenAttention<B> {
     /// Single-token decode using the KV cache.
     pub fn forward_decode(
         &self,
-        hidden: Tensor<B, 3>,          // [1, 1, hidden]
+        hidden: Tensor<B, 3>, // [1, 1, hidden]
         rope: &RotaryEmbedding<B>,
         start_pos: usize,
         kv: &mut KvEntry<B>,
     ) -> Tensor<B, 3> {
-        let q = self.q_proj.forward(hidden.clone())
+        let q = self
+            .q_proj
+            .forward(hidden.clone())
             .reshape([1, 1, self.num_heads, self.head_dim])
             .swap_dims(1, 2);
-        let new_k = self.k_proj.forward(hidden.clone())
+        let new_k = self
+            .k_proj
+            .forward(hidden.clone())
             .reshape([1, 1, self.num_kv_heads, self.head_dim])
             .swap_dims(1, 2);
-        let new_v = self.v_proj.forward(hidden)
+        let new_v = self
+            .v_proj
+            .forward(hidden)
             .reshape([1, 1, self.num_kv_heads, self.head_dim])
             .swap_dims(1, 2);
 
@@ -172,11 +178,12 @@ impl<B: Backend> QwenAttention<B> {
             q.matmul(k_full.swap_dims(2, 3)).div_scalar(scale),
             3,
         );
-        self.o_proj.forward(
-            attn.matmul(v_full)
-                .swap_dims(1, 2)
-                .reshape([1, 1, self.num_heads * self.head_dim]),
-        )
+        self.o_proj
+            .forward(attn.matmul(v_full).swap_dims(1, 2).reshape([
+                1,
+                1,
+                self.num_heads * self.head_dim,
+            ]))
     }
 }
 
@@ -195,9 +202,15 @@ pub struct QwenMLP<B: Backend> {
 impl<B: Backend> QwenMLP<B> {
     pub fn new(hidden_size: usize, intermediate_size: usize, device: &B::Device) -> Self {
         Self {
-            gate_proj: LinearConfig::new(hidden_size, intermediate_size).with_bias(false).init(device),
-            up_proj: LinearConfig::new(hidden_size, intermediate_size).with_bias(false).init(device),
-            down_proj: LinearConfig::new(intermediate_size, hidden_size).with_bias(false).init(device),
+            gate_proj: LinearConfig::new(hidden_size, intermediate_size)
+                .with_bias(false)
+                .init(device),
+            up_proj: LinearConfig::new(hidden_size, intermediate_size)
+                .with_bias(false)
+                .init(device),
+            down_proj: LinearConfig::new(intermediate_size, hidden_size)
+                .with_bias(false)
+                .init(device),
         }
     }
 
@@ -229,11 +242,16 @@ impl<B: Backend> QwenLayer<B> {
                 config.num_attention_heads,
                 config.num_kv_heads,
                 config.head_dim,
+                config.attention_bias,
                 device,
             ),
             mlp: QwenMLP::new(config.hidden_size, config.intermediate_size, device),
             input_layernorm: RMSNorm::new(config.hidden_size, config.rms_norm_eps as f64, device),
-            post_attention_layernorm: RMSNorm::new(config.hidden_size, config.rms_norm_eps as f64, device),
+            post_attention_layernorm: RMSNorm::new(
+                config.hidden_size,
+                config.rms_norm_eps as f64,
+                device,
+            ),
         }
     }
 
@@ -247,7 +265,9 @@ impl<B: Backend> QwenLayer<B> {
     ) -> (Tensor<B, 3>, KvEntry<B>) {
         let residual = input.clone();
         let x = self.input_layernorm.forward(input);
-        let (attn_out, kv) = self.attention.forward_prefill(x, rope, start_pos, causal_bias);
+        let (attn_out, kv) = self
+            .attention
+            .forward_prefill(x, rope, start_pos, causal_bias);
         let x = attn_out + residual;
 
         let residual = x.clone();
@@ -291,36 +311,56 @@ pub struct Qwen<B: Backend> {
     pub rope: RotaryEmbedding<B>,
     #[module(ignore)]
     pub tokenizer: Ignored<Tokenizer>,
+    /// EOS token ids read from the checkpoint's (generation_)config.json.
+    ///
+    /// NOTE: must come before `device` — burn_derive's `Module::to_device`/`fork`
+    /// codegen binds a `let device = ...;` when it processes a field literally
+    /// named `device`, shadowing the `&B::Device` parameter for every field
+    /// generated afterward. Keeping `device` last avoids the shadowing bug.
+    pub eos_token_ids: Ignored<std::collections::HashSet<u32>>,
     pub device: Ignored<B::Device>,
 }
 
 impl<B: Backend> Qwen<B> {
-    pub fn new(config: &QwenConfig, device: &B::Device, tokenizer_path: &Path) -> Result<Self, WorkerError> {
+    pub fn new(
+        config: &QwenConfig,
+        device: &B::Device,
+        tokenizer_path: &Path,
+    ) -> Result<Self, WorkerError> {
         let layers = (0..config.num_layers)
             .map(|_| QwenLayer::new(config, device))
             .collect();
 
-        let rope = RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_theta, device);
+        let rope = RotaryEmbedding::new(
+            config.head_dim,
+            config.max_seq_len,
+            config.rope_theta,
+            device,
+        );
 
+        // Load tokenizer from the model directory — no cross-model network fallback:
+        // a mismatched tokenizer silently produces garbage.
         let tok_file = tokenizer_path.join("tokenizer.json");
-        eprintln!("[INFO] Loading Qwen tokenizer from: {:?}", tok_file);
-        let tokenizer = Tokenizer::from_file(&tok_file)
-            .map_err(|e| {
-                eprintln!("[WARN] Failed to load tokenizer from {:?}: {}. Trying HF pretrained...", tok_file, e);
-                e
-            })
-            .or_else(|_| Tokenizer::from_pretrained("Qwen/Qwen2.5-0.5B", None))
-            .map_err(|e| WorkerError::ModelLoad(format!("Failed to load Qwen tokenizer: {}", e)))?;
+        let tokenizer = Tokenizer::from_file(&tok_file).map_err(|e| {
+            WorkerError::ModelLoad(format!(
+                "Failed to load Qwen tokenizer {:?}: {}",
+                tok_file, e
+            ))
+        })?;
+        let eos_token_ids = super::common::load_eos_ids(tokenizer_path);
 
         Ok(Self {
             embed_tokens: EmbeddingConfig::new(config.vocab_size, config.hidden_size).init(device),
             layers,
             norm: RMSNorm::new(config.hidden_size, config.rms_norm_eps as f64, device),
-            lm_head: LinearConfig::new(config.hidden_size, config.vocab_size).with_bias(false).init(device),
+            lm_head: LinearConfig::new(config.hidden_size, config.vocab_size)
+                .with_bias(false)
+                .init(device),
             config: Ignored(config.clone()),
             rope,
             tokenizer: Ignored(tokenizer),
             device: Ignored(device.clone()),
+            eos_token_ids: Ignored(eos_token_ids),
         })
     }
 
@@ -330,17 +370,9 @@ impl<B: Backend> Qwen<B> {
         let device = input_ids.device();
         let config = &*self.config;
 
-        let causal_bias: Option<Tensor<B, 4>> = if seq_len > 1 {
-            let mut data = vec![-1e9_f32; seq_len * seq_len];
-            for i in 0..seq_len {
-                for j in 0..=i {
-                    data[i * seq_len + j] = 0.0;
-                }
-            }
-            Some(Tensor::<B, 1>::from_floats(data.as_slice(), &device).reshape([1, 1, seq_len, seq_len]))
-        } else {
-            None
-        };
+        // Build additive causal bias once — [1, 1, seq, seq]; shared helper.
+        let causal_bias: Option<Tensor<B, 4>> =
+            super::common::build_causal_bias::<B>(seq_len, &device);
 
         let mut x = self.embed_tokens.forward(input_ids.int());
         let mut kv_cache: KvCache<B> = Vec::with_capacity(self.layers.len());
@@ -364,7 +396,12 @@ impl<B: Backend> Qwen<B> {
     }
 
     /// Single-token decode step using the KV cache.
-    pub fn decode_step(&self, token_id: u32, start_pos: usize, kv_cache: &mut KvCache<B>) -> Vec<f32> {
+    pub fn decode_step(
+        &self,
+        token_id: u32,
+        start_pos: usize,
+        kv_cache: &mut KvCache<B>,
+    ) -> Vec<f32> {
         let device = &*self.device;
         let vocab = self.config.vocab_size;
 
@@ -377,10 +414,14 @@ impl<B: Backend> Qwen<B> {
 
         let x = self.norm.forward(x);
         let logits = self.lm_head.forward(x);
-        logits.reshape([vocab]).into_data().to_vec().unwrap_or_else(|e| {
-            tracing::error!("qwen decode_step: failed to pull logits from GPU: {e:?}");
-            vec![0.0; vocab]
-        })
+        logits
+            .reshape([vocab])
+            .into_data()
+            .to_vec()
+            .unwrap_or_else(|e| {
+                tracing::error!("qwen decode_step: failed to pull logits from GPU: {e:?}");
+                vec![0.0; vocab]
+            })
     }
 
     /// Tokenize a prompt, handling Qwen chat-format special tokens.
@@ -406,7 +447,9 @@ impl<B: Backend> Qwen<B> {
             if min_idx > current_pos {
                 let text_segment = &prompt[current_pos..min_idx];
                 let add_special = current_pos == 0;
-                let encoding = self.tokenizer.encode(text_segment, add_special)
+                let encoding = self
+                    .tokenizer
+                    .encode(text_segment, add_special)
                     .map_err(|e| WorkerError::Internal(format!("Qwen tokenizer error: {}", e)))?;
                 tokens.extend_from_slice(encoding.get_ids());
             }
@@ -415,8 +458,9 @@ impl<B: Backend> Qwen<B> {
                 if let Some(id) = self.tokenizer.token_to_id(st) {
                     tokens.push(id);
                 } else {
-                    let encoding = self.tokenizer.encode(st, false)
-                        .map_err(|e| WorkerError::Internal(format!("Qwen tokenizer error (special): {}", e)))?;
+                    let encoding = self.tokenizer.encode(st, false).map_err(|e| {
+                        WorkerError::Internal(format!("Qwen tokenizer error (special): {}", e))
+                    })?;
                     tokens.extend_from_slice(encoding.get_ids());
                 }
                 current_pos = min_idx + st.len();
@@ -436,9 +480,24 @@ impl<B: Backend> TextGeneration for Qwen<B> {
         temperature: f32,
         top_p: f32,
         top_k: usize,
+        seed: Option<u64>,
     ) -> Result<super::TextStream, WorkerError> {
         let tokens = self.tokenize_prompt(prompt)?;
         let prompt_len = tokens.len();
+
+        let max_seq_len = self.config.max_seq_len;
+        if prompt_len >= max_seq_len {
+            return Err(WorkerError::InvalidRequest(format!(
+                "prompt is {} tokens but the model's max_seq_len is {}",
+                prompt_len, max_seq_len
+            )));
+        }
+        // Clamp so prefill + decode can never index past the RoPE table.
+        let max_tokens = max_tokens.min(max_seq_len - prompt_len);
+        if max_tokens == 0 {
+            return Ok(Box::pin(futures::stream::empty()));
+        }
+
         let model = self.clone();
 
         let (tx, mut rx) =
@@ -448,30 +507,47 @@ impl<B: Backend> TextGeneration for Qwen<B> {
             // ── PREFILL ──────────────────────────────────────────────────────
             let input_f32: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
             let device: &<B as burn::tensor::backend::Backend>::Device = &model.device;
-            let input = Tensor::<B, 1>::from_floats(input_f32.as_slice(), device)
-                .reshape([1, prompt_len]);
+            let input =
+                Tensor::<B, 1>::from_floats(input_f32.as_slice(), device).reshape([1, prompt_len]);
             let (logits_vec, mut kv_cache) = model.prefill(input);
 
-            let sample = |logits: &[f32]| -> u32 {
+            use rand::SeedableRng;
+            let mut rng = match seed {
+                Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+                None => rand::rngs::StdRng::from_entropy(),
+            };
+            let mut sample = |logits: &[f32]| -> u32 {
                 if temperature < 0.01 {
-                    logits.iter().enumerate()
+                    // Deterministic argmax for temperature ~ 0
+                    logits
+                        .iter()
+                        .enumerate()
                         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                         .map(|(i, _)| i as u32)
                         .unwrap_or(0)
                 } else {
-                    super::common::top_k_top_p_sample(logits, temperature, top_p, top_k) as u32
+                    super::common::top_k_top_p_sample(logits, temperature, top_p, top_k, &mut rng)
+                        as u32
                 }
             };
 
-            let delta_text = |tok_ids: &[u32], prev_len: &mut usize, tok: &Tokenizer| -> Result<String, WorkerError> {
-                let text = tok.decode(tok_ids, true)
+            let delta_text = |tok_ids: &[u32],
+                              prev_len: &mut usize,
+                              tok: &Tokenizer|
+             -> Result<String, WorkerError> {
+                let text = tok
+                    .decode(tok_ids, true)
                     .map_err(|e| WorkerError::Internal(format!("Decode error: {}", e)))?;
                 let delta = if text.len() > *prev_len {
                     let mut start = *prev_len;
                     while start < text.len() && !text.is_char_boundary(start) {
                         start += 1;
                     }
-                    if start < text.len() { text[start..].to_string() } else { String::new() }
+                    if start < text.len() {
+                        text[start..].to_string()
+                    } else {
+                        String::new()
+                    }
                 } else {
                     String::new()
                 };
@@ -479,31 +555,49 @@ impl<B: Backend> TextGeneration for Qwen<B> {
                 Ok(delta)
             };
 
-            // Prefer <|im_end|> as EOS; fall back to <|endoftext|>
-            let eos_id: Option<u32> = model.tokenizer.token_to_id("<|im_end|>")
-                .or_else(|| model.tokenizer.token_to_id("<|endoftext|>"));
+            let eos_ids = &*model.eos_token_ids;
 
             // ── FIRST TOKEN (from prefill logits) ────────────────────────────
             let first_tok = sample(&logits_vec);
             let mut all_tokens = tokens;
             all_tokens.push(first_tok);
             let mut prev_text_len = 0usize;
-            let _ = tx.blocking_send(delta_text(
-                &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
-            ));
-            if eos_id == Some(first_tok) { return; }
+            if tx
+                .blocking_send(delta_text(
+                    &all_tokens[prompt_len..],
+                    &mut prev_text_len,
+                    &model.tokenizer,
+                ))
+                .is_err()
+            {
+                // Receiver dropped (client disconnected) — stop burning GPU.
+                return;
+            }
+            if eos_ids.contains(&first_tok) {
+                return;
+            }
 
             // ── DECODE LOOP ──────────────────────────────────────────────────
             for _step in 1..max_tokens {
-                let cur_tok  = *all_tokens.last().unwrap();
-                let start    = all_tokens.len() - 1;
-                let logits   = model.decode_step(cur_tok, start, &mut kv_cache);
+                let cur_tok = *all_tokens.last().unwrap();
+                let start = all_tokens.len() - 1;
+                let logits = model.decode_step(cur_tok, start, &mut kv_cache);
                 let next_tok = sample(&logits);
                 all_tokens.push(next_tok);
-                let _ = tx.blocking_send(delta_text(
-                    &all_tokens[prompt_len..], &mut prev_text_len, &model.tokenizer,
-                ));
-                if eos_id == Some(next_tok) { break; }
+                if tx
+                    .blocking_send(delta_text(
+                        &all_tokens[prompt_len..],
+                        &mut prev_text_len,
+                        &model.tokenizer,
+                    ))
+                    .is_err()
+                {
+                    // Receiver dropped (client disconnected) — stop burning GPU.
+                    return;
+                }
+                if eos_ids.contains(&next_tok) {
+                    break;
+                }
             }
         });
 

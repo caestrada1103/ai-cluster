@@ -1,0 +1,23 @@
+# Minimal hooks matching CI's lint gates. Install: pip install pre-commit && pre-commit install
+repos:
+  - repo: https://github.com/psf/black
+    rev: 23.11.0
+    hooks:
+      - id: black
+        args: ["--line-length", "100"]
+        files: ^coordinator/
+        exclude: ^coordinator/proto/
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.6
+    hooks:
+      - id: ruff
+        files: ^coordinator/
+        exclude: ^coordinator/proto/
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: bash -c 'cd worker && cargo fmt -- --check'
+        language: system
+        files: \.rs$
+        pass_filenames: false

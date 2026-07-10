@@ -1,7 +1,6 @@
 # Rust
 target/
 **/*.rs.bk
-Cargo.lock
 .idea/
 
 # Python
@@ -49,8 +48,6 @@ logs/
 
 # Docker
 *.pid
-*.lock
-.dockerignore
 docker-compose.override.yml
 
 # Protobuf generated
@@ -71,3 +68,8 @@ coordinator/*_pb2_grpc.py
 *.safetensors
 *.bin
 *.onnx
+
+# Local-only: planning docs and session skills (never commit/push)
+pending-work/
+.claude/skills/
+!.claude/skills/commit/

@@ -2,7 +2,7 @@
 
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, Dict, Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,30 +20,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Global coordinator instance
-coordinator: ClusterCoordinator = None
+coordinator: Optional[ClusterCoordinator] = None
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifecycle."""
     global coordinator
-    
+
     # Load settings
     settings = Settings()
     logger.info(f"Starting coordinator with settings: {settings}")
-    
+
     # Initialize coordinator
     coordinator = ClusterCoordinator(settings)
     await coordinator.start()
-    
+
     # Store in app state
     app.state.coordinator = coordinator
     app.state.settings = settings
-    
+
     logger.info("Coordinator started successfully")
-    
+
     yield
-    
+
     # Shutdown
     logger.info("Shutting down coordinator...")
     await coordinator.stop()
@@ -79,7 +79,7 @@ app.include_router(api_router, prefix="/v1")
 
 
 @app.get("/health")
-async def health_check():
+async def health_check() -> Dict[str, Any]:
     """Health check endpoint."""
     if coordinator and coordinator.is_running:
         return {"status": "healthy", "workers": len(coordinator.workers)}
@@ -87,16 +87,19 @@ async def health_check():
 
 
 @app.get("/")
-async def root():
+async def root() -> Dict[str, Any]:
     """Root endpoint with API information."""
     return {
         "name": "AI Cluster Coordinator",
         "version": "0.1.0",
         "endpoints": [
             "/v1/completions",
+            "/v1/chat/completions",
             "/v1/models",
             "/v1/models/load",
+            "/v1/models/{name} (DELETE)",
             "/v1/workers",
+            "/v1/workers/manual",
             "/health",
             "/metrics",
         ],
@@ -105,4 +108,5 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)

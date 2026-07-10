@@ -3,23 +3,21 @@
 //! This module contains the implementations of different model architectures
 //! supported by the AI cluster, including DeepSeek, Llama, and Mistral.
 
+pub mod common;
 pub mod deepseek;
 pub mod llama;
 pub mod mistral;
 pub mod qwen;
-pub mod common;
 
 /// Re-export shared KV cache types used by llama, qwen, and deepseek.
 #[allow(unused_imports)]
-pub use llama::{KvEntry, KvCache};
+pub use llama::{KvCache, KvEntry};
 
-
-
-use std::sync::Arc;
+use crate::error::WorkerError;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::debug;
-use crate::error::WorkerError;
 
 /// Configuration common to all models
 #[derive(Debug, Clone)]
@@ -54,6 +52,12 @@ pub struct ModelConfig {
     /// Rotary embedding theta
     pub rope_theta: f32,
 
+    /// Explicit head dimension from config.json (None → hidden_size / num_attention_heads).
+    pub head_dim: Option<usize>,
+
+    /// Whether q/k/v projections carry biases (Qwen2/2.5 style).
+    pub attention_bias: bool,
+
     /// Whether model uses MoE
     #[allow(dead_code)]
     pub is_moe: bool,
@@ -81,7 +85,7 @@ pub type TextStream = Pin<Box<dyn Stream<Item = Result<String, WorkerError>> + S
 
 /// Trait for type-erased text generation
 pub trait TextGeneration: Send {
-    /// Generate text stream
+    /// Generate text stream. `seed` = Some(n) gives deterministic sampling.
     fn generate(
         &self,
         prompt: &str,
@@ -89,6 +93,7 @@ pub trait TextGeneration: Send {
         temperature: f32,
         top_p: f32,
         top_k: usize,
+        seed: Option<u64>,
     ) -> Result<TextStream, WorkerError>;
 }
 
@@ -180,63 +185,32 @@ impl ModelInstance {
         temperature: f32,
         top_p: f32,
         top_k: usize,
+        seed: Option<u64>,
     ) -> Result<TextStream, WorkerError> {
         if let Some(model) = &self.model {
+            self.inference_count.fetch_add(1, Ordering::Relaxed);
             let stream = {
-                debug!("ModelInstance::generate starting for {} - waiting for Mutex", self.name);
-                let guard = model.lock()
+                debug!(
+                    "ModelInstance::generate starting for {} - waiting for Mutex",
+                    self.name
+                );
+                let guard = model
+                    .lock()
                     .map_err(|e| WorkerError::Internal(format!("Lock error: {}", e)))?;
                 debug!("ModelInstance::generate acquired Mutex for {}", self.name);
-                let res = guard.generate(prompt, max_tokens, temperature, top_p, top_k);
-                debug!("ModelInstance::generate trait call finished for {}", self.name);
+                let res = guard.generate(prompt, max_tokens, temperature, top_p, top_k, seed);
+                debug!(
+                    "ModelInstance::generate trait call finished for {}",
+                    self.name
+                );
                 res?
             }; // guard dropped here, stream is 'static
             Ok(stream)
         } else {
-             // Placeholder for now (should be error or dummy stream)
-             Ok(Box::pin(TokenStream::new(max_tokens)))
+            Err(WorkerError::Internal(format!(
+                "Model instance {} holds no runnable model",
+                self.name
+            )))
         }
-    }
-}
-
-/// Backend-agnostic token stream for generation.
-///
-/// This simplified version doesn't hold model references so it's
-/// trivially `Send + Sync + Unpin`.
-pub struct TokenStream {
-    /// Current position
-    position: usize,
-
-    /// Maximum tokens to generate
-    max_tokens: usize,
-}
-
-impl TokenStream {
-    /// Create a new token stream
-    pub fn new(max_tokens: usize) -> Self {
-        Self {
-            position: 0,
-            max_tokens,
-        }
-    }
-
-
-}
-
-impl futures::Stream for TokenStream {
-    type Item = Result<String, WorkerError>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        // SAFETY: TokenStream is Unpin (no self-referential fields)
-        let this = self.get_mut();
-        if this.position >= this.max_tokens {
-            return std::task::Poll::Ready(None);
-        }
-
-        this.position += 1;
-        std::task::Poll::Ready(Some(Ok(" generated".to_string())))
     }
 }

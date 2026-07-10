@@ -7,17 +7,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{
-    extract::State,
-    response::IntoResponse,
-    routing::get,
-    Router,
-};
-use metrics::{
-    describe_counter, describe_gauge, describe_histogram,
-    counter, gauge, histogram,
-};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use axum::{extract::State, response::IntoResponse, routing::get, Router};
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
+use metrics_exporter_prometheus::PrometheusHandle;
 use tracing::info;
 
 use crate::gpu_manager::GPUManager;
@@ -52,45 +44,25 @@ impl Metrics {
             "GPU utilization percentage"
         );
 
-        describe_gauge!(
-            "worker_gpu_memory_used_bytes",
-            "GPU memory used in bytes"
-        );
+        describe_gauge!("worker_gpu_memory_used_bytes", "GPU memory used in bytes");
 
         describe_gauge!(
             "worker_gpu_temperature_celsius",
             "GPU temperature in Celsius"
         );
 
-        describe_gauge!(
-            "worker_gpu_power_watts",
-            "GPU power usage in watts"
-        );
+        describe_gauge!("worker_gpu_power_watts", "GPU power usage in watts");
 
         describe_counter!(
             "worker_tokens_generated_total",
             "Total number of tokens generated"
         );
 
-        describe_histogram!(
-            "worker_batch_size",
-            "Batch size distribution"
-        );
+        describe_gauge!("worker_loaded_models", "Number of loaded models");
 
-        describe_gauge!(
-            "worker_loaded_models",
-            "Number of loaded models"
-        );
+        describe_gauge!("worker_model_memory_bytes", "Memory used by each model");
 
-        describe_gauge!(
-            "worker_model_memory_bytes",
-            "Memory used by each model"
-        );
-
-        describe_counter!(
-            "worker_errors_total",
-            "Total number of errors"
-        );
+        describe_counter!("worker_errors_total", "Total number of errors");
 
         Self { _private: () }
     }
@@ -132,14 +104,27 @@ impl Metrics {
         );
     }
 
+    /// Gauge: number of in-flight inference requests.
+    pub fn set_active_requests(&self, n: usize) {
+        gauge!("worker_active_requests", n as f64);
+    }
+
+    /// Gauge: number of models currently loaded.
+    pub fn set_loaded_models(&self, n: usize) {
+        gauge!("worker_loaded_models", n as f64);
+    }
+
+    /// Counter: errors by kind ("inference", "timeout", "model_load").
+    pub fn record_error(&self, kind: &str) {
+        counter!("worker_errors_total", 1, "kind" => kind.to_string());
+    }
 }
 
 /// Metrics HTTP handler
-async fn metrics_handler(
-    State(state): State<Arc<MetricsAppState>>,
-) -> impl IntoResponse {
+async fn metrics_handler(State(state): State<Arc<MetricsAppState>>) -> impl IntoResponse {
     // Update GPU metrics before serving
     let gpu_manager = &state.gpu_manager;
+    gpu_manager.refresh_telemetry().await;
 
     for gpu_info in gpu_manager.get_all_gpu_info().await {
         let gpu_label = gpu_info.id.to_string();
@@ -176,25 +161,23 @@ struct MetricsAppState {
 pub struct MetricsServer {
     port: u16,
     gpu_manager: Arc<GPUManager>,
+    handle: PrometheusHandle,
 }
 
 impl MetricsServer {
-    /// Create new metrics server
-    pub fn new(
-        port: u16,
-        gpu_manager: Arc<GPUManager>,
-    ) -> Self {
+    /// Create new metrics server. The recorder handle is installed by main()
+    /// before any service starts, so early describe!/counter! calls register.
+    pub fn new(port: u16, gpu_manager: Arc<GPUManager>, handle: PrometheusHandle) -> Self {
         Self {
             port,
             gpu_manager,
+            handle,
         }
     }
 
     /// Run the metrics server
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Build Prometheus recorder and exporter
-        let builder = PrometheusBuilder::new();
-        let handle = builder.install_recorder()?;
+        let handle = self.handle.clone();
 
         let state = Arc::new(MetricsAppState {
             gpu_manager: self.gpu_manager.clone(),
@@ -210,10 +193,7 @@ impl MetricsServer {
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         info!("Metrics server listening on {}", addr);
 
-        axum::serve(
-            tokio::net::TcpListener::bind(addr).await?,
-            app
-        ).await?;
+        axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
 
         Ok(())
     }

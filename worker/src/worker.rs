@@ -6,21 +6,21 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_stream::try_stream;
-use futures::{Stream, StreamExt};
 use dashmap::DashMap;
+use futures::{Stream, StreamExt};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn, error, debug, instrument};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-use crate::cluster::*;
 use crate::cluster::worker_server::Worker;
+use crate::cluster::*;
+use crate::config::WorkerConfig;
 use crate::gpu_manager::GPUManager;
+use crate::metrics::Metrics;
 use crate::model_loader::ModelLoader;
 use crate::models::ModelInstance;
-use crate::config::WorkerConfig;
-use crate::metrics::Metrics;
 
 /// Worker service implementation
 #[derive(Clone)]
@@ -48,6 +48,9 @@ pub struct WorkerService {
 
     /// Metrics
     metrics: Metrics,
+
+    /// Bounds concurrent inference requests (RESOURCE_EXHAUSTED beyond this).
+    infer_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl WorkerService {
@@ -58,6 +61,7 @@ impl WorkerService {
         model_loader: Arc<ModelLoader>,
         config: WorkerConfig,
     ) -> Self {
+        let infer_semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_requests));
         Self {
             worker_id,
             gpu_manager,
@@ -67,6 +71,7 @@ impl WorkerService {
             start_time: Instant::now(),
             config,
             metrics: Metrics::new(),
+            infer_semaphore,
         }
     }
 
@@ -74,8 +79,21 @@ impl WorkerService {
     pub fn version(&self) -> &'static str {
         env!("CARGO_PKG_VERSION")
     }
+}
 
+/// Removes the request from the active map when dropped — even if the client
+/// disconnects mid-stream and the response stream is dropped.
+struct ActiveGuard {
+    map: Arc<DashMap<String, Instant>>,
+    id: String,
+    metrics: Metrics,
+}
 
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.map.remove(&self.id);
+        self.metrics.set_active_requests(self.map.len());
+    }
 }
 
 #[tonic::async_trait]
@@ -90,35 +108,53 @@ impl Worker for WorkerService {
         let req = request.into_inner();
         info!("Loading model: {}", req.model_name);
 
-        // Check if already loaded
+        // Check if already loaded — report the REAL instance data, not zeros.
         {
             let models = self.loaded_models.read().await;
-            if models.contains_key(&req.model_name) {
+            if let Some(instance) = models.get(&req.model_name) {
                 return Ok(Response::new(LoadModelResponse {
                     success: true,
                     message: "Model already loaded".to_string(),
-                    memory_used: 0,
-                    loaded_on_gpus: vec![],
+                    memory_used: instance.memory_used() as u64,
+                    loaded_on_gpus: instance.gpu_ids().iter().map(|&id| id as i32).collect(),
                 }));
             }
         }
 
-        // Validate GPU IDs
+        // Validate GPU IDs — reject out-of-range ids from remote input up front.
+        let device_count = self.gpu_manager.device_count();
+        for &id in &req.gpu_ids {
+            if id < 0 || (id as usize) >= device_count {
+                return Err(Status::invalid_argument(format!(
+                    "gpu_id {} out of range: this worker manages {} device(s)",
+                    id, device_count
+                )));
+            }
+        }
         let gpu_ids: Vec<u32> = if req.gpu_ids.is_empty() {
-            (0..self.gpu_manager.device_count() as u32).collect()
+            (0..device_count as u32).collect()
         } else {
             req.gpu_ids.iter().map(|&id| id as u32).collect()
         };
 
         // Load model
         let load_start = Instant::now();
-        let result = self.model_loader.load_model(
-            &req.model_name,
-            req.config.as_ref(),
-            &gpu_ids,
-            req.quantization(),
-            req.parallelism(),
-        ).await;
+        let repo_override = if req.model_path.is_empty() {
+            None
+        } else {
+            Some(req.model_path.as_str())
+        };
+        let result = self
+            .model_loader
+            .load_model(
+                &req.model_name,
+                repo_override,
+                req.config.as_ref(),
+                &gpu_ids,
+                req.quantization(),
+                req.parallelism(),
+            )
+            .await;
 
         match result {
             Ok(model_instance) => {
@@ -126,18 +162,23 @@ impl Worker for WorkerService {
                 let memory_used = model_instance.memory_used();
 
                 // Store model
-                self.loaded_models.write().await.insert(
-                    req.model_name.clone(),
-                    model_instance,
-                );
+                self.loaded_models
+                    .write()
+                    .await
+                    .insert(req.model_name.clone(), model_instance);
 
                 // Update metrics
                 self.metrics.record_model_load(&req.model_name, load_time);
-                self.metrics.set_model_memory(&req.model_name, memory_used as i64);
+                self.metrics
+                    .set_model_memory(&req.model_name, memory_used as i64);
+                self.metrics
+                    .set_loaded_models(self.loaded_models.read().await.len());
 
                 info!(
                     "Model {} loaded successfully in {:?}, using {}MB VRAM",
-                    req.model_name, load_time, memory_used / 1024 / 1024
+                    req.model_name,
+                    load_time,
+                    memory_used / 1024 / 1024
                 );
 
                 Ok(Response::new(LoadModelResponse {
@@ -149,6 +190,7 @@ impl Worker for WorkerService {
             }
             Err(e) => {
                 error!("Failed to load model {}: {}", req.model_name, e);
+                self.metrics.record_error("model_load");
                 Err(Status::internal(format!("Failed to load model: {}", e)))
             }
         }
@@ -168,26 +210,53 @@ impl Worker for WorkerService {
 
         info!(
             "Inference request {}: model={}, prompt_len={}",
-            request_id, req.model_name, req.prompt.len()
+            request_id,
+            req.model_name,
+            req.prompt.len()
         );
 
+        // Concurrency limit — reject instead of queueing unboundedly.
+        let permit = match self.infer_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                return Err(Status::resource_exhausted(format!(
+                    "worker at max_concurrent_requests={}",
+                    self.config.max_concurrent_requests
+                )));
+            }
+        };
+
         // Track active request
-        self.active_requests.insert(request_id.clone(), Instant::now());
+        self.active_requests
+            .insert(request_id.clone(), Instant::now());
+        self.metrics.set_active_requests(self.active_requests.len());
+        let active_guard = ActiveGuard {
+            map: self.active_requests.clone(),
+            id: request_id.clone(),
+            metrics: self.metrics.clone(),
+        };
 
         // Get model
-        debug!("Inference request {}: waiting for loaded_models read lock", request_id);
+        debug!(
+            "Inference request {}: waiting for loaded_models read lock",
+            request_id
+        );
         let model = {
             let models = self.loaded_models.read().await;
             models.get(&req.model_name).cloned()
         };
-        debug!("Inference request {}: released loaded_models read lock (found: {})", request_id, model.is_some());
+        debug!(
+            "Inference request {}: released loaded_models read lock (found: {})",
+            request_id,
+            model.is_some()
+        );
 
         let model = match model {
             Some(m) => m,
             None => {
-                debug!("Inference request {}: removing from active_requests mapping", request_id);
-                self.active_requests.remove(&request_id);
-                return Err(Status::not_found(format!("Model {} not loaded", req.model_name)));
+                return Err(
+                    crate::error::WorkerError::ModelNotFound(req.model_name.clone()).into(),
+                );
             }
         };
 
@@ -195,15 +264,18 @@ impl Worker for WorkerService {
         let timeout_duration = std::time::Duration::from_secs(self.config.request_timeout_secs);
 
         let metrics = self.metrics.clone();
-        let active_requests = self.active_requests.clone();
         let model_name = req.model_name.clone();
         let req_id = request_id.clone();
 
         // Create response stream
         let stream = try_stream! {
+            let _permit = permit;           // released when the stream is dropped/finished
+            let _active_guard = active_guard; // removes active_requests entry on drop
             let start_time = Instant::now();
             let mut tokens_generated: u32 = 0;
 
+            // proto: seed == 0 means "random"
+            let seed = if req.seed == 0 { None } else { Some(req.seed as u64) };
             // Run inference
             let inference_result = timeout(
                 timeout_duration,
@@ -213,18 +285,26 @@ impl Worker for WorkerService {
                     req.temperature,
                     req.top_p,
                     req.top_k as usize,
+                    seed,
                 )
             ).await;
 
             match inference_result {
                 Ok(Ok(mut token_stream)) => {
-                    // Stream tokens as they're generated
-                    while let Some(token) = token_stream.next().await {
-                        match token {
-                            Ok(text) => {
-                                tokens_generated += 1;
+                    let deadline = tokio::time::Instant::now() + timeout_duration;
+                    let mut stream_error = false;
+                    let mut timed_out = false;
 
-                                // Send chunk
+                    loop {
+                        match tokio::time::timeout_at(deadline, token_stream.next()).await {
+                            Err(_) => {
+                                timed_out = true;
+                                metrics.record_error("timeout");
+                                break;
+                            }
+                            Ok(None) => break,
+                            Ok(Some(Ok(text))) => {
+                                tokens_generated += 1;
                                 yield InferenceResponse {
                                     request_id: req_id.clone(),
                                     text,
@@ -234,12 +314,25 @@ impl Worker for WorkerService {
                                     processing_time_ms: start_time.elapsed().as_millis() as u64,
                                 };
                             }
-                            Err(e) => {
+                            Ok(Some(Err(e))) => {
                                 tracing::error!("Generation error: {}", e);
+                                stream_error = true;
+                                metrics.record_error("inference");
                                 break;
                             }
                         }
                     }
+
+                    let finish_reason = if timed_out {
+                        tracing::warn!("Request {} timed out after {:?}", req_id, timeout_duration);
+                        FinishReason::Timeout
+                    } else if stream_error {
+                        FinishReason::Error
+                    } else if tokens_generated >= req.max_tokens {
+                        FinishReason::Length
+                    } else {
+                        FinishReason::Stop
+                    };
 
                     // Send final response
                     yield InferenceResponse {
@@ -247,7 +340,7 @@ impl Worker for WorkerService {
                         text: String::new(),
                         tokens_generated,
                         finished: true,
-                        finish_reason: FinishReason::Stop as i32,
+                        finish_reason: finish_reason as i32,
                         processing_time_ms: start_time.elapsed().as_millis() as u64,
                     };
 
@@ -260,12 +353,13 @@ impl Worker for WorkerService {
                     );
 
                     tracing::info!(
-                        "Request {} completed: {} tokens in {:?}",
-                        req_id, tokens_generated, elapsed
+                        "Request {} completed ({:?}): {} tokens in {:?}",
+                        req_id, finish_reason, tokens_generated, elapsed
                     );
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Inference error for {}: {}", req_id, e);
+                    metrics.record_error("inference");
                     yield InferenceResponse {
                         request_id: req_id.clone(),
                         text: format!("Error: {}", e),
@@ -277,6 +371,7 @@ impl Worker for WorkerService {
                 }
                 Err(_) => {
                     tracing::warn!("Request {} timed out after {:?}", req_id, timeout_duration);
+                    metrics.record_error("timeout");
                     yield InferenceResponse {
                         request_id: req_id.clone(),
                         text: String::new(),
@@ -287,19 +382,13 @@ impl Worker for WorkerService {
                     };
                 }
             }
-
-            // Clean up
-            active_requests.remove(&req_id);
         };
 
         Ok(Response::new(Box::pin(stream)))
     }
 
     #[instrument(skip(self))]
-    async fn get_status(
-        &self,
-        _request: Request<Empty>,
-    ) -> Result<Response<WorkerStatus>, Status> {
+    async fn get_status(&self, _request: Request<Empty>) -> Result<Response<WorkerStatus>, Status> {
         debug!("Status request received - waiting for locks");
 
         // Get GPU info
@@ -309,8 +398,9 @@ impl Worker for WorkerService {
         // Get loaded models info
         let loaded_models = {
             let models = self.loaded_models.read().await;
-            models.iter().map(|(name, instance)| {
-                LoadedModelInfo {
+            models
+                .iter()
+                .map(|(name, instance)| LoadedModelInfo {
                     model_name: name.clone(),
                     memory_used: instance.memory_used() as u64,
                     gpu_ids: instance.gpu_ids().iter().map(|&id| id as i32).collect(),
@@ -318,8 +408,8 @@ impl Worker for WorkerService {
                     parallelism: instance.parallelism(),
                     loaded_at_timestamp: instance.loaded_at().timestamp() as u64,
                     num_inferences: instance.inference_count(),
-                }
-            }).collect()
+                })
+                .collect()
         };
 
         // Get system info
@@ -350,20 +440,25 @@ impl Worker for WorkerService {
         let req = request.into_inner();
         info!("Unloading model: {}", req.model_name);
 
-        let mut models = self.loaded_models.write().await;
+        let removed_from_service = {
+            let mut models = self.loaded_models.write().await;
+            models.remove(&req.model_name).is_some()
+        };
+        // The loader's DashMap holds the other Arc clone AND owns the GPU reservations.
+        let removed_from_loader = self.model_loader.unload(&req.model_name).await;
 
-        if let Some(model) = models.remove(&req.model_name) {
-            // Drop model to free GPU memory
-            drop(model);
-
-            // Update metrics
+        if removed_from_service || removed_from_loader {
             self.metrics.remove_model_metrics(&req.model_name);
-
+            self.metrics
+                .set_loaded_models(self.loaded_models.read().await.len());
             info!("Model {} unloaded successfully", req.model_name);
             Ok(Response::new(Empty {}))
         } else {
             warn!("Model {} not found for unloading", req.model_name);
-            Err(Status::not_found(format!("Model {} not found", req.model_name)))
+            Err(Status::not_found(format!(
+                "Model {} not found",
+                req.model_name
+            )))
         }
     }
 
@@ -381,7 +476,9 @@ impl Worker for WorkerService {
 
         Ok(Response::new(HealthCheckResponse {
             status: status as i32,
-            message: format!("Worker {} is {}", self.worker_id,
+            message: format!(
+                "Worker {} is {}",
+                self.worker_id,
                 if is_healthy { "healthy" } else { "unhealthy" }
             ),
         }))

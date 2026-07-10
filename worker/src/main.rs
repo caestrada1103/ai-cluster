@@ -15,7 +15,7 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::runtime::Runtime;
 use tonic::transport::Server;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// Burn backend selection (wgpu / CUDA / ROCm / ndarray).
@@ -23,6 +23,8 @@ pub mod backend;
 mod config;
 mod error;
 mod gpu_manager;
+#[cfg(feature = "llamacpp")]
+mod llamacpp_engine;
 mod metrics;
 mod model_loader;
 #[path = "../models/mod.rs"]
@@ -51,15 +53,15 @@ struct Args {
     #[clap(long, env = "WORKER_ID")]
     worker_id: Option<String>,
 
-    /// gRPC server port
-    #[clap(short, long, default_value = "50051", env = "GRPC_PORT")]
-    port: u16,
+    /// gRPC server port (falls back to config file, then 50051)
+    #[clap(short, long, env = "GRPC_PORT")]
+    port: Option<u16>,
 
-    /// Metrics server port
-    #[clap(long, default_value = "9091", env = "METRICS_PORT")]
-    metrics_port: u16,
+    /// Metrics server port (falls back to config file, then 9091)
+    #[clap(long, env = "METRICS_PORT")]
+    metrics_port: Option<u16>,
 
-    /// GPU IDs to use (comma-separated, e.g., "0,1,2")
+    /// GPU IDs to use (comma-separated, e.g., "0,1,2"; falls back to config file)
     #[clap(long, env = "GPU_IDS")]
     gpu_ids: Option<String>,
 
@@ -89,8 +91,9 @@ fn main() -> Result<(), WorkerError> {
     info!("Starting AI Worker v{}", env!("CARGO_PKG_VERSION"));
     info!("Configuration: {:?}", config);
 
-    // Parse GPU IDs
-    let gpu_ids = args.gpu_ids
+    // Parse GPU IDs — CLI/env wins, then config file, then [0]
+    let gpu_ids = args
+        .gpu_ids
         .as_ref()
         .map(|s| {
             s.split(',')
@@ -99,7 +102,7 @@ fn main() -> Result<(), WorkerError> {
         })
         .transpose()
         .map_err(|e| WorkerError::Configuration(format!("Invalid GPU IDs: {}", e)))?
-        .unwrap_or_else(|| vec![0]);
+        .unwrap_or_else(|| config.gpu_ids.clone());
 
     info!("Using GPUs: {:?}", gpu_ids);
 
@@ -111,12 +114,14 @@ fn main() -> Result<(), WorkerError> {
 }
 
 fn init_logging(args: &Args) {
-    let base_filter = std::env::var("RUST_LOG")
-        .unwrap_or_else(|_| args.log_level.clone());
+    let base_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| args.log_level.clone());
 
     // Aggressively silence driver-level noise from internal dependencies.
     // Use 'off' for crates that continue to leak INFO logs despite 'error' filters.
-    let filter_str = format!("{},wgpu=warn,wgpu_hal=off,naga=off,vulkan=off,vulkan_layer=off", base_filter);
+    let filter_str = format!(
+        "{},wgpu=warn,wgpu_hal=off,naga=off,vulkan=off,vulkan_layer=off",
+        base_filter
+    );
 
     let env_filter = EnvFilter::new(filter_str);
 
@@ -157,11 +162,21 @@ fn create_runtime() -> Result<Runtime, WorkerError> {
         .map_err(|e| WorkerError::Runtime(format!("Failed to create runtime: {}", e)))
 }
 
-async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Result<(), WorkerError> {
+async fn async_main(
+    args: Args,
+    config: WorkerConfig,
+    gpu_ids: Vec<usize>,
+) -> Result<(), WorkerError> {
+    // Install the Prometheus recorder BEFORE any metric is described or recorded.
+    // If this fails the process must not run blind — bail out.
+    let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .map_err(|e| WorkerError::Runtime(format!("Failed to install metrics recorder: {}", e)))?;
+
     // Initialize GPU manager
     info!("Initializing GPU Manager...");
-    let gpu_manager = Arc::new(gpu_manager::GPUManager::new(&config.gpu_ids).await?);
-    
+    let gpu_manager = Arc::new(gpu_manager::GPUManager::new(&gpu_ids).await?);
+
     #[cfg(feature = "wgpu")]
     {
         use burn::backend::wgpu::WgpuDevice;
@@ -176,50 +191,54 @@ async fn async_main(args: Args, config: WorkerConfig, gpu_ids: Vec<usize>) -> Re
         let device = WgpuDevice::default();
         info!("Selected WGPU Device: {:?}", device);
     }
-    
+
     info!("GPU Manager initialized successfully");
-    info!("Initialized GPU manager with {} devices", gpu_manager.device_count());
+    info!(
+        "Initialized GPU manager with {} devices",
+        gpu_manager.device_count()
+    );
 
     // Initialize model loader
     let loader_config = ModelLoaderConfig {
         cache_dir: config.model_cache_dir.clone(),
         download_dir: config.download_dir.clone(),
         max_concurrent_loads: config.max_concurrent_loads,
-        load_timeout_secs: config.load_timeout_secs,
-        verify_checksums: config.verify_checksums,
-        enable_mmap: config.enable_mmap,
-        pin_memory: config.pin_memory,
-        prefetch_size_gb: 2.0,
+        hf_token: config.hf_token.clone(),
+        hf_cache_dir: config.hf_cache_dir.clone(),
+        llamacpp_n_threads: config.llamacpp_n_threads,
+        llamacpp_default_n_gpu_layers: config.llamacpp_default_n_gpu_layers,
     };
     let model_loader = Arc::new(ModelLoader::new(loader_config, gpu_manager.clone())?);
 
+    // Effective values: CLI/env > config file > default
+    let grpc_port = args.port.unwrap_or(config.grpc_port);
+    let metrics_port = args.metrics_port.unwrap_or(config.metrics_port);
+    let worker_id = args
+        .worker_id
+        .or_else(|| config.worker_id.clone())
+        .unwrap_or_else(|| format!("worker-{}", gpu_ids[0]));
+
     // Create worker service
-    let worker_service = WorkerService::new(
-        args.worker_id.unwrap_or_else(|| format!("worker-{}", gpu_ids[0])),
-        gpu_manager.clone(),
-        model_loader,
-        config,
-    );
+    let worker_service = WorkerService::new(worker_id, gpu_manager.clone(), model_loader, config);
 
     // Start metrics server
-    let metrics_server = MetricsServer::new(
-        args.metrics_port,
-        gpu_manager.clone(),
-    );
+    let metrics_server = MetricsServer::new(metrics_port, gpu_manager.clone(), prometheus_handle);
     tokio::spawn(async move {
         if let Err(e) = metrics_server.run().await {
             error!("Metrics server error: {}", e);
         }
     });
-    info!("Metrics server listening on port {}", args.metrics_port);
+    info!("Metrics server listening on port {}", metrics_port);
 
     // Build gRPC server
-    let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], grpc_port));
     info!("gRPC server listening on {}", addr);
 
     // Health service
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
-    health_reporter.set_serving::<WorkerServer<WorkerService>>().await;
+    health_reporter
+        .set_serving::<WorkerServer<WorkerService>>()
+        .await;
 
     Server::builder()
         .add_service(health_service)

@@ -4,14 +4,13 @@
 //! and device operations. Uses Burn's wgpu backend by default for
 //! automatic GPU detection across NVIDIA, AMD, and Intel.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
+use std::sync::Arc;
 
 use dashmap::DashMap;
-use tokio::sync::Semaphore;
-use tracing::{info, warn, debug};
 use std::process::Command;
+use tokio::sync::Semaphore;
+use tracing::{debug, info, warn};
 
 use crate::cluster::GpuInfo;
 use crate::error::WorkerError;
@@ -31,24 +30,39 @@ pub struct GPUDevice {
     /// Available VRAM in bytes
     pub available_memory: u64,
 
-    /// Current utilization (0-100)
+    /// Current utilization (0-100) at detection time — live values come from
+    /// `GpuTelemetry` via `refresh_telemetry`/`get_all_gpu_info` instead.
+    #[allow(dead_code)]
     pub utilization: f32,
 
-    /// Temperature in Celsius
+    /// Temperature in Celsius at detection time — see `utilization` note.
+    #[allow(dead_code)]
     pub temperature: f32,
 
-    /// Power usage in watts
+    /// Power usage in watts at detection time — see `utilization` note.
+    #[allow(dead_code)]
     pub power_usage: u32,
 
     /// Device capabilities
     pub capabilities: Vec<String>,
-
 }
 
 /// GPU memory allocation tracking
 struct MemoryAllocation {
+    /// Owner tag (model name) — used to free the reservation on unload.
+    tag: String,
+    /// Reserved bytes.
+    size: u64,
     /// Allocation timestamp
     _timestamp: std::time::Instant,
+}
+
+/// Mutable GPU telemetry sampled from vendor tools at scrape time.
+#[derive(Debug, Clone, Default)]
+struct GpuTelemetry {
+    utilization: f32,
+    temperature: f32,
+    power_usage: u32,
 }
 
 /// GPU Manager — handles device detection and memory tracking
@@ -68,6 +82,9 @@ pub struct GPUManager {
 
     /// Whether peer-to-peer is enabled
     _p2p_enabled: bool,
+
+    /// Per-managed-device telemetry, refreshed on demand (metrics scrape / health check).
+    telemetry: Arc<tokio::sync::RwLock<Vec<GpuTelemetry>>>,
 }
 
 impl GPUManager {
@@ -128,6 +145,10 @@ impl GPUManager {
             used_bytes: Arc::new((0..num_devices).map(|_| AtomicU64::new(0)).collect()),
             memory_locks,
             _p2p_enabled: false,
+            telemetry: Arc::new(tokio::sync::RwLock::new(vec![
+                GpuTelemetry::default();
+                num_devices
+            ])),
         })
     }
 
@@ -140,20 +161,17 @@ impl GPUManager {
                 .difference(wgpu::InstanceFlags::VALIDATION | wgpu::InstanceFlags::DEBUG),
             ..Default::default()
         });
-        
+
         let adapters = instance.enumerate_adapters(wgpu::Backends::all());
-        let mut devices = Vec::new();
+        let mut devices: Vec<(GPUDevice, bool)> = Vec::new();
         let mut seen_hardware = std::collections::HashSet::new();
 
         for adapter in adapters {
             let info = adapter.get_info();
-            
-            // Skip software/CPU renderers if we have hardware options, but keep as fallback
-            if info.device_type == wgpu::DeviceType::Cpu && !devices.is_empty() {
-                continue;
-            }
 
-            // Create a unique key for the physical hardware to avoid double-counting 
+            let is_cpu = info.device_type == wgpu::DeviceType::Cpu;
+
+            // Create a unique key for the physical hardware to avoid double-counting
             // (e.g. same card via Vulkan and DX12)
             let hardware_id = format!("{}-{}-{:?}", info.name, info.vendor, info.device_type);
             if seen_hardware.contains(&hardware_id) {
@@ -163,14 +181,15 @@ impl GPUManager {
 
             let idx = devices.len();
             let name = info.name.clone();
-            let mut total_memory = Self::estimate_total_memory(); 
-            
+            let mut total_memory = Self::estimate_total_memory();
+
             // Try to get precise VRAM for NVIDIA via nvidia-smi
-            if info.name.to_lowercase().contains("nvidia") {
-                if let Some(vram) = Self::try_detect_nvidia_memory() {
+            let lname = info.name.to_lowercase();
+            if lname.contains("nvidia") {
+                if let Some(vram) = Self::try_detect_nvidia_memory(idx) {
                     total_memory = vram;
                 }
-            } else if info.name.to_lowercase().contains("amd") {
+            } else if lname.contains("amd") || lname.contains("radeon") {
                 if let Some(vram) = Self::try_detect_amd_memory(idx) {
                     total_memory = vram;
                 }
@@ -178,23 +197,44 @@ impl GPUManager {
 
             debug!(
                 "Detected {} adapter {}: {} ({:?}) - VRAM: {}MB",
-                info.backend, idx, name, info.device_type, total_memory / 1024 / 1024
+                info.backend,
+                idx,
+                name,
+                info.device_type,
+                total_memory / 1024 / 1024
             );
 
-            devices.push(GPUDevice {
-                id: idx,
-                name: format!("{} ({})", name, info.backend),
-                total_memory,
-                available_memory: total_memory,
-                utilization: 0.0,
-                temperature: 0.0,
-                power_usage: 0,
-                capabilities: vec!["fp32".to_string()],
-            });
+            devices.push((
+                GPUDevice {
+                    id: idx,
+                    name: format!("{} ({})", name, info.backend),
+                    total_memory,
+                    available_memory: total_memory,
+                    utilization: 0.0,
+                    temperature: 0.0,
+                    power_usage: 0,
+                    capabilities: vec!["fp32".to_string()],
+                },
+                is_cpu,
+            ));
         }
 
+        // Prefer hardware adapters: drop CPU/software renderers whenever any real GPU exists,
+        // regardless of enumeration order (llvmpipe often enumerates first).
+        if devices.iter().any(|(_, is_cpu)| !is_cpu) {
+            devices.retain(|(_, is_cpu)| !is_cpu);
+        }
+        let mut devices: Vec<GPUDevice> = devices
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (mut d, _))| {
+                d.id = idx;
+                d
+            })
+            .collect();
+
         if devices.is_empty() {
-             devices.push(GPUDevice {
+            devices.push(GPUDevice {
                 id: 0,
                 name: "CPU Fallback".to_string(),
                 total_memory: 0,
@@ -209,8 +249,9 @@ impl GPUManager {
         devices
     }
 
-    /// Try to run nvidia-smi to get total VRAM (3-second timeout).
-    fn try_detect_nvidia_memory() -> Option<u64> {
+    /// Try to run nvidia-smi to get total VRAM for one GPU (3-second timeout).
+    /// nvidia-smi prints one line per GPU; pick the line matching `device_idx`.
+    fn try_detect_nvidia_memory(device_idx: usize) -> Option<u64> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let out = Command::new("nvidia-smi")
@@ -225,8 +266,12 @@ impl GPUManager {
             .ok()?;
 
         if output.status.success() {
-            let val_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if let Ok(mb) = val_str.parse::<u64>() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let line = stdout
+                .lines()
+                .nth(device_idx)
+                .or_else(|| stdout.lines().next())?;
+            if let Ok(mb) = line.trim().parse::<u64>() {
                 return Some(mb * 1024 * 1024);
             }
         }
@@ -248,16 +293,22 @@ impl GPUManager {
             .recv_timeout(std::time::Duration::from_secs(3))
             .ok()?
             .ok()?;
-            
+
         if output.status.success() {
             let json_str = String::from_utf8_lossy(&output.stdout);
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
                 // rocm-smi returns a JSON object where keys are usually "card0", "card1", etc.
                 // We try "card{idx}" first, then fallback to any available card if idx fails.
                 let card_key = format!("card{}", device_idx);
-                
-                if let Some(card_data) = v.get(&card_key).or_else(|| v.as_object().and_then(|obj| obj.values().next())) {
-                    if let Some(vram_str) = card_data.get("VRAM Total Memory (B)").and_then(|v| v.as_str()) {
+
+                if let Some(card_data) = v
+                    .get(&card_key)
+                    .or_else(|| v.as_object().and_then(|obj| obj.values().next()))
+                {
+                    if let Some(vram_str) = card_data
+                        .get("VRAM Total Memory (B)")
+                        .and_then(|v| v.as_str())
+                    {
                         if let Ok(vram_bytes) = vram_str.parse::<u64>() {
                             return Some(vram_bytes);
                         }
@@ -276,7 +327,7 @@ impl GPUManager {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(8);
-        
+
         gb * 1024 * 1024 * 1024
     }
 
@@ -285,21 +336,65 @@ impl GPUManager {
         self.devices.len()
     }
 
+    /// Re-sample utilization/temperature/power via nvidia-smi (one CSV line per GPU).
+    /// AMD/Intel adapters keep zeros until a rocm-smi refresh is added.
+    /// Managed device i maps to vendor-tool line i (single-vendor hosts; documented limitation).
+    pub async fn refresh_telemetry(&self) {
+        let output = tokio::task::spawn_blocking(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let out = Command::new("nvidia-smi")
+                    .arg("--query-gpu=utilization.gpu,temperature.gpu,power.draw")
+                    .arg("--format=csv,noheader,nounits")
+                    .output();
+                let _ = tx.send(out);
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(3))
+                .ok()
+                .and_then(|r| r.ok())
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let Some(output) = output else { return };
+        if !output.status.success() {
+            return;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut telemetry = self.telemetry.write().await;
+        for (i, line) in stdout.lines().enumerate() {
+            if i >= telemetry.len() {
+                break;
+            }
+            let fields: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            if fields.len() >= 3 {
+                telemetry[i] = GpuTelemetry {
+                    utilization: fields[0].parse().unwrap_or(0.0),
+                    temperature: fields[1].parse().unwrap_or(0.0),
+                    power_usage: fields[2].parse::<f32>().map(|w| w as u32).unwrap_or(0),
+                };
+            }
+        }
+    }
+
     /// Get all GPU info for status reporting (gRPC)
     pub async fn get_all_gpu_info(&self) -> Vec<GpuInfo> {
+        let telemetry = self.telemetry.read().await.clone();
         let mut infos = Vec::new();
 
-        for device in &self.devices {
+        for (i, device) in self.devices.iter().enumerate() {
             let available = self.get_available_memory(device.id).await;
+            let t = telemetry.get(i).cloned().unwrap_or_default();
 
             infos.push(GpuInfo {
                 id: device.id as i32,
                 name: device.name.clone(),
                 total_memory: device.total_memory,
                 available_memory: available,
-                utilization: device.utilization,
-                temperature: device.temperature,
-                power_usage: device.power_usage,
+                utilization: t.utilization,
+                temperature: t.temperature,
+                power_usage: t.power_usage,
                 capabilities: device.capabilities.clone(),
             });
         }
@@ -313,20 +408,30 @@ impl GPUManager {
             Some(d) => d,
             None => return 0,
         };
-        let used = self.used_bytes
+        let used = self
+            .used_bytes
             .get(device_id)
             .map(|a| a.load(Ordering::Relaxed))
             .unwrap_or(0);
         device.available_memory.saturating_sub(used)
     }
 
-    /// Allocate memory on a device (tracking only — actual GPU alloc via Burn)
+    /// Reserve memory on a device (tracking only — actual GPU alloc via Burn).
+    /// `tag` identifies the owner (model name) so `free_memory` can release it.
     pub async fn allocate_memory(
         &self,
         device_id: usize,
         size: u64,
+        tag: &str,
     ) -> Result<(), WorkerError> {
-        let _permit = self.memory_locks[device_id]
+        let lock = self.memory_locks.get(device_id).ok_or_else(|| {
+            WorkerError::Gpu(format!(
+                "GPU {} not managed by this worker ({} device(s))",
+                device_id,
+                self.devices.len()
+            ))
+        })?;
+        let _permit = lock
             .acquire()
             .await
             .map_err(|e| WorkerError::Resource(format!("Failed to acquire memory lock: {}", e)))?;
@@ -340,31 +445,120 @@ impl GPUManager {
             });
         }
 
-        let mut allocations = self.allocations.entry(device_id).or_default();
-        allocations.push(MemoryAllocation {
-            _timestamp: std::time::Instant::now(),
-        });
+        self.allocations
+            .entry(device_id)
+            .or_default()
+            .push(MemoryAllocation {
+                tag: tag.to_string(),
+                size,
+                _timestamp: std::time::Instant::now(),
+            });
         if let Some(counter) = self.used_bytes.get(device_id) {
             counter.fetch_add(size, Ordering::Relaxed);
         }
 
-        debug!("Allocated {} bytes on GPU {}", size, device_id);
+        debug!("Reserved {} bytes on GPU {} for {}", size, device_id, tag);
         Ok(())
     }
 
-    /// Check if all GPUs are healthy
+    /// Release every reservation carrying `tag` on `device_id`. Returns bytes freed.
+    pub async fn free_memory(&self, device_id: usize, tag: &str) -> u64 {
+        let mut freed: u64 = 0;
+        if let Some(mut allocs) = self.allocations.get_mut(&device_id) {
+            allocs.retain(|a| {
+                if a.tag == tag {
+                    freed += a.size;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if freed > 0 {
+            if let Some(counter) = self.used_bytes.get(device_id) {
+                counter.fetch_sub(freed, Ordering::Relaxed);
+            }
+            debug!("Freed {} bytes on GPU {} for {}", freed, device_id, tag);
+        }
+        freed
+    }
+
+    /// Check if all GPUs are healthy (refreshes telemetry first).
     pub async fn is_healthy(&self) -> bool {
-        for device in &self.devices {
-            if device.temperature > 100.0 {
+        self.refresh_telemetry().await;
+        let telemetry = self.telemetry.read().await;
+        for t in telemetry.iter() {
+            if t.temperature > 100.0 {
                 return false;
             }
         }
         true
     }
 
-    /// Get system memory information: (free, total)
+    /// Get system memory information from /proc/meminfo: (available, total) bytes.
     pub async fn system_memory(&self) -> (u64, u64) {
-        // Fallback — real system memory detection can be added later
-        (0, 0)
+        let Ok(contents) = tokio::fs::read_to_string("/proc/meminfo").await else {
+            return (0, 0);
+        };
+        let mut total = 0u64;
+        let mut available = 0u64;
+        for line in contents.lines() {
+            let mut parts = line.split_whitespace();
+            match parts.next() {
+                Some("MemTotal:") => total = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+                Some("MemAvailable:") => {
+                    available = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0)
+                }
+                _ => {}
+            }
+        }
+        (available * 1024, total * 1024) // /proc/meminfo reports kB
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_manager_with_one_device() -> GPUManager {
+        let device = GPUDevice {
+            id: 0,
+            name: "test-gpu".to_string(),
+            total_memory: 1_000,
+            available_memory: 1_000,
+            utilization: 0.0,
+            temperature: 0.0,
+            power_usage: 0,
+            capabilities: vec!["fp32".to_string()],
+        };
+        GPUManager {
+            devices: vec![device],
+            allocations: Arc::new(DashMap::new()),
+            used_bytes: Arc::new(vec![AtomicU64::new(0)]),
+            memory_locks: vec![Arc::new(Semaphore::new(1))],
+            telemetry: Arc::new(tokio::sync::RwLock::new(vec![Default::default()])),
+            _p2p_enabled: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_allocate_then_free_restores_capacity() {
+        let m = make_manager_with_one_device();
+        m.allocate_memory(0, 600, "model-a").await.unwrap();
+        assert_eq!(m.get_available_memory(0).await, 400);
+        // Second allocation of 600 must fail (OOM guard)
+        assert!(m.allocate_memory(0, 600, "model-b").await.is_err());
+        let freed = m.free_memory(0, "model-a").await;
+        assert_eq!(freed, 600);
+        assert_eq!(m.get_available_memory(0).await, 1_000);
+        // Now it fits
+        m.allocate_memory(0, 600, "model-b").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_allocate_invalid_device_errors_instead_of_panicking() {
+        let m = make_manager_with_one_device();
+        let err = m.allocate_memory(7, 100, "x").await.unwrap_err();
+        assert!(err.to_string().contains("not managed"));
     }
 }

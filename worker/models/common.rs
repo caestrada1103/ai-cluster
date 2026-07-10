@@ -45,9 +45,9 @@ impl<B: Backend> RMSNorm<B> {
 /// Precomputed rotary embeddings for efficient position encoding.
 #[derive(Module, Debug)]
 pub struct RotaryEmbedding<B: Backend> {
-    /// Cosine component: shape [max_seq_len, head_dim]
+    /// Cosine component: shape [max_seq_len, head_dim / 2] (HF Llama half-dim convention)
     pub cos: Tensor<B, 2>,
-    /// Sine component: shape [max_seq_len, head_dim]
+    /// Sine component: shape [max_seq_len, head_dim / 2] (HF Llama half-dim convention)
     pub sin: Tensor<B, 2>,
 }
 
@@ -68,7 +68,9 @@ impl<B: Backend> RotaryEmbedding<B> {
         let pos_tensor = Tensor::<B, 1>::from_floats(positions.as_slice(), device);
 
         // freqs = outer(positions, inv_freq)  -> [max_seq_len, half_dim]
-        let freqs = pos_tensor.unsqueeze::<2>().transpose()
+        let freqs = pos_tensor
+            .unsqueeze::<2>()
+            .transpose()
             .matmul(inv_freq_tensor.unsqueeze::<2>());
 
         let cos = freqs.clone().cos();
@@ -109,7 +111,9 @@ impl<B: Backend> RotaryEmbedding<B> {
         let head_dim = dims[3];
         let half = head_dim / 2;
 
-        let x1 = x.clone().slice([0..dims[0], 0..dims[1], 0..dims[2], 0..half]);
+        let x1 = x
+            .clone()
+            .slice([0..dims[0], 0..dims[1], 0..dims[2], 0..half]);
         let x2 = x.slice([0..dims[0], 0..dims[1], 0..dims[2], half..head_dim]);
 
         let cos = cos.unsqueeze::<4>();
@@ -152,16 +156,19 @@ pub fn repeat_kv<B: Backend>(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
 /// Apply top-k and top-p (nucleus) filtering to logits, then sample.
 ///
 /// Returns the sampled token index.
-pub fn top_k_top_p_sample(logits: &[f32], temperature: f32, top_p: f32, top_k: usize) -> usize {
+pub fn top_k_top_p_sample(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    rng: &mut rand::rngs::StdRng,
+) -> usize {
     if logits.is_empty() {
         return 0;
     }
 
     // Apply temperature
-    let scaled: Vec<f32> = logits
-        .iter()
-        .map(|&l| l / temperature.max(1e-8))
-        .collect();
+    let scaled: Vec<f32> = logits.iter().map(|&l| l / temperature.max(1e-8)).collect();
 
     // Softmax
     let max_logit = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -210,9 +217,18 @@ pub fn top_k_top_p_sample(logits: &[f32], temperature: f32, top_p: f32, top_k: u
         }
     }
 
-    // Sample (deterministic fallback: argmax)
-    // In production this would use a proper RNG; for now pick the most likely.
-    probs[0].0
+    // Sample from the re-normalised distribution.
+    use rand::Rng;
+    let r: f32 = rng.gen();
+    let mut acc = 0.0_f32;
+    for &(i, p) in &probs {
+        acc += p;
+        if r <= acc {
+            return i;
+        }
+    }
+    // Floating-point slack: fall back to the least-probable kept token.
+    probs.last().map(|&(i, _)| i).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +240,6 @@ pub fn top_k_top_p_sample(logits: &[f32], temperature: f32, top_p: f32, top_k: u
 ///
 /// Returns `None` for `seq_len ≤ 1` (single token — no masking needed).
 /// Call this once at the model level and pass the result to each layer.
-#[allow(dead_code)]
 pub fn build_causal_bias<B: Backend>(seq_len: usize, device: &B::Device) -> Option<Tensor<B, 4>> {
     if seq_len <= 1 {
         return None;
@@ -235,10 +250,52 @@ pub fn build_causal_bias<B: Backend>(seq_len: usize, device: &B::Device) -> Opti
             data[i * seq_len + j] = 0.0;
         }
     }
-    Some(
-        Tensor::<B, 1>::from_floats(data.as_slice(), device)
-            .reshape([1, 1, seq_len, seq_len]),
-    )
+    Some(Tensor::<B, 1>::from_floats(data.as_slice(), device).reshape([1, 1, seq_len, seq_len]))
+}
+
+// ---------------------------------------------------------------------------
+// EOS token ids
+// ---------------------------------------------------------------------------
+
+/// Read `eos_token_id` (int or list) from the checkpoint directory.
+/// `generation_config.json` wins over `config.json` (HF convention).
+/// Returns an empty set when neither declares one (generation then runs to max_tokens).
+pub fn load_eos_ids(model_dir: &std::path::Path) -> std::collections::HashSet<u32> {
+    let mut ids = std::collections::HashSet::new();
+    for file in ["generation_config.json", "config.json"] {
+        let path = model_dir.join(file);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
+        match &json["eos_token_id"] {
+            serde_json::Value::Number(n) => {
+                if let Some(v) = n.as_u64() {
+                    ids.insert(v as u32);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for n in arr {
+                    if let Some(v) = n.as_u64() {
+                        ids.insert(v as u32);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !ids.is_empty() {
+            break;
+        }
+    }
+    if ids.is_empty() {
+        tracing::warn!(
+            "No eos_token_id found in {:?} — generation will only stop at max_tokens",
+            model_dir
+        );
+    }
+    ids
 }
 
 // ---------------------------------------------------------------------------
@@ -251,4 +308,76 @@ pub fn swiglu<B: Backend>(gate: Tensor<B, 3>, up: Tensor<B, 3>) -> Tensor<B, 3> 
     let sigmoid = gate.clone().neg().exp().add_scalar(1.0).recip();
     let silu = gate * sigmoid;
     silu * up
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    #[test]
+    fn test_sampling_is_not_always_argmax() {
+        // Two near-equal logits: over 1000 draws BOTH indices must appear.
+        let logits = [0.0_f32, 0.1_f32];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut seen = [false, false];
+        for _ in 0..1000 {
+            let idx = top_k_top_p_sample(&logits, 1.0, 1.0, 0, &mut rng);
+            seen[idx] = true;
+        }
+        assert!(
+            seen[0] && seen[1],
+            "sampler must draw both candidates, got {:?}",
+            seen
+        );
+    }
+
+    #[test]
+    fn test_top_k_one_is_argmax() {
+        let logits = [0.1_f32, 3.0, 0.2, 0.05];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        for _ in 0..100 {
+            assert_eq!(top_k_top_p_sample(&logits, 1.0, 1.0, 1, &mut rng), 1);
+        }
+    }
+
+    #[test]
+    fn test_seeded_sampling_is_deterministic() {
+        let logits = [0.3_f32, 0.2, 0.5, 0.1];
+        let a: Vec<usize> = {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+            (0..50)
+                .map(|_| top_k_top_p_sample(&logits, 1.0, 0.9, 0, &mut rng))
+                .collect()
+        };
+        let b: Vec<usize> = {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+            (0..50)
+                .map(|_| top_k_top_p_sample(&logits, 1.0, 0.9, 0, &mut rng))
+                .collect()
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_load_eos_ids_int_and_list() {
+        let dir = tempfile::tempdir().unwrap();
+        // generation_config.json wins and may hold a list (Llama-3 style)
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"eos_token_id": [128001, 128009]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("config.json"), r#"{"eos_token_id": 2}"#).unwrap();
+        let ids = load_eos_ids(dir.path());
+        assert!(ids.contains(&128001) && ids.contains(&128009));
+        assert!(!ids.contains(&2));
+
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(dir2.path().join("config.json"), r#"{"eos_token_id": 2}"#).unwrap();
+        assert!(load_eos_ids(dir2.path()).contains(&2));
+
+        let dir3 = tempfile::tempdir().unwrap();
+        assert!(load_eos_ids(dir3.path()).is_empty());
+    }
 }

@@ -20,18 +20,15 @@ GPU_INDEX="${GPU_INDEX:-0}"
 GRPC_BASE_PORT="${GRPC_BASE_PORT:-50051}"
 METRICS_BASE_PORT="${METRICS_BASE_PORT:-9091}"
 
-# Compute ports: base + GPU index offset
-GRPC_PORT=$((GRPC_BASE_PORT + GPU_INDEX))
-METRICS_PORT=$((METRICS_BASE_PORT + GPU_INDEX))
+# Compute ports: explicit GRPC_PORT/METRICS_PORT win; else base + GPU index offset
+GRPC_PORT="${GRPC_PORT:-$((GRPC_BASE_PORT + GPU_INDEX))}"
+METRICS_PORT="${METRICS_PORT:-$((METRICS_BASE_PORT + GPU_INDEX))}"
 
 # Auto-generate worker ID if not set
 if [ -z "$WORKER_ID" ]; then
     HOSTNAME=$(hostname -s 2>/dev/null || echo "worker")
     WORKER_ID="${HOSTNAME}-gpu-${GPU_INDEX}"
 fi
-
-# Export for healthcheck
-export METRICS_PORT
 
 echo "============================================="
 echo "  AI Worker Starting"

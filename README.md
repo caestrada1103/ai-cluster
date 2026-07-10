@@ -6,12 +6,6 @@
 [![CUDA](https://img.shields.io/badge/CUDA-12.1+-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-latest-brightgreen.svg)](docs/architecture.md)
-[![Discord](https://img.shields.io/badge/chat-discord-7289da.svg)](https://discord.gg/ai-cluster)
-
-<div align="center">
-  <img src="docs/images/ai-cluster-logo.png" alt="AI Cluster Logo" width="200"/>
-  <p><strong>Run large language models across multiple GPUs with ease</strong></p>
-</div>
 
 ## 📋 Table of Contents
 
@@ -62,7 +56,7 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
 | **Dynamic Model Loading** | Load/unload models at runtime without restart |
 | **REST API** | OpenAI-compatible API for easy integration |
 | **Streaming** | Stream tokens as they're generated |
-| **Quantization** | FP16, INT8, INT4, FP8 support |
+| **Quantization** | Planned — FP16/INT8/INT4/FP8 (weights load as FP32 today; non-NONE requests are rejected) |
 
 ### Advanced Features
 
@@ -73,7 +67,7 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
 | **Affinity Routing** | Session persistence for chatbots |
 | **Prometheus Metrics** | Comprehensive monitoring |
 | **Grafana Dashboards** | Pre-built visualizations |
-| **Kubernetes Support** | Helm charts and operators |
+| **Kubernetes Support** | Planned — no manifests ship yet |
 
 ### Roadmap & Planned Optimizations
 
@@ -107,7 +101,8 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
 ## Tech Stack
 
 - **Coordinator**: Python (FastAPI, gRPC)
-- **Worker**: Rust (Burn Framework, Tokio, Tonic)
+- **Worker**: Rust (Burn Framework + llama.cpp, Tokio, Tonic)
+- **Inference Engines**: **llama.cpp/GGUF** (`llama-cpp-2 =0.1.150`) — **recommended engine** for quantized inference on consumer NVIDIA/AMD GPUs (native Q4_K_M/Q5_K_M/Q8_0 quantization; opt-in via the `llamacpp` cargo feature) + **Burn 0.19** (safetensors, FP32, the **default** cargo build feature) — experimental/reference engine, no quantization yet
 - **Communication**: gRPC (Inter-service), REST API (Client-facing)
 - **GPU Acceleration**:
     - **AMD**: ROCm (HIP)
@@ -125,12 +120,9 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        Coordinator Cluster                          │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐      │
-│  │   Coordinator   │  │   Coordinator   │  │   Coordinator   │      │
-│  │     Primary     │──│    Replica 1    │──│    Replica 2    │      │
-│  └─────────────────┘  └─────────────────┘  └─────────────────┘      │
-│                         (Leader Election)                           │
+│                     Coordinator (single instance)                    │
+│        FastAPI REST · worker discovery · routing · registry         │
+│     (HA replicas + leader election are on the roadmap, not built)   │
 └────────────────────────────────┬────────────────────────────────────┘
                                  │
                     ┌────────────┴────────────┐
@@ -153,16 +145,11 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
                                  │
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                       Infrastructure Layer                          │
-│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐   │
-│   │   Prometheus│ │    Grafana  │ │    Redis    │ │    MinIO    │   │
-│   │   Metrics   │ │  Dashboards │ │    Cache    │ │Model Storage│   │
-│   └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘   │
-│                                                                     │
-│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐   │
-│   │    Jaeger   │ │    Consul   │ │    Vault    │ │   Elastic   │   │
-│   │   Tracing   │ │   Discovery │ │   Secrets   │ │    Logs     │   │
-│   └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘   │
+│                 Infrastructure Layer (shipped today)                 │
+│        ┌─────────────┐              ┌─────────────┐                  │
+│        │  Prometheus │              │   Grafana   │                  │
+│        └─────────────┘              └─────────────┘                  │
+│  Planned: Redis · MinIO · Jaeger · Consul · Vault · Elastic          │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -171,6 +158,15 @@ For detailed architecture information, see the [Architecture Guide](docs/archite
 ---
 
 ## Quick Start
+
+> **Recommended for consumer GPUs**: the steps below bring up the full stack
+> using the default Burn/wgpu build (FP32, single GPU per worker) so you can
+> get everything running quickly. For **quantized** models on consumer
+> NVIDIA/AMD GPUs (~8-16 GB VRAM) — the project's primary goal — build the
+> worker with the **llama.cpp/GGUF engine** instead (`--features llamacpp`
+> [+ `llamacpp-vulkan`/`llamacpp-cuda`]) and load a `[models.X.gguf]` entry;
+> see [Adding a GGUF model](#adding-a-gguf-model-llamacpp-engine-recommended)
+> below for the recommended end-to-end example.
 
 ### Method 1: Docker Compose
 
@@ -181,10 +177,10 @@ The easiest way to get started is using Docker Compose, which handles all depend
 git clone https://github.com/caestrada1103/ai-cluster.git
 cd ai-cluster
 
-# 2. Configure Environment (Optional but Recommended)
-# Create a .env file to store secrets like your Hugging Face Token (required for Llama 3)
+# 2. Configure Environment (REQUIRED: compose refuses to start Grafana without
+#    GRAFANA_ADMIN_PASSWORD; HF_TOKEN is needed for gated models like Llama 3)
 cp .env.example .env
-# Edit .env and set HF_TOKEN=hf_...
+# Edit .env: set GRAFANA_ADMIN_PASSWORD=<something> and HF_TOKEN=hf_...
 
 # 3. Build and start with Docker Compose
 docker compose up -d --build
@@ -228,11 +224,14 @@ cd worker
 # For AMD: cargo run --release --features rocm
 # For NVIDIA: cargo run --release --features cuda
 cargo run --release --features cuda
+# Recommended for consumer GPUs — add the llama.cpp/GGUF engine for quantized models:
+#   cargo run --release --features wgpu,llamacpp,llamacpp-vulkan   (Vulkan offload, AMD or NVIDIA)
+#   cargo run --release --features cuda,llamacpp,llamacpp-cuda     (NVIDIA CUDA offload)
 
 # 5. Start the Coordinator locally
 # In the original python terminal:
-cd coordinator
-uvicorn main:app --host 0.0.0.0 --port 8000
+# From the repo root (module path matters — cd coordinator breaks imports):
+uvicorn coordinator.main:app --host 0.0.0.0 --port 8000
 
 # 6. Run your first inference (Model will auto-download and load)
 curl -X POST http://localhost:8000/v1/completions \
@@ -268,19 +267,78 @@ curl -X POST http://localhost:8000/v1/completions \
 
 ## Supported Models
 
-AI Cluster supports a wide range of popular models:
+AI Cluster runs models through two inference engines: **llama.cpp/GGUF**
+(recommended — quantized, runs on consumer NVIDIA + AMD GPUs) and
+**Burn/safetensors** (experimental FP32 reference engine, single GPU per
+worker).
 
-| Model Family | Sizes | Status | Quantization |
-|--------------|-------|--------|--------------|
-| **DeepSeek** | 7B, 67B | ✅ Implemented | FP16, INT8, INT4 |
-| **Llama 3** | 8B, 70B | ✅ Implemented | FP16, INT8, INT4 |
-| **Mistral** | 7B | ✅ Implemented | FP16, INT8 |
-| **Mixtral** | 8x7B | 🔲 Planned | INT8, INT4 |
-| **Gemma** | 2B, 7B | 🔲 Planned | FP16, INT8 |
-| **Phi** | 2, 3-mini | 🔲 Planned | FP16 |
-| **Qwen** | 7B, 14B | 🔲 Planned | FP16, INT8 |
+### GGUF models via llama.cpp (recommended)
 
-### Adding Custom Models
+This is the recommended way to run models on consumer-grade GPUs (~8-16 GB
+VRAM): weights are loaded **quantized** (Q4_K_M, Q5_K_M, Q8_0, …) so larger
+models fit in limited VRAM, and inference runs on both NVIDIA (CUDA/Vulkan)
+and AMD (ROCm/Vulkan). It's opt-in — build the worker with `--features
+llamacpp` (see [Adding a GGUF model](#adding-a-gguf-model-llamacpp-engine-recommended)
+below). Splitting one GGUF model across several consumer GPUs is on the
+worker roadmap; today one GGUF model loads per worker process.
+
+| Model | Status | Notes |
+|-------|--------|-------|
+| **Any GGUF checkpoint** (e.g. Qwen2.5, Llama 3.1, Qwen2.5-Coder, …) | ✅ Implemented (opt-in: build worker with `--features llamacpp` [+ `llamacpp-vulkan`/`llamacpp-cuda`]) | Native quantization: Q4_K_M, Q5_K_M, Q8_0, …; NVIDIA + AMD; multi-GPU split upcoming |
+
+### Burn / safetensors models (experimental FP32 reference)
+
+The Burn engine is the **default** cargo build feature (`--features
+wgpu|cuda|rocm`) and serves as the experimental / reference path: it loads
+full-precision **FP32** safetensors weights — it does not quantize (non-`none`
+quantization requests are rejected) — and runs a model on a **single GPU** per
+worker. Tensor/pipeline parallelism exist in `worker/src/parallelism.rs` but
+are not yet wired to inference.
+
+| Model Family | Sizes | Status | Notes |
+|--------------|-------|--------|-------|
+| **Llama 3** | 8B, 70B | ✅ Implemented | reference architecture |
+| **Qwen 2.5 Coder** | 32B | ✅ Implemented | GQA + RoPE + SwiGLU (Qwen3 not yet supported) |
+| **DeepSeek (dense)** | 7B, 67B | ✅ Implemented | loads via the Llama-layout path |
+| **DeepSeek (MoE/V3)** | 671B | 🔶 Model code present | V3 routing (sigmoid/MLA) not implemented |
+| **Mistral** | 7B | 🔶 Model code present, not wired to loader | no TextGeneration/tokenizer/KV cache yet |
+| **Mixtral** | 8x7B | 🔲 Planned | |
+| **Gemma** | 2B, 7B | 🔲 Planned | |
+| **Phi** | 2, 3-mini | 🔲 Planned | |
+
+### Adding a GGUF model (llama.cpp engine, recommended)
+
+```toml
+# config/models.toml — no architecture block needed (read from GGUF metadata)
+[models."qwen2.5-0.5b-gguf"]
+family = "qwen"
+parameters = "0.5B"
+min_memory_gb = 1
+engine = "llamacpp"
+
+[models."qwen2.5-0.5b-gguf".gguf]
+repo_id = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+file = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+n_gpu_layers = -1  # -1 = all layers on GPU
+n_ctx = 4096
+```
+
+The worker must be built with the engine enabled: `cargo build --release --features wgpu,llamacpp` (add `llamacpp-vulkan` or `llamacpp-cuda` for GPU offload), or `docker build -f docker/Dockerfile.worker --build-arg WORKER_FEATURES="llamacpp,llamacpp-vulkan" .`. Then load and run it like any other model:
+
+```bash
+curl -X POST http://localhost:8000/v1/models/load \
+  -d '{"model_name": "qwen2.5-0.5b-gguf"}'
+
+curl -X POST http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen2.5-0.5b-gguf",
+    "prompt": "Hello, how are you?",
+    "max_tokens": 50
+  }'
+```
+
+### Adding a Burn/safetensors model (reference engine)
 
 ```python
 # 1. Convert your model
@@ -341,7 +399,8 @@ Once fully implemented, these optimizations are projected to provide the followi
 - **Paged KV Cache**: 50-70% memory reduction
 - **Flash Attention**: 2-4x faster attention
 - **Speculative Decoding**: 2-3x faster generation
-- **Quantization**: 75% memory reduction with INT8 (Currently available)
+
+**Quantization** isn't on this roadmap list — it's available **today**, but only via the **llama.cpp/GGUF engine** (Q4_K_M, Q5_K_M, Q8_0, …; opt-in `--features llamacpp`), which typically cuts memory ~50-75% vs. full precision depending on the quant level. The default Burn/safetensors path still loads weights as FP32 and rejects non-`none` quantization requests (see [Features](#features)).
 
 ---
 
@@ -350,70 +409,39 @@ Once fully implemented, these optimizations are projected to provide the followi
 ### 1. **Chat Applications**
 
 ```python
-from ai_cluster import Client
+import requests
 
-client = Client("http://localhost:8000", api_key="sk-...")
-
-# Streaming chat
 messages = []
 while True:
     user_input = input("You: ")
     messages.append({"role": "user", "content": user_input})
-    
-    response = client.chat_completion(
-        model="llama3-8b",
-        messages=messages,
-        stream=True
+    r = requests.post(
+        "http://localhost:8000/v1/chat/completions",
+        json={"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0", "messages": messages},
+        timeout=300,
     )
-    
-    for chunk in response:
-        print(chunk.content, end="", flush=True)
-    print()
+    content = r.json()["choices"][0]["message"]["content"]
+    messages.append({"role": "assistant", "content": content})
+    print(f"Assistant: {content}")
 ```
 
-### 2. **Batch Processing**
+### 2. **Scripted Batch Processing**
 
 ```python
-import pandas as pd
-from ai_cluster import Client
+import requests
 
-client = Client("http://localhost:8000")
-
-# Load dataset
-df = pd.read_csv("reviews.csv")
-
-# Process in batch
-results = client.batch_complete(
-    model="deepseek-7b",
-    prompts=df["text"].tolist(),
-    max_tokens=50
-)
-
-df["summary"] = [r.text for r in results]
-df.to_csv("reviews_processed.csv")
+prompts = ["Summarize: ...", "Translate: ..."]
+results = [
+    requests.post(
+        "http://localhost:8000/v1/completions",
+        json={"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0", "prompt": p, "max_tokens": 64},
+        timeout=300,
+    ).json()["text"]
+    for p in prompts
+]
 ```
 
-### 3. **RAG Pipeline**
-
-```python
-from ai_cluster import Client
-from sentence_transformers import SentenceTransformer
-
-client = Client("http://localhost:8000")
-encoder = SentenceTransformer('all-MiniLM-L6-v2')
-
-# Retrieve relevant documents
-query = "What is machine learning?"
-query_embedding = encoder.encode(query)
-docs = vector_db.search(query_embedding, k=5)
-
-# Generate answer with context
-response = client.complete(
-    model="llama3-8b",
-    prompt=f"Context: {docs}\n\nQuestion: {query}\n\nAnswer:",
-    max_tokens=200
-)
-```
+> A dedicated `ai_cluster` client SDK (Python/JS) is planned — today the API is plain HTTP.
 
 ---
 
@@ -422,8 +450,8 @@ response = client.complete(
 ### 1. **Multi-Agent Systems (Agent per GPU)**
 
 You can assign specific models to specific workers to create specialized agents.
-- **Worker 1 (AMD)**: Loads `llama-3-8b` for Coding tasks.
-- **Worker 2 (NVIDIA)**: Loads `mistral-7b` for Reasoning/Review tasks.
+- **Worker 1 (AMD)**: Loads `llama3-8b` for Coding tasks.
+- **Worker 2 (NVIDIA)**: Loads `qwen3-coder-32b` for Reasoning/Review tasks.
 
 **Configuration**:
 No special config needed. Just route your load requests:
@@ -431,12 +459,12 @@ No special config needed. Just route your load requests:
 # Load Coding Agent on AMD Worker
 curl -X POST http://localhost:8000/v1/models/load \
   -H "Content-Type: application/json" \
-  -d '{"model_name": "llama3-8b", "worker_id": "amd-gpu-0"}'
+  -d '{"model_name": "llama3-8b", "worker_id": "<id from GET /v1/workers>"}'
 
 # Load Reasoning Agent on NVIDIA Worker
 curl -X POST http://localhost:8000/v1/models/load \
   -H "Content-Type: application/json" \
-  -d '{"model_name": "mistral-7b", "worker_id": "nvidia-gpu-0"}'
+  -d '{"model_name": "qwen3-coder-32b", "worker_id": "<id from GET /v1/workers>"}'
 ```
 
 ### 2. **Running Large Models (Future Optimization)**
@@ -495,8 +523,8 @@ cd ..
 mkdir -p models
 
 # Start coordinator
-cd coordinator
-uvicorn main:app --host 0.0.0.0 --port 8000
+# From the repo root (module path matters — cd coordinator breaks imports):
+uvicorn coordinator.main:app --host 0.0.0.0 --port 8000
 
 # In another terminal, start worker
 cd worker
@@ -516,22 +544,10 @@ docker-compose logs -f
 docker-compose down
 ```
 
-### Method 3: Kubernetes
+### Method 3: Kubernetes (planned)
 
-```bash
-# Create namespace
-kubectl create namespace ai-cluster
-
-# Apply configurations
-kubectl apply -f k8s/namespace.yaml
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/storage.yaml
-kubectl apply -f k8s/coordinator.yaml
-kubectl apply -f k8s/worker.yaml
-
-# Check status
-kubectl get pods -n ai-cluster -w
-```
+Kubernetes manifests are not shipped yet. Deploy with Docker Compose (Method 2)
+or run the services natively. K8s manifests/Helm are tracked on the roadmap.
 
 For detailed installation instructions, see the [Deployment Guide](docs/deployment.md).
 
@@ -539,38 +555,29 @@ For detailed installation instructions, see the [Deployment Guide](docs/deployme
 
 ## Configuration
 
-### Minimal Coordinator Configuration
+### Coordinator Configuration (environment variables)
 
-```yaml
-# config/coordinator.yaml
-server:
-  host: "0.0.0.0"
-  port: 8000
+The coordinator is configured exclusively via `COORDINATOR_*` environment
+variables (or `.env`). Key settings:
 
-discovery:
-  method: "static"
-  static_workers:
-    - "localhost:50051"
-
-models:
-  cache_dir: "/data/models"
+```bash
+COORDINATOR_HOST=0.0.0.0
+COORDINATOR_PORT=8000
+COORDINATOR_DISCOVERY_METHOD=static          # static only today (mdns/consul planned)
+COORDINATOR_STATIC_WORKERS=localhost:50051   # comma-separated host:port list
+COORDINATOR_ROUTING_STRATEGY=least_load      # least_load|round_robin|random|affinity|power_of_two
 ```
+
+See the [Configuration Guide](docs/configuration.md) for the full table.
 
 ### Minimal Worker Configuration
 
 ```toml
-# config/worker.toml
-[worker]
-id = "worker-1"
-
-[grpc]
-port = 50051
-
-[gpu]
-device_ids = [0]
-
-[model_loader]
-cache_dir = "/data/models"
+# config/worker.toml — FLAT schema (unknown keys are rejected)
+grpc_port = 50051
+metrics_port = 9091
+gpu_ids = [0]
+model_cache_dir = "./models"
 ```
 
 For complete configuration options, see the [Configuration Guide](docs/configuration.md).
@@ -585,11 +592,12 @@ For complete configuration options, see the [Configuration Guide](docs/configura
 |--------|----------|-------------|
 | GET | `/health` | Health check |
 | GET | `/v1/workers` | List workers |
-| GET | `/v1/models` | List models |
+| POST | `/v1/workers/manual` | Manually register worker addresses |
+| GET | `/v1/models` | List models (OpenAI-style list) |
 | POST | `/v1/models/load` | Load a model |
 | DELETE | `/v1/models/{name}` | Unload a model |
-| POST | `/v1/completions` | Generate text |
-| POST | `/v1/completions/batch` | Batch inference |
+| POST | `/v1/completions` | Generate text (buffered) |
+| POST | `/v1/chat/completions` | OpenAI-compatible chat (supports SSE streaming) |
 | GET | `/metrics` | Prometheus metrics |
 
 ### Example: Text Completion
@@ -608,17 +616,11 @@ curl -X POST http://localhost:8000/v1/completions \
 Response:
 ```json
 {
-  "id": "cmpl-123456",
-  "choices": [{
-    "text": " in a faraway land, there lived a brave knight...",
-    "tokens_generated": 50,
-    "finish_reason": "stop"
-  }],
-  "usage": {
-    "prompt_tokens": 4,
-    "completion_tokens": 50,
-    "total_tokens": 54
-  }
+  "request_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "text": " in a faraway land, there lived a brave knight...",
+  "tokens_generated": 50,
+  "processing_time_ms": 2140.5,
+  "worker_id": "worker-0"
 }
 ```
 
@@ -646,24 +648,14 @@ worker_gpu_utilization_percent{worker="worker-gpu-0",gpu="0"} 75.2
 
 ### Grafana Dashboards
 
-Pre-built dashboards are available in `monitoring/grafana-dashboards/`:
+Provisioning ships in `monitoring/`: the Prometheus datasource plus an
+**AI Cluster Overview** dashboard (request rate, P95 latency, GPU
+utilization/temperature, coordinator backlog). Grafana: http://localhost:3000
+(admin / $GRAFANA_ADMIN_PASSWORD).
 
-- **Cluster Overview**: Worker health, request rates, latency
-- **GPU Details**: Utilization, memory, temperature, power
-- **Model Performance**: Load times, cache hit rates, token throughput
-- **Resource Usage**: CPU, memory, disk, network
+### Distributed Tracing (planned)
 
-### Distributed Tracing with Jaeger
-
-```bash
-# Access Jaeger UI
-open http://localhost:16686
-
-# View traces for specific operations
-# - model_load
-# - inference
-# - worker_communication
-```
+Jaeger integration is on the roadmap — no tracing ships today.
 
 ---
 
@@ -682,12 +674,9 @@ cd ai-cluster
 pip install pre-commit
 pre-commit install
 
-# Run tests
-pytest tests/
-cd worker && cargo test
-
-# Build documentation
-cd docs && mkdocs build
+# Run tests (unit suite lives under coordinator/)
+pytest coordinator/
+cd worker && cargo test --features wgpu
 ```
 
 ### Development Workflow

@@ -1,0 +1,52 @@
+{
+  "uid": "ai-cluster-overview",
+  "title": "AI Cluster Overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Inference request rate (worker)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sum(rate(worker_requests_total[5m]))", "legendFormat": "requests/s", "refId": "A" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "P95 inference latency",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(worker_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95 seconds",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "GPU utilization / temperature",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "worker_gpu_utilization_percent", "legendFormat": "util % gpu{{gpu}}", "refId": "A" },
+        { "expr": "worker_gpu_temperature_celsius", "legendFormat": "temp °C gpu{{gpu}}", "refId": "B" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Coordinator active requests / tokens rate",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "coordinator_active_requests", "legendFormat": "active requests", "refId": "A" },
+        { "expr": "sum(rate(worker_tokens_generated_total[5m]))", "legendFormat": "tokens/s", "refId": "B" }
+      ]
+    }
+  ]
+}

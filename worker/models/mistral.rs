@@ -5,13 +5,13 @@
 
 #![allow(dead_code)]
 
+use super::common::{swiglu, RMSNorm, RotaryEmbedding};
+use super::ModelConfig;
 use burn::{
-    module::{Module, Ignored},
-    nn::{Linear, LinearConfig, Embedding, EmbeddingConfig},
+    module::{Ignored, Module},
+    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig},
     tensor::{backend::Backend, Tensor},
 };
-use super::ModelConfig;
-use super::common::{RMSNorm, RotaryEmbedding, swiglu};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -71,6 +71,8 @@ impl MistralConfig {
             intermediate_size: self.intermediate_size,
             rms_norm_eps: self.rms_norm_eps,
             rope_theta: self.rope_theta,
+            head_dim: None,
+            attention_bias: false,
             is_moe: false,
             num_experts: None,
             num_experts_per_tok: None,
@@ -106,10 +108,18 @@ impl<B: Backend> MistralAttention<B> {
         let kv_out = config.num_kv_heads * config.head_dim;
 
         Self {
-            q_proj: LinearConfig::new(hidden, q_out).with_bias(false).init(device),
-            k_proj: LinearConfig::new(hidden, kv_out).with_bias(false).init(device),
-            v_proj: LinearConfig::new(hidden, kv_out).with_bias(false).init(device),
-            o_proj: LinearConfig::new(q_out, hidden).with_bias(false).init(device),
+            q_proj: LinearConfig::new(hidden, q_out)
+                .with_bias(false)
+                .init(device),
+            k_proj: LinearConfig::new(hidden, kv_out)
+                .with_bias(false)
+                .init(device),
+            v_proj: LinearConfig::new(hidden, kv_out)
+                .with_bias(false)
+                .init(device),
+            o_proj: LinearConfig::new(q_out, hidden)
+                .with_bias(false)
+                .init(device),
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
@@ -126,13 +136,19 @@ impl<B: Backend> MistralAttention<B> {
         let [batch, seq_len, _hidden] = x.dims();
 
         // Project Q, K, V
-        let q = self.q_proj.forward(x.clone())
+        let q = self
+            .q_proj
+            .forward(x.clone())
             .reshape([batch, seq_len, self.num_heads, self.head_dim])
             .swap_dims(1, 2);
-        let k = self.k_proj.forward(x.clone())
+        let k = self
+            .k_proj
+            .forward(x.clone())
             .reshape([batch, seq_len, self.num_kv_heads, self.head_dim])
             .swap_dims(1, 2);
-        let v = self.v_proj.forward(x)
+        let v = self
+            .v_proj
+            .forward(x)
             .reshape([batch, seq_len, self.num_kv_heads, self.head_dim])
             .swap_dims(1, 2);
 
@@ -170,10 +186,11 @@ impl<B: Backend> MistralAttention<B> {
 
         let attn_weights = burn::tensor::activation::softmax(attn_weights, 3);
 
-        let attn_output = attn_weights
-            .matmul(v)
-            .swap_dims(1, 2)
-            .reshape([batch, seq_len, self.num_heads * self.head_dim]);
+        let attn_output = attn_weights.matmul(v).swap_dims(1, 2).reshape([
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ]);
 
         self.o_proj.forward(attn_output)
     }
@@ -197,9 +214,15 @@ impl<B: Backend> MistralMLP<B> {
         let inter = config.intermediate_size;
 
         Self {
-            gate_proj: LinearConfig::new(hidden, inter).with_bias(false).init(device),
-            up_proj: LinearConfig::new(hidden, inter).with_bias(false).init(device),
-            down_proj: LinearConfig::new(inter, hidden).with_bias(false).init(device),
+            gate_proj: LinearConfig::new(hidden, inter)
+                .with_bias(false)
+                .init(device),
+            up_proj: LinearConfig::new(hidden, inter)
+                .with_bias(false)
+                .init(device),
+            down_proj: LinearConfig::new(inter, hidden)
+                .with_bias(false)
+                .init(device),
         }
     }
 
@@ -228,11 +251,7 @@ impl<B: Backend> MistralLayer<B> {
         Self {
             attention: MistralAttention::new(config, device),
             mlp: MistralMLP::new(config, device),
-            input_layernorm: RMSNorm::new(
-                config.hidden_size,
-                config.rms_norm_eps as f64,
-                device,
-            ),
+            input_layernorm: RMSNorm::new(config.hidden_size, config.rms_norm_eps as f64, device),
             post_attention_layernorm: RMSNorm::new(
                 config.hidden_size,
                 config.rms_norm_eps as f64,
@@ -292,8 +311,7 @@ impl<B: Backend> Mistral<B> {
         );
 
         Self {
-            embed_tokens: EmbeddingConfig::new(config.vocab_size, config.hidden_size)
-                .init(device),
+            embed_tokens: EmbeddingConfig::new(config.vocab_size, config.hidden_size).init(device),
             layers,
             norm: RMSNorm::new(config.hidden_size, config.rms_norm_eps as f64, device),
             lm_head: LinearConfig::new(config.hidden_size, config.vocab_size)
@@ -306,11 +324,14 @@ impl<B: Backend> Mistral<B> {
     }
 
     /// Forward pass returning logits tensor.
-    pub fn forward_pass(
-        &self,
-        input_ids: Tensor<B, 2>,
-        start_pos: usize,
-    ) -> Tensor<B, 3> {
+    pub fn forward_pass(&self, input_ids: Tensor<B, 2>, start_pos: usize) -> Tensor<B, 3> {
+        // The sliding-window mask below indexes chunk-local (i, j) while RoPE uses
+        // absolute start_pos — only a full-prompt (start_pos == 0) pass is correct.
+        assert_eq!(
+            start_pos, 0,
+            "Mistral::forward_pass only supports start_pos == 0 (no chunked prefill)"
+        );
+
         // Token embeddings: [batch, seq] -> [batch, seq, hidden]
         let mut x = self.embed_tokens.forward(input_ids.int());
 
@@ -328,15 +349,18 @@ impl<B: Backend> Mistral<B> {
     pub fn memory_usage(&self) -> usize {
         let c = &self.config;
         let embed_params = c.vocab_size * c.hidden_size;
-        let attn_params = c.num_layers * (
-            4 * c.hidden_size * c.hidden_size  // q, k, v, o projections
-        );
-        let ffn_params = c.num_layers * (
-            3 * c.hidden_size * c.intermediate_size  // gate, up, down
-        );
+        let attn_params = c.num_layers
+            * (
+                4 * c.hidden_size * c.hidden_size
+                // q, k, v, o projections
+            );
+        let ffn_params = c.num_layers
+            * (
+                3 * c.hidden_size * c.intermediate_size
+                // gate, up, down
+            );
         let norm_params = (c.num_layers * 2 + 1) * c.hidden_size;
         let total_params = embed_params + attn_params + ffn_params + norm_params;
-        total_params * 2  // FP16 = 2 bytes per param
+        total_params * 2 // FP16 = 2 bytes per param
     }
 }
-

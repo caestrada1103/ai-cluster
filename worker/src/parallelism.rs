@@ -54,7 +54,7 @@ use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 
 use crate::models::common::repeat_kv;
-use crate::models::llama::{Llama, KvEntry};
+use crate::models::llama::{KvEntry, Llama};
 
 // ---------------------------------------------------------------------------
 // TP-distributed KV cache
@@ -87,7 +87,10 @@ pub struct LocalAllReduce;
 
 impl<B: Backend> AllReduce<B> for LocalAllReduce {
     fn sum(&self, partials: Vec<Tensor<B, 2>>) -> Tensor<B, 2> {
-        assert!(!partials.is_empty(), "LocalAllReduce::sum: called with zero partials");
+        assert!(
+            !partials.is_empty(),
+            "LocalAllReduce::sum: called with zero partials"
+        );
         partials.into_iter().reduce(|a, b| a + b).unwrap()
     }
 }
@@ -110,7 +113,6 @@ pub enum ParallelStrategy {
     /// Expert parallelism (Mixture-of-Experts routing across devices)
     ExpertParallel,
 }
-
 
 // Helpers
 // ---------------------------------------------------------------------------
@@ -144,10 +146,7 @@ fn build_causal_bias<B: Backend>(seq_len: usize, device: &B::Device) -> Option<T
             data[i * seq_len + j] = 0.0;
         }
     }
-    Some(
-        Tensor::<B, 1>::from_floats(data.as_slice(), device)
-            .reshape([1, 1, seq_len, seq_len]),
-    )
+    Some(Tensor::<B, 1>::from_floats(data.as_slice(), device).reshape([1, 1, seq_len, seq_len]))
 }
 
 /// Run the sharded MLP (SwiGLU) for one layer, returning the all-reduced
@@ -170,10 +169,16 @@ fn tp_mlp_forward<B: Backend>(
     for shard in 0..num_shards {
         let start = shard * inter_per_shard;
         let end = ((shard + 1) * inter_per_shard).min(inter);
-        if start >= inter { break; }
+        if start >= inter {
+            break;
+        }
 
-        let gate = h2_flat.clone().matmul(gate_w.clone().slice([0..hidden, start..end]));
-        let up = h2_flat.clone().matmul(up_w.clone().slice([0..hidden, start..end]));
+        let gate = h2_flat
+            .clone()
+            .matmul(gate_w.clone().slice([0..hidden, start..end]));
+        let up = h2_flat
+            .clone()
+            .matmul(up_w.clone().slice([0..hidden, start..end]));
 
         let silu = gate.clone() * (gate.neg().exp().add_scalar(1.0).recip());
         let activated = silu * up;
@@ -241,17 +246,20 @@ pub fn tensor_parallel_llama_forward<B: Backend>(
             let kv_s = shard * kv_per_shard * head_dim;
             let kv_e = kv_s + kv_per_shard * head_dim;
 
-            let q = h_flat.clone()
+            let q = h_flat
+                .clone()
                 .matmul(q_w.clone().slice([0..hidden, q_s..q_e]))
                 .reshape([batch, seq_len, q_per_shard, head_dim])
                 .swap_dims(1, 2);
 
-            let k = h_flat.clone()
+            let k = h_flat
+                .clone()
                 .matmul(k_w.clone().slice([0..hidden, kv_s..kv_e]))
                 .reshape([batch, seq_len, kv_per_shard, head_dim])
                 .swap_dims(1, 2);
 
-            let v = h_flat.clone()
+            let v = h_flat
+                .clone()
                 .matmul(v_w.clone().slice([0..hidden, kv_s..kv_e]))
                 .reshape([batch, seq_len, kv_per_shard, head_dim])
                 .swap_dims(1, 2);
@@ -268,7 +276,8 @@ pub fn tensor_parallel_llama_forward<B: Backend>(
             };
             let attn = burn::tensor::activation::softmax(scores, 3);
 
-            let ctx = attn.matmul(v)
+            let ctx = attn
+                .matmul(v)
                 .swap_dims(1, 2)
                 .reshape([batch * seq_len, q_per_shard * head_dim]);
 
@@ -292,8 +301,14 @@ pub fn tensor_parallel_llama_forward<B: Backend>(
             layer.mlp.gate_proj.weight.val(),
             layer.mlp.up_proj.weight.val(),
             layer.mlp.down_proj.weight.val(),
-            hidden, inter, num_shards, inter_per_shard, &device, batch * seq_len,
-        ).reshape([batch, seq_len, hidden]);
+            hidden,
+            inter,
+            num_shards,
+            inter_per_shard,
+            &device,
+            batch * seq_len,
+        )
+        .reshape([batch, seq_len, hidden]);
 
         x = mlp_out + attn_out;
     }
@@ -356,17 +371,20 @@ pub fn tensor_parallel_llama_prefill<B: Backend>(
             let kv_s = shard * kv_per_shard * head_dim;
             let kv_e = kv_s + kv_per_shard * head_dim;
 
-            let q = h_flat.clone()
+            let q = h_flat
+                .clone()
                 .matmul(q_w.clone().slice([0..hidden, q_s..q_e]))
                 .reshape([batch, seq_len, q_per_shard, head_dim])
                 .swap_dims(1, 2);
 
-            let k = h_flat.clone()
+            let k = h_flat
+                .clone()
                 .matmul(k_w.clone().slice([0..hidden, kv_s..kv_e]))
                 .reshape([batch, seq_len, kv_per_shard, head_dim])
                 .swap_dims(1, 2);
 
-            let v = h_flat.clone()
+            let v = h_flat
+                .clone()
                 .matmul(v_w.clone().slice([0..hidden, kv_s..kv_e]))
                 .reshape([batch, seq_len, kv_per_shard, head_dim])
                 .swap_dims(1, 2);
@@ -387,7 +405,8 @@ pub fn tensor_parallel_llama_prefill<B: Backend>(
             };
             let attn = burn::tensor::activation::softmax(scores, 3);
 
-            let ctx = attn.matmul(v)
+            let ctx = attn
+                .matmul(v)
                 .swap_dims(1, 2)
                 .reshape([batch * seq_len, q_per_shard * head_dim]);
 
@@ -413,8 +432,14 @@ pub fn tensor_parallel_llama_prefill<B: Backend>(
             layer.mlp.gate_proj.weight.val(),
             layer.mlp.up_proj.weight.val(),
             layer.mlp.down_proj.weight.val(),
-            hidden, inter, num_shards, inter_per_shard, &device, batch * seq_len,
-        ).reshape([batch, seq_len, hidden]);
+            hidden,
+            inter,
+            num_shards,
+            inter_per_shard,
+            &device,
+            batch * seq_len,
+        )
+        .reshape([batch, seq_len, hidden]);
 
         x = mlp_out + attn_out;
     }
@@ -458,8 +483,7 @@ pub fn tensor_parallel_llama_decode_step<B: Backend>(
     let inter_per_shard = inter.div_ceil(num_shards);
     let global_n_rep = (config.num_attention_heads / config.num_kv_heads).max(1);
 
-    let input = Tensor::<B, 1>::from_floats([token_id as f32], device)
-        .reshape([1, 1]);
+    let input = Tensor::<B, 1>::from_floats([token_id as f32], device).reshape([1, 1]);
     let mut x = model.embed_tokens.forward(input.int()); // [1, 1, hidden]
 
     for (layer_idx, layer) in model.layers.iter().enumerate() {
@@ -480,17 +504,20 @@ pub fn tensor_parallel_llama_decode_step<B: Backend>(
             let kv_e = kv_s + kv_per_shard * head_dim;
 
             // Column-parallel Q/K/V for single token
-            let q = h_flat.clone()
+            let q = h_flat
+                .clone()
                 .matmul(q_w.clone().slice([0..hidden, q_s..q_e]))
                 .reshape([1, 1, q_per_shard, head_dim])
                 .swap_dims(1, 2); // [1, q_per_shard, 1, head_dim]
 
-            let new_k = h_flat.clone()
+            let new_k = h_flat
+                .clone()
                 .matmul(k_w.clone().slice([0..hidden, kv_s..kv_e]))
                 .reshape([1, 1, kv_per_shard, head_dim])
                 .swap_dims(1, 2);
 
-            let new_v = h_flat.clone()
+            let new_v = h_flat
+                .clone()
                 .matmul(v_w.clone().slice([0..hidden, kv_s..kv_e]))
                 .reshape([1, 1, kv_per_shard, head_dim])
                 .swap_dims(1, 2);
@@ -510,10 +537,10 @@ pub fn tensor_parallel_llama_decode_step<B: Backend>(
 
             // Attention — single query, no causal mask needed
             let scale = (head_dim as f64).sqrt();
-            let attn = burn::tensor::activation::softmax(
-                q.matmul(k.swap_dims(2, 3)).div_scalar(scale), 3,
-            );
-            let ctx = attn.matmul(v)
+            let attn =
+                burn::tensor::activation::softmax(q.matmul(k.swap_dims(2, 3)).div_scalar(scale), 3);
+            let ctx = attn
+                .matmul(v)
                 .swap_dims(1, 2)
                 .reshape([1, q_per_shard * head_dim]); // [1, q_shard_dim]
 
@@ -539,15 +566,25 @@ pub fn tensor_parallel_llama_decode_step<B: Backend>(
             layer.mlp.gate_proj.weight.val(),
             layer.mlp.up_proj.weight.val(),
             layer.mlp.down_proj.weight.val(),
-            hidden, inter, num_shards, inter_per_shard, device, 1,
-        ).reshape([1, 1, hidden]);
+            hidden,
+            inter,
+            num_shards,
+            inter_per_shard,
+            device,
+            1,
+        )
+        .reshape([1, 1, hidden]);
 
         x = mlp_out + attn_out;
     }
 
     let x = model.norm.forward(x);
     let logits = model.lm_head.forward(x);
-    logits.reshape([config.vocab_size]).into_data().to_vec().unwrap_or_default()
+    logits
+        .reshape([config.vocab_size])
+        .into_data()
+        .to_vec()
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -594,5 +631,3 @@ pub fn pipeline_parallel_llama_forward<B: Backend>(
     let x = model.norm.forward(x);
     model.lm_head.forward(x)
 }
-
-
