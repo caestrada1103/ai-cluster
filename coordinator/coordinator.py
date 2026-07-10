@@ -123,6 +123,11 @@ class ClusterCoordinator:
 
         # Locks for thread safety
         self._workers_lock = asyncio.Lock()
+        # Per-model single-flight locks for llamaserver auto-load (Plan 13 Task
+        # 5): concurrent proxied requests for the same unloaded model serialize
+        # here so exactly ONE load runs. Created lazily per model name; never
+        # evicted (bounded by the registry size).
+        self._autoload_locks: Dict[str, asyncio.Lock] = {}
 
         # Background tasks
         self._discovery_task: Optional["asyncio.Task[None]"] = None
@@ -387,13 +392,13 @@ class ClusterCoordinator:
     ) -> Optional[WorkerInfo]:
         """Return a healthy worker that ALREADY reports ``model_name`` loaded.
 
-        Used by the Plan 13 llamaserver proxy path (`coordinator/proxy.py`): the
+        Used by the Plan 13 llamaserver proxy path (`coordinator/api.py`): the
         coordinator forwards HTTP requests to the llama-server child process on
-        whichever worker already serves the model. Unlike the in-process path
-        there is no auto-load in Phase 1 — callers 404 when this returns None.
-        Prefers the router's strategy among the workers that hold the model,
-        falling back to the first such worker when the router declines every one
-        (e.g. all at capacity).
+        whichever worker already serves the model. Returns None when no healthy
+        worker holds the model — the caller then either auto-loads (Task 5) or
+        404s (auto-load disabled). Prefers the router's strategy among the
+        workers that hold the model, falling back to the first such worker when
+        the router declines every one (e.g. all at capacity).
         """
         async with self._workers_lock:
             holders = {
@@ -407,6 +412,89 @@ class ClusterCoordinator:
         if picked is not None:
             return picked
         return next(iter(holders.values()))
+
+    async def _pick_autoload_worker(
+        self, model_name: str, session_id: Optional[str] = None
+    ) -> Optional[WorkerInfo]:
+        """Pick a healthy worker to auto-load ``model_name`` onto (Plan 13 Task 5).
+
+        Prefers the router's strategy (least-load by default) across the HEALTHY
+        workers, using the model's real memory requirement for the fit check;
+        falls back to the first healthy worker when the router declines them all
+        (e.g. none report enough free VRAM yet the operator still wants the load
+        attempted — mirrors POST /models/load's unconditional "pick a worker").
+        Unlike /models/load's "first registered worker", auto-load restricts to
+        HEALTHY workers so it never spawns a llama-server on a still-connecting
+        or unhealthy node. Returns None only when no healthy worker exists.
+        """
+        async with self._workers_lock:
+            healthy = {wid: w for wid, w in self.workers.items() if w.state == WorkerState.HEALTHY}
+        if not healthy:
+            return None
+        picked = await self.router.pick_worker(healthy, model_name, session_id)
+        if picked is not None:
+            return picked
+        return next(iter(healthy.values()))
+
+    async def ensure_llamaserver_model_loaded(
+        self, model_name: str, session_id: Optional[str] = None
+    ) -> WorkerInfo:
+        """Ensure ``model_name`` is loaded on a healthy worker, loading on demand.
+
+        Plan 13 Task 5 auto-load. Reuses ``_load_model_on_worker`` — the exact
+        path ``POST /models/load`` drives — on a router-picked healthy worker.
+        Single-flight per model: concurrent callers serialize on a per-model
+        lock and RE-CHECK the loaded state after acquiring it, so exactly one
+        load runs even under a burst of requests for the same cold model. The
+        load itself is the only work done under the lock — the caller's proxy
+        call happens afterwards, lock released.
+
+        Returns the worker now serving the model. Raises ``RuntimeError`` when no
+        healthy worker is available or the load fails/ times out (the API layer
+        maps that to a 503).
+        """
+        # Fast path: already loaded somewhere (no lock — the common case).
+        worker = await self.find_worker_for_model(model_name, session_id)
+        if worker is not None:
+            return worker
+
+        lock = self._autoload_locks.setdefault(model_name, asyncio.Lock())
+        async with lock:
+            # Waiters re-check: a concurrent load may have finished while blocked.
+            worker = await self.find_worker_for_model(model_name, session_id)
+            if worker is not None:
+                return worker
+
+            target = await self._pick_autoload_worker(model_name, session_id)
+            if target is None:
+                raise RuntimeError(f"No healthy worker available to auto-load model '{model_name}'")
+
+            loaded = await self._load_model_on_worker(target, model_name)
+            if not loaded:
+                raise RuntimeError(f"Failed to load model '{model_name}' on worker {target.id}")
+
+            # Reflect the load immediately so waiters (and the next request
+            # arriving before the health loop refreshes GetStatus) see the model
+            # as loaded and don't trigger a second load. get_status() overwrites
+            # this with the worker's authoritative LoadedModelInfo on its next
+            # health tick.
+            target.loaded_models.setdefault(model_name, pb.LoadedModelInfo(model_name=model_name))
+            return target
+
+    async def loaded_llamaserver_models(self) -> List[str]:
+        """Distinct ``engine=="llamaserver"`` model names reported loaded on any
+        healthy worker (Plan 13 Task 6 — the ``/infill`` single-model fallback).
+        """
+        names: Set[str] = set()
+        async with self._workers_lock:
+            for worker in self.workers.values():
+                if worker.state != WorkerState.HEALTHY:
+                    continue
+                for name in worker.loaded_models:
+                    cfg = ModelRegistry.get_model(name)
+                    if cfg is not None and cfg.engine == "llamaserver":
+                        names.add(name)
+        return sorted(names)
 
     async def _execute_request(self, ctx: RequestContext, worker: WorkerInfo) -> None:
         """Execute a request on a worker."""

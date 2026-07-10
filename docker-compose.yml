@@ -84,6 +84,15 @@ services:
     ports:
       - "${GRPC_PORT:-50051}:${GRPC_PORT:-50051}"
       - "${METRICS_PORT:-9091}:${METRICS_PORT:-9091}"
+      # llama-server (Plan 13, engine="llamaserver") registry ports — one per
+      # llamaserver model in config/models.toml (8081 Devstral, 8082 Qwen3-Coder;
+      # coordinator-assigned, globally unique per model). The coordinator proxies
+      # agentic HTTP inference to worker_host:<port>. Within this compose network
+      # it reaches the worker as "worker:8081" without publishing; publish them (as
+      # below) only when the coordinator runs on ANOTHER host and must reach these
+      # over the LAN. Trusted-LAN only — firewall them (that hop is unauthenticated).
+      - "8081:8081"
+      - "8082:8082"
     logging: *default-logging
     depends_on:
       coordinator:
@@ -281,6 +290,13 @@ services:
   # (devices/group_add for AMD or deploy.resources.reservations.devices for NVIDIA),
   # (b) an entry in COORDINATOR_STATIC_WORKERS, e.g. ["worker-gpu-0:50051","worker-gpu-1:50052"],
   # (c) a matching target in config/prometheus.yml (workers job).
+  #
+  # NOTE for engine="llamaserver" (Plan 13): the alternate worker blocks above
+  # (NVIDIA/ROCm/CUDA) omit the llamaserver port publishes for brevity — copy the
+  # `- "8081:8081"` / `- "8082:8082"` lines from the default worker when swapping
+  # one in, if the coordinator is on another host. Those ports are per-MODEL and
+  # globally unique (not per-worker), so one publish covers whichever worker loads
+  # that model. See docs/deployment.md "llama-server for agentic serving".
 
   # Monitoring Stack
   prometheus:

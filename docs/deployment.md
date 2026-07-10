@@ -111,13 +111,92 @@ register at runtime: `curl -X POST localhost:8000/v1/workers/manual -H "Content-
 - Traffic is plaintext gRPC/HTTP — deploy on a trusted network or behind your own TLS proxy
   (built-in TLS/auth is planned, not implemented).
 
-## 4. Health checks
+## 4. llama-server for agentic serving (engine = "llamaserver")
+
+Models with `engine = "llamaserver"` in `config/models.toml` (the 16 GB AMD
+fleet's **Devstral Small 2 24B** and **Qwen3-Coder-30B-A3B**) are served
+differently from the in-process `llamacpp` engine: the worker spawns and
+**supervises one `llama-server` child process per such model**, and the
+coordinator **proxies** agentic HTTP inference (OpenAI/Anthropic tool calling,
+streaming `tool_calls`, `/v1/messages`) straight through to it. This is the only
+path that gets real tool calling — the in-process engine cannot do it.
+
+Unlike the in-process engine (compiled by cargo via `--features llamacpp`), the
+`llama-server` binary is **not** built by cargo. Each worker host needs it
+present, located via worker config `llamaserver_binary_path` (env
+`LLAMASERVER_BINARY_PATH` wins; default `llama-server` on `PATH`).
+
+### Docker (built in)
+
+The worker image bakes it in — nothing to do. `docker/Dockerfile.worker` builds
+only the `llama-server` target from a **pinned** llama.cpp release (Vulkan
+backend, statically linked) into `/usr/local/bin/llama-server` and sets
+`LLAMASERVER_BINARY_PATH`. The default universal image already ships the Vulkan
+loader (`libvulkan1` + `mesa-vulkan-drivers`), so it runs as-is. To build a
+pure-Burn / CPU-only image *without* the (heavy) llama.cpp compile, pass
+`--build-arg LLAMASERVER_SRC=llamaserver-none`.
+
+### Bare-metal Linux
+
+Build `llama-server` once from the same pinned tag, then point the worker at it:
+
+```bash
+# Build deps (Ubuntu 24.04; glslc + spirv-headers compile the Vulkan shaders;
+# libcurl is required by llama.cpp's default build unless you add -DLLAMA_CURL=OFF):
+sudo apt-get install -y build-essential cmake git libvulkan-dev glslc spirv-headers libcurl4-openssl-dev
+# Runtime deps (Vulkan loader + AMD/Intel Mesa drivers):
+sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+
+git clone --depth 1 --branch b9941 https://github.com/ggml-org/llama.cpp.git
+cd llama.cpp
+cmake -B build -DGGML_VULKAN=ON -DLLAMA_BUILD_SERVER=ON
+cmake --build build --target llama-server -j
+
+# Point the worker at the in-tree binary (simplest — keeps its shared libs):
+export LLAMASERVER_BINARY_PATH="$PWD/build/bin/llama-server"
+```
+
+- NVIDIA hosts can build with `-DGGML_CUDA=ON` instead for CUDA offload; the
+  Vulkan build above already covers AMD, NVIDIA, and Intel.
+- To relocate it to a single file on `PATH`, add `-DBUILD_SHARED_LIBS=OFF`
+  (the Docker image does this) so it links statically, then copy
+  `build/bin/llama-server` anywhere and drop the `LLAMASERVER_BINARY_PATH`
+  export.
+
+> **Minimum version — do not use a build older than mid-March 2026.** Builds
+> from around then had a tool-calling bug that corrupted the `arguments` of
+> streamed `tool_calls` (llama.cpp issue #20198, fixed in PR #20213). The pinned
+> tag **b9941** (released 2026-07-09) is well past the fix. If agents see
+> garbled tool-call arguments, your `llama-server` is too old — rebuild at the
+> pinned tag or newer.
+
+### Port reachability (coordinator → worker)
+
+Each llamaserver model listens on its own coordinator-assigned `llamaserver_port`
+(`config/models.toml`: **8081** Devstral, **8082** Qwen3-Coder). The worker binds
+`--host 0.0.0.0` (`llamaserver_bind_host`), and the coordinator proxies to
+`http://<worker_host>:<port>`. Those TCP ports must therefore be **reachable from
+the coordinator host** across the LAN:
+
+- **Docker:** publish them on the worker container — already done in
+  `docker-compose.yml` (`- "8081:8081"` / `- "8082:8082"`); copy the same lines
+  if you swap in a different worker service block. Within one compose network the
+  coordinator reaches the worker as `worker:8081` without publishing.
+- **Bare metal:** open the ports in the worker host's firewall to the coordinator.
+- **Trusted-LAN only:** that proxy hop is plaintext and unauthenticated — never
+  expose the llamaserver ports to an untrusted network (see Plan 15).
+
+### Windows
+
+Windows `llama-server` provisioning is deferred to **Plan 17**.
+
+## 5. Health checks
 
 - Coordinator: `GET /health` → `{"status": "healthy", "workers": N}` (always 200; `starting` before ready).
 - Worker (metrics port): `GET /health` → `OK`, `GET /live` → `ALIVE`.
 - There are no `/health/live|ready|startup` coordinator routes.
 
-## 5. Upgrades
+## 6. Upgrades
 
 ```bash
 git pull

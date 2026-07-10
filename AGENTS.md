@@ -107,7 +107,7 @@ Client (REST) → Coordinator (FastAPI) → Workers (Rust: llama.cpp + Burn) →
 
 **Configuration files** (`config/`):
 - `worker.toml` — flat worker settings (ports, gpu_ids, concurrency, HF token fallback, llamacpp thread/gpu-layer defaults; unknown keys rejected)
-- `models.toml` — Model registry: architectures, memory requirements, HuggingFace repo ids, per-model `engine` ("burn" | "llamacpp") + `[models.X.gguf]` source
+- `models.toml` — Model registry: architectures, memory requirements, HuggingFace repo ids, per-model `engine` ("burn" | "llamacpp" | "llamaserver") + `[models.X.gguf]` source (`llamaserver` = agentic tool calling via a worker-supervised `llama-server` child process the coordinator proxies to; needs the `llama-server` binary on the worker host — see docs/deployment.md)
 - `prometheus.yml` — Prometheus scrape targets
 - `alerts.yml` — Prometheus alert rules (written against the real metric names)
 (The coordinator has no config file — `COORDINATOR_*` env vars only.)
@@ -182,7 +182,7 @@ When generating commit messages use Conventional Commits format (`feat`/`fix`/`c
 This project uses Docker with NVIDIA GPU support and Vulkan. Dockerfiles must include appropriate NVIDIA base images (`nvidia/cuda`) and Vulkan SDK layers (`libvulkan-dev`, `mesa-vulkan-drivers`). Always refer to existing Dockerfiles for patterns before creating new ones.
 
 - `docker/Dockerfile.coordinator` — coordinator image (Python/FastAPI)
-- `docker/Dockerfile.worker` — ONE parameterized worker image: default wgpu/Vulkan; `--build-arg BACKEND=rocm|cuda` with matching `BUILDER_IMAGE`/`RUNTIME_IMAGE`/`*_EXTRA_PKGS` args for the vendor variants (see the file header and docker-compose.yml comments)
+- `docker/Dockerfile.worker` — ONE parameterized worker image: default wgpu/Vulkan; `--build-arg BACKEND=rocm|cuda` with matching `BUILDER_IMAGE`/`RUNTIME_IMAGE`/`*_EXTRA_PKGS` args for the vendor variants (see the file header and docker-compose.yml comments). Also bakes in a `llama-server` binary (Vulkan, from a pinned llama.cpp tag) for `engine = "llamaserver"` agentic models and sets `LLAMASERVER_BINARY_PATH`; opt out with `--build-arg LLAMASERVER_SRC=llamaserver-none`. See docs/deployment.md "llama-server for agentic serving".
 - AMD passthrough: mount `/dev/kfd` + `/dev/dri`, add `group_add: [video, render]`
 - NVIDIA passthrough: use `deploy.resources.reservations.devices` (NVIDIA Container Toolkit)
 - Intel GPU works out of the box with `Dockerfile.worker` via Mesa Intel ANV Vulkan driver

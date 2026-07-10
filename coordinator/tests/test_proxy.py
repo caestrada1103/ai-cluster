@@ -15,15 +15,18 @@ from typing import Any, AsyncIterator, Callable, Dict, List
 import httpx
 import pytest
 from fastapi import HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from coordinator import proxy
 from coordinator.api import (
     count_message_tokens,
     create_chat_completion,
+    create_embeddings,
+    create_infill,
     create_message,
 )
 from coordinator.models import ModelConfig, ModelFamily, ModelRegistry
+from coordinator.tests.conftest import make_settings
 
 _Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -240,8 +243,47 @@ def _fake_request(
 
 
 class _NoWorkerCoordinator:
+    """No worker holds the model AND auto-load is off — the 404 path."""
+
+    def __init__(self) -> None:
+        self.settings = SimpleNamespace(llamaserver_autoload=False)
+
     async def find_worker_for_model(self, name: str, session_id: Any = None) -> Any:
         return None
+
+
+class _AutoloadCoordinator:
+    """No worker holds the model; auto-load is on and succeeds (Task 5).
+
+    ``ensure_llamaserver_model_loaded`` records its call count and returns a
+    fixed worker so the api-level auto-load dispatch can be asserted without a
+    real ClusterCoordinator.
+    """
+
+    def __init__(self, address: str, autoload: bool = True) -> None:
+        self._address = address
+        self.settings = SimpleNamespace(llamaserver_autoload=autoload)
+        self.ensure_calls = 0
+
+    async def find_worker_for_model(self, name: str, session_id: Any = None) -> Any:
+        return None
+
+    async def ensure_llamaserver_model_loaded(self, name: str, session_id: Any = None) -> Any:
+        self.ensure_calls += 1
+        return SimpleNamespace(address=self._address, id="w-auto")
+
+
+class _AutoloadFailCoordinator:
+    """Auto-load is on but the load fails/ times out (Task 5 → 503)."""
+
+    def __init__(self, autoload: bool = True) -> None:
+        self.settings = SimpleNamespace(llamaserver_autoload=autoload)
+
+    async def find_worker_for_model(self, name: str, session_id: Any = None) -> Any:
+        return None
+
+    async def ensure_llamaserver_model_loaded(self, name: str, session_id: Any = None) -> Any:
+        raise RuntimeError("llama-server health check timed out")
 
 
 class _OneWorkerCoordinator:
@@ -253,7 +295,8 @@ class _OneWorkerCoordinator:
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_llamaserver_404_when_unloaded() -> None:
+async def test_chat_completions_llamaserver_404_when_unloaded_and_autoload_off() -> None:
+    # Auto-load disabled → Phase-1 behavior: 404 pointing at the load endpoint.
     _register_llamaserver_model()
     request = _fake_request(
         _NoWorkerCoordinator(),
@@ -378,3 +421,281 @@ async def test_count_tokens_never_streams(monkeypatch: Any) -> None:
 
     assert captured["stream"] is False
     assert captured["url"].endswith("/v1/messages/count_tokens")
+
+
+# ---------------------------------------------------------------------------
+# Task 5 — auto-load-on-demand (coordinator single-flight + api-level gate)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_autoload_single_flight_loads_once(monkeypatch: Any) -> None:
+    """Concurrent requests for the same cold model trigger EXACTLY ONE load."""
+    from unittest.mock import AsyncMock
+
+    from coordinator.coordinator import ClusterCoordinator, WorkerInfo, WorkerState
+
+    _register_llamaserver_model(name="agentic-sf", port=8300)
+    coord = ClusterCoordinator(make_settings())
+    worker = WorkerInfo(id="w1", address="10.0.0.1:50051", channel=AsyncMock(), stub=AsyncMock())
+    worker.state = WorkerState.HEALTHY
+    coord.workers["w1"] = worker
+
+    load_calls = 0
+
+    async def fake_load(w: Any, name: str, quantization: Any = None) -> bool:
+        nonlocal load_calls
+        load_calls += 1
+        # Hold the single-flight lock while the other callers pile up behind it.
+        await asyncio.sleep(0.05)
+        return True
+
+    monkeypatch.setattr(coord, "_load_model_on_worker", fake_load)
+
+    results = await asyncio.gather(
+        *[coord.ensure_llamaserver_model_loaded("agentic-sf") for _ in range(12)]
+    )
+
+    assert load_calls == 1  # single-flight: one load despite 12 concurrent callers
+    assert all(r is worker for r in results)
+    assert "agentic-sf" in worker.loaded_models  # load reflected for later requests
+
+
+@pytest.mark.asyncio
+async def test_autoload_no_healthy_worker_raises() -> None:
+    from coordinator.coordinator import ClusterCoordinator
+
+    _register_llamaserver_model(name="agentic-noworker", port=8301)
+    coord = ClusterCoordinator(make_settings())
+    with pytest.raises(RuntimeError, match="No healthy worker"):
+        await coord.ensure_llamaserver_model_loaded("agentic-noworker")
+
+
+@pytest.mark.asyncio
+async def test_autoload_load_failure_raises(monkeypatch: Any) -> None:
+    from unittest.mock import AsyncMock
+
+    from coordinator.coordinator import ClusterCoordinator, WorkerInfo, WorkerState
+
+    _register_llamaserver_model(name="agentic-loadfail", port=8302)
+    coord = ClusterCoordinator(make_settings())
+    worker = WorkerInfo(id="w1", address="10.0.0.1:50051", channel=AsyncMock(), stub=AsyncMock())
+    worker.state = WorkerState.HEALTHY
+    coord.workers["w1"] = worker
+
+    async def fake_load(w: Any, name: str, quantization: Any = None) -> bool:
+        return False
+
+    monkeypatch.setattr(coord, "_load_model_on_worker", fake_load)
+
+    with pytest.raises(RuntimeError, match="Failed to load"):
+        await coord.ensure_llamaserver_model_loaded("agentic-loadfail")
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_autoload_triggers_and_proxies(monkeypatch: Any) -> None:
+    """Auto-load on + model unloaded → load once, then proxy to that worker."""
+    _register_llamaserver_model(name="agentic-auto", port=8305)
+    captured: Dict[str, Any] = {}
+
+    async def fake_proxy_request(
+        method: str, url: str, body: bytes, headers: Dict[str, str], stream: bool
+    ) -> proxy.ProxyResponse:
+        captured.update(url=url, method=method)
+        return proxy.BufferedProxyResponse(200, {"content-type": "application/json"}, b"{}")
+
+    monkeypatch.setattr(proxy, "proxy_request", fake_proxy_request)
+
+    coord = _AutoloadCoordinator("192.168.1.77:50051", autoload=True)
+    request = _fake_request(
+        coord, {"model": "agentic-auto", "messages": []}, path="/v1/chat/completions"
+    )
+    response = await create_chat_completion(request)
+
+    assert isinstance(response, Response)
+    assert response.status_code == 200
+    assert coord.ensure_calls == 1
+    assert captured["url"] == "http://192.168.1.77:8305/v1/chat/completions"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_autoload_failure_returns_503() -> None:
+    _register_llamaserver_model(name="agentic-503", port=8306)
+    request = _fake_request(
+        _AutoloadFailCoordinator(autoload=True),
+        {"model": "agentic-503", "messages": []},
+        path="/v1/chat/completions",
+    )
+    with pytest.raises(HTTPException) as exc:
+        await create_chat_completion(request)
+    assert exc.value.status_code == 503
+    assert "health check timed out" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_loaded_llamaserver_models_filters_by_engine() -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    from coordinator.coordinator import ClusterCoordinator, WorkerInfo, WorkerState
+
+    _register_llamaserver_model(name="ls-loaded", port=8307)
+    coord = ClusterCoordinator(make_settings())
+    worker = WorkerInfo(id="w1", address="a:1", channel=AsyncMock(), stub=AsyncMock())
+    worker.state = WorkerState.HEALTHY
+    # ls-loaded is engine=llamaserver; deepseek-7b is a Burn model — filtered out.
+    worker.loaded_models = {"ls-loaded": MagicMock(), "deepseek-7b": MagicMock()}
+    coord.workers["w1"] = worker
+
+    assert await coord.loaded_llamaserver_models() == ["ls-loaded"]
+
+
+# ---------------------------------------------------------------------------
+# Task 6 — /v1/embeddings + /infill proxy
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_embeddings_proxies_buffered(monkeypatch: Any) -> None:
+    _register_llamaserver_model(name="embed-model", port=8310)
+    captured: Dict[str, Any] = {}
+
+    async def fake_proxy_request(
+        method: str, url: str, body: bytes, headers: Dict[str, str], stream: bool
+    ) -> proxy.ProxyResponse:
+        captured.update(url=url, stream=stream, body=body)
+        return proxy.BufferedProxyResponse(
+            200, {"content-type": "application/json"}, b'{"data":[]}'
+        )
+
+    monkeypatch.setattr(proxy, "proxy_request", fake_proxy_request)
+
+    body = {"model": "embed-model", "input": "hello"}
+    request = _fake_request(_OneWorkerCoordinator("10.0.0.2:50051"), body, path="/v1/embeddings")
+    response = await create_embeddings(request)
+
+    assert response.status_code == 200
+    assert captured["url"] == "http://10.0.0.2:8310/v1/embeddings"
+    assert captured["stream"] is False  # embeddings are never SSE
+    assert json.loads(captured["body"]) == body
+
+
+@pytest.mark.asyncio
+async def test_embeddings_501_for_non_llamaserver_engine() -> None:
+    # llama3-8b is a Burn-engine model in the default registry.
+    request = _fake_request(
+        SimpleNamespace(), {"model": "llama3-8b", "input": "x"}, path="/v1/embeddings"
+    )
+    with pytest.raises(HTTPException) as exc:
+        await create_embeddings(request)
+    assert exc.value.status_code == 501
+    assert "llamaserver" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_embeddings_404_for_unknown_model() -> None:
+    request = _fake_request(
+        SimpleNamespace(), {"model": "does-not-exist", "input": "x"}, path="/v1/embeddings"
+    )
+    with pytest.raises(HTTPException) as exc:
+        await create_embeddings(request)
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_infill_explicit_model_proxies_to_root_path(monkeypatch: Any) -> None:
+    _register_llamaserver_model(name="infill-a", port=8320)
+    captured: Dict[str, Any] = {}
+
+    async def fake_proxy_request(
+        method: str, url: str, body: bytes, headers: Dict[str, str], stream: bool
+    ) -> proxy.ProxyResponse:
+        captured.update(url=url, stream=stream, body=body)
+        return proxy.BufferedProxyResponse(200, {"content-type": "application/json"}, b"{}")
+
+    monkeypatch.setattr(proxy, "proxy_request", fake_proxy_request)
+
+    body = {"model": "infill-a", "input_prefix": "def f(", "input_suffix": "):"}
+    request = _fake_request(_OneWorkerCoordinator("10.0.0.3:50051"), body, path="/v1/infill")
+    await create_infill(request)
+
+    # Upstream path is pinned to the llama-server root /infill, NOT /v1/infill.
+    assert captured["url"] == "http://10.0.0.3:8320/infill"
+    assert captured["stream"] is False
+    # Raw body forwarded unmodified — the `model` key is left in place.
+    assert json.loads(captured["body"]) == body
+
+
+@pytest.mark.asyncio
+async def test_infill_single_loaded_fallback(monkeypatch: Any) -> None:
+    _register_llamaserver_model(name="infill-solo", port=8321)
+    captured: Dict[str, Any] = {}
+
+    async def fake_proxy_request(
+        method: str, url: str, body: bytes, headers: Dict[str, str], stream: bool
+    ) -> proxy.ProxyResponse:
+        captured.update(url=url)
+        return proxy.BufferedProxyResponse(200, {"content-type": "application/json"}, b"{}")
+
+    monkeypatch.setattr(proxy, "proxy_request", fake_proxy_request)
+
+    class _SingleLoadedCoord:
+        async def loaded_llamaserver_models(self) -> List[str]:
+            return ["infill-solo"]
+
+        async def find_worker_for_model(self, name: str, session_id: Any = None) -> Any:
+            return SimpleNamespace(address="10.0.0.4:50051", id="w1")
+
+    body = {"input_prefix": "a", "input_suffix": "b"}  # no "model" field
+    request = _fake_request(_SingleLoadedCoord(), body, path="/v1/infill")
+    await create_infill(request)
+
+    assert captured["url"] == "http://10.0.0.4:8321/infill"
+
+
+@pytest.mark.asyncio
+async def test_infill_no_model_zero_loaded_returns_400() -> None:
+    class _NoneLoadedCoord:
+        async def loaded_llamaserver_models(self) -> List[str]:
+            return []
+
+    request = _fake_request(_NoneLoadedCoord(), {"input_prefix": "a"}, path="/v1/infill")
+    with pytest.raises(HTTPException) as exc:
+        await create_infill(request)
+    assert exc.value.status_code == 400
+    assert '"model"' in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_infill_no_model_multiple_loaded_returns_400() -> None:
+    class _MultiLoadedCoord:
+        async def loaded_llamaserver_models(self) -> List[str]:
+            return ["infill-m1", "infill-m2"]
+
+    request = _fake_request(_MultiLoadedCoord(), {"input_prefix": "a"}, path="/v1/infill")
+    with pytest.raises(HTTPException) as exc:
+        await create_infill(request)
+    assert exc.value.status_code == 400
+    assert "multiple" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_infill_streams_when_stream_true(monkeypatch: Any) -> None:
+    _register_llamaserver_model(name="infill-stream", port=8322)
+
+    async def _chunks() -> AsyncIterator[bytes]:
+        yield b"data: x\n\n"
+
+    async def fake_proxy_request(
+        method: str, url: str, body: bytes, headers: Dict[str, str], stream: bool
+    ) -> proxy.ProxyResponse:
+        assert stream is True  # sniffed from the body's "stream": true
+        return proxy.StreamingProxyResponse(200, {"content-type": "text/event-stream"}, _chunks())
+
+    monkeypatch.setattr(proxy, "proxy_request", fake_proxy_request)
+
+    body = {"model": "infill-stream", "input_prefix": "a", "stream": True}
+    request = _fake_request(_OneWorkerCoordinator("10.0.0.5:50051"), body, path="/v1/infill")
+    response = await create_infill(request)
+
+    assert isinstance(response, StreamingResponse)
+    assert response.media_type == "text/event-stream"

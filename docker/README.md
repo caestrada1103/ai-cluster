@@ -29,6 +29,13 @@ curl http://localhost:8000/health
 There is no `GPU_BACKEND` arg and no `hip` feature — the arg is `BACKEND`
 and the AMD feature is `rocm`.
 
+All three variants also bake in a `llama-server` binary (Vulkan, from a pinned
+llama.cpp tag via `--build-arg LLAMASERVER_TAG=`) at `/usr/local/bin/llama-server`
+with `LLAMASERVER_BINARY_PATH` preset, for `engine = "llamaserver"` agentic
+models. Opt out (skip the llama.cpp compile) with
+`--build-arg LLAMASERVER_SRC=llamaserver-none`. See
+docs/deployment.md "llama-server for agentic serving".
+
 ## GPU passthrough
 
 - **AMD**: `devices: [/dev/kfd, /dev/dri]` + `group_add: [video, render]` (see the active worker service).
@@ -49,7 +56,9 @@ Worker: `GPU_INDEX` (replica offset), `GRPC_BASE_PORT`/`METRICS_BASE_PORT`
 ## Ports & networking (bridge network `ai-cluster-net`)
 
 - coordinator: 8000 (API + metrics)
-- worker: 50051+GPU_INDEX (gRPC), 9091+GPU_INDEX (metrics/health)
+- worker: 50051+GPU_INDEX (gRPC), 9091+GPU_INDEX (metrics/health), 8081/8082
+  (llama-server registry ports for `engine = "llamaserver"` models — published so
+  the coordinator can proxy agentic HTTP inference to them; firewall to the LAN)
 - prometheus: host 9099 → container 9090; grafana: 3000; open-webui: 8080
 
 ## Health checks

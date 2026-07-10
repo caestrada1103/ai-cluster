@@ -252,47 +252,82 @@ def _proxy_response(result: proxy.ProxyResponse) -> Response:
     )
 
 
+def _not_loaded_detail(model_name: str) -> str:
+    """404 message for a llamaserver model that no worker holds (auto-load off)."""
+    return (
+        f"Model '{model_name}' (engine=llamaserver) is not loaded on any worker. "
+        "Load it first with POST /v1/models/load."
+    )
+
+
+async def _resolve_llamaserver_worker(coordinator: Any, model_cfg: ModelConfig) -> Any:
+    """Find — or, when auto-load is on, load — a worker serving ``model_cfg``.
+
+    Plan 13 Task 5. The already-loaded common case takes the fast path
+    (``find_worker_for_model``) untouched. When no worker reports the model
+    loaded, ``settings.llamaserver_autoload`` decides: True (default) triggers
+    the coordinator's single-flight auto-load and returns the freshly-loaded
+    worker (a load failure/timeout surfaces as 503); False preserves the
+    Phase-1 behavior — 404 pointing at ``POST /v1/models/load``.
+    """
+    worker = await coordinator.find_worker_for_model(model_cfg.name)
+    if worker is not None:
+        return worker
+
+    settings = getattr(coordinator, "settings", None)
+    if not bool(getattr(settings, "llamaserver_autoload", True)):
+        raise HTTPException(status_code=404, detail=_not_loaded_detail(model_cfg.name))
+
+    try:
+        return await coordinator.ensure_llamaserver_model_loaded(model_cfg.name)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Auto-load of model '{model_cfg.name}' failed: {exc}",
+        ) from exc
+
+
 async def _proxy_to_llamaserver(
     request: Request,  # type: ignore[type-arg]
     coordinator: Any,
     model_cfg: ModelConfig,
     raw_body: bytes,
     stream: bool,
+    *,
+    upstream_path: Optional[str] = None,
 ) -> Response:
     """Forward a request to the worker-local llama-server serving ``model_cfg``.
 
-    Plan 13 Task 2: pick a worker that already reports the model loaded (no
-    auto-load in Phase 1), build ``http://<worker_host>:<port><same_path>`` and
-    pass the raw body straight through. Returns 404 (pointing at the load
-    endpoint) when the model is loaded on no worker.
+    Resolves a serving worker (auto-loading on demand — Plan 13 Task 5 — via
+    :func:`_resolve_llamaserver_worker`), builds
+    ``http://<worker_host>:<port><path>`` and passes the raw body straight
+    through. ``path`` defaults to the incoming ``request.url.path``; callers pass
+    ``upstream_path`` to override it (``/infill`` is served at llama-server's
+    root, not under the coordinator's ``/v1`` mount — see :func:`create_infill`).
     """
-    worker = await coordinator.find_worker_for_model(model_cfg.name)
-    if worker is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"Model '{model_cfg.name}' (engine=llamaserver) is not loaded on any worker. "
-                "Load it first with POST /v1/models/load."
-            ),
-        )
+    worker = await _resolve_llamaserver_worker(coordinator, model_cfg)
     if model_cfg.llamaserver_port is None:  # defensive: validated at registry load
         raise HTTPException(
             status_code=500,
             detail=f"Model '{model_cfg.name}' has no llamaserver_port configured",
         )
     host = _worker_host(worker.address)
-    url = f"http://{host}:{model_cfg.llamaserver_port}{request.url.path}"
+    path = upstream_path if upstream_path is not None else request.url.path
+    url = f"http://{host}:{model_cfg.llamaserver_port}{path}"
     headers = proxy.filter_request_headers(request.headers)
     result = await proxy.proxy_request(request.method, url, raw_body, headers, stream)
     return _proxy_response(result)
 
 
-def _require_llamaserver_model(model_string: Any) -> ModelConfig:
-    """Resolve an Anthropic body's ``model`` to a llamaserver registry entry.
+def _require_llamaserver_model(model_string: Any, *, surface: str = "this endpoint") -> ModelConfig:
+    """Resolve a request body's ``model`` to a llamaserver registry entry.
 
     404 when the model is unknown; 501 when it exists but is not a
-    llamaserver-engine model (the Anthropic ``/v1/messages`` surface has no
-    in-process path — only llama-server serves it).
+    llamaserver-engine model (these surfaces — Anthropic ``/v1/messages``,
+    ``/v1/embeddings``, ``/infill`` — have no in-process path; only llama-server
+    serves them). ``surface`` names the endpoint in the 501 message.
     """
     model_cfg = _lookup_engine_model(model_string)
     if model_cfg is None:
@@ -301,11 +336,33 @@ def _require_llamaserver_model(model_string: Any) -> ModelConfig:
         raise HTTPException(
             status_code=501,
             detail=(
-                f"Model '{model_cfg.name}' (engine={model_cfg.engine}) does not support the "
-                "Anthropic /v1/messages API; only engine=llamaserver models do."
+                f"Model '{model_cfg.name}' (engine={model_cfg.engine}) does not support "
+                f"{surface}; only engine=llamaserver models do."
             ),
         )
     return model_cfg
+
+
+async def _resolve_single_loaded_llamaserver(coordinator: Any) -> ModelConfig:
+    """Resolve ``/infill`` when the body omits ``model`` (Plan 13 Task 6).
+
+    Uses the sole llamaserver model currently loaded across the fleet; raises a
+    400 telling the client to specify ``model`` when zero or more than one are
+    loaded (the request is genuinely ambiguous).
+    """
+    loaded = await coordinator.loaded_llamaserver_models()
+    if len(loaded) == 1:
+        cfg = ModelRegistry.get_model(loaded[0])
+        if cfg is not None:
+            return cfg
+    if not loaded:
+        hint = "no engine=llamaserver model is currently loaded"
+    else:
+        hint = f"multiple llamaserver models are loaded ({', '.join(loaded)})"
+    raise HTTPException(
+        status_code=400,
+        detail=f'POST /infill requires a "model" field: {hint}.',
+    )
 
 
 @router.post("/completions", response_model=None)
@@ -535,7 +592,9 @@ async def create_message(request: Request) -> Response:  # type: ignore[type-arg
     """
     coordinator = _get_coordinator(request)
     raw_body, data = await _read_json_body(request)
-    model_cfg = _require_llamaserver_model(data.get("model"))
+    model_cfg = _require_llamaserver_model(
+        data.get("model"), surface="the Anthropic /v1/messages API"
+    )
     return await _proxy_to_llamaserver(
         request, coordinator, model_cfg, raw_body, bool(data.get("stream", False))
     )
@@ -551,8 +610,59 @@ async def count_message_tokens(request: Request) -> Response:  # type: ignore[ty
     """
     coordinator = _get_coordinator(request)
     raw_body, data = await _read_json_body(request)
-    model_cfg = _require_llamaserver_model(data.get("model"))
+    model_cfg = _require_llamaserver_model(
+        data.get("model"), surface="the Anthropic /v1/messages/count_tokens API"
+    )
     return await _proxy_to_llamaserver(request, coordinator, model_cfg, raw_body, False)
+
+
+@router.post("/embeddings", response_model=None)
+async def create_embeddings(request: Request) -> Response:  # type: ignore[type-arg]
+    """OpenAI-compatible embeddings endpoint (Plan 13 Task 6), llamaserver-only.
+
+    Resolves the model from the JSON body's ``model`` field and proxies the raw
+    body — buffered, NEVER SSE — to the worker-local llama-server's
+    ``/v1/embeddings``. Unknown model → 404; any other engine → 501. Auto-load
+    (Task 5) applies via :func:`_proxy_to_llamaserver`.
+    """
+    coordinator = _get_coordinator(request)
+    raw_body, data = await _read_json_body(request)
+    model_cfg = _require_llamaserver_model(data.get("model"), surface="the /v1/embeddings API")
+    return await _proxy_to_llamaserver(request, coordinator, model_cfg, raw_body, False)
+
+
+@router.post("/infill", response_model=None)
+async def create_infill(request: Request) -> Response:  # type: ignore[type-arg]
+    """llama.cpp FIM ``/infill`` proxy (Plan 13 Task 6), llamaserver-only.
+
+    The body MAY carry ``model``: when present it is resolved like the other
+    routes; when absent, ``/infill`` falls back to the single llamaserver model
+    currently loaded across the fleet (zero or multiple → 400 telling the client
+    to specify ``model``). The raw body is forwarded verbatim — llama-server
+    ignores unknown fields, so the ``model`` key is left in place. Streaming is
+    honored only when the body sets ``"stream": true`` (llama-server's ``/infill``
+    supports SSE), sniffed like ``/v1/messages``.
+
+    NOTE: llama-server serves FIM at its ROOT ``/infill``, not under ``/v1``. This
+    route is registered on the coordinator's ``/v1`` router (mounted in main.py,
+    outside this task's ownership), so the upstream path is pinned to ``/infill``
+    regardless of the coordinator-facing path.
+    """
+    coordinator = _get_coordinator(request)
+    raw_body, data = await _read_json_body(request)
+    model_field = data.get("model")
+    if model_field is not None:
+        model_cfg = _require_llamaserver_model(model_field, surface="the /infill API")
+    else:
+        model_cfg = await _resolve_single_loaded_llamaserver(coordinator)
+    return await _proxy_to_llamaserver(
+        request,
+        coordinator,
+        model_cfg,
+        raw_body,
+        bool(data.get("stream", False)),
+        upstream_path="/infill",
+    )
 
 
 @router.get("/models", response_model=ModelsResponse)
