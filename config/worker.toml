@@ -18,6 +18,15 @@ llamacpp_default_n_gpu_layers = -1  # -1 = offload all layers to the GPU
 # rpc_server_port = 50151           # base port; one rpc-server process per lent GPU, port+i
 # rpc_server_bind_host = "0.0.0.0"  # bind interface for the rpc-server process(es)
 
+# llama-server engine (Plan 13, engine="llamaserver" models). The worker spawns
+# and supervises a `llama-server` child per such model; the coordinator proxies
+# agentic HTTP inference (OpenAI/Anthropic tool calling, streaming) to it. The
+# binary is NOT built by cargo — install llama.cpp's `llama-server` on the host.
+# Env LLAMASERVER_BINARY_PATH wins over llamaserver_binary_path. Trusted-LAN
+# only: firewall the llamaserver ports (0.0.0.0 lets the coordinator reach them).
+# llamaserver_binary_path = "llama-server"  # PATH lookup by default; or an absolute path
+# llamaserver_bind_host = "0.0.0.0"         # --host for llama-server (LAN-reachable)
+
 # worker_id = "my-worker"        # optional; auto-generated when absent everywhere
 grpc_port = 50051
 metrics_port = 9091

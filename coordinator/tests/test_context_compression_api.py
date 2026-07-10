@@ -31,12 +31,24 @@ class _FakeCoordinator:
         }
 
 
-def _fake_request(coordinator: _FakeCoordinator) -> Any:
+def _fake_request(coordinator: _FakeCoordinator, body: Any) -> Any:
+    """Build a duck-typed Request whose ``.body()`` returns the model's raw JSON.
+
+    The chat/completions + completions routes now read the RAW request body
+    (Plan 13) so they can proxy llamaserver models untouched; the in-process
+    path re-validates that same JSON through pydantic. Model ``"m"`` is unknown
+    to the registry, so these requests always take the in-process path.
+    """
     from types import SimpleNamespace
+
+    raw: bytes = body.model_dump_json().encode()
+
+    async def _body() -> bytes:
+        return raw
 
     app_state = SimpleNamespace(coordinator=coordinator)
     app = SimpleNamespace(state=app_state)
-    return SimpleNamespace(app=app)
+    return SimpleNamespace(app=app, body=_body)
 
 
 @pytest.mark.asyncio
@@ -46,7 +58,7 @@ async def test_chat_completions_noop_when_disabled() -> None:
     body = ChatCompletionRequest(
         model="m", messages=[{"role": "user", "content": "```python\n" + "x=1\n" * 500 + "```\n"}]
     )
-    await create_chat_completion(body, _fake_request(coordinator))
+    await create_chat_completion(_fake_request(coordinator, body))
     assert "x=1" in coordinator.last_prompt  # untouched — not skeletonized
 
 
@@ -60,7 +72,7 @@ async def test_chat_completions_compresses_when_enabled_and_over_budget() -> Non
     coordinator = _FakeCoordinator(settings)
     long_code = "```python\ndef old(x, y):\n    z = x + y\n    return z\n```\n"
     body = ChatCompletionRequest(model="m", messages=[{"role": "user", "content": long_code * 5}])
-    await create_chat_completion(body, _fake_request(coordinator))
+    await create_chat_completion(_fake_request(coordinator, body))
     assert "z = x + y" not in coordinator.last_prompt
     assert "def old(x, y):" in coordinator.last_prompt
 
@@ -77,7 +89,7 @@ async def test_chat_completions_per_request_override() -> None:
     body = ChatCompletionRequest(
         model="m", messages=[{"role": "user", "content": long_code * 5}], compress_context=True
     )
-    await create_chat_completion(body, _fake_request(coordinator))
+    await create_chat_completion(_fake_request(coordinator, body))
     assert "z = x + y" not in coordinator.last_prompt  # server default is off, request forced it on
 
 
@@ -91,5 +103,5 @@ async def test_completions_endpoint_also_wired() -> None:
     coordinator = _FakeCoordinator(settings)
     long_code = "```python\ndef old(x, y):\n    z = x + y\n    return z\n```\n"
     body = CompletionRequest(model="m", prompt=long_code * 5)
-    await create_completion(body, _fake_request(coordinator))
+    await create_completion(_fake_request(coordinator, body))
     assert "z = x + y" not in coordinator.last_prompt

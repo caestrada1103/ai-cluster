@@ -11,13 +11,18 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Type, TypeVar, Union
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, Field, ValidationError
+
+from coordinator import proxy
+from coordinator.models import ModelConfig, ModelRegistry
 
 logger = logging.getLogger(__name__)
+
+_BodyT = TypeVar("_BodyT", bound=BaseModel)
 
 router = APIRouter()
 
@@ -169,11 +174,159 @@ def _parse_model_and_worker(model_string: str) -> tuple[str, Optional[str]]:
     return model_string, None
 
 
-@router.post("/completions", response_model=CompletionResponse)
-async def create_completion(body: CompletionRequest, request: Request) -> CompletionResponse:  # type: ignore[type-arg]
-    """Run inference on the cluster."""
+# ---------------------------------------------------------------------------
+# Engine dispatch + transparent llama-server proxy (Plan 13 Task 2)
+# ---------------------------------------------------------------------------
+
+
+async def _read_json_body(request: Request) -> tuple[bytes, Dict[str, Any]]:  # type: ignore[type-arg]
+    """Read the RAW request bytes once and parse them as a JSON object.
+
+    The proxy path forwards these raw bytes to llama-server unchanged (so
+    OpenAI ``tools``/``tool_calls`` and other unknown fields survive), while the
+    in-process path re-validates the same dict through pydantic. Reading the
+    body here — instead of declaring a pydantic body parameter — is exactly what
+    lets an agentic request with ``content: null`` tool messages reach the proxy
+    rather than 422-ing at FastAPI's validation layer first.
+    """
+    raw = await request.body()
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON body: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    return raw, parsed
+
+
+def _parse_body(model_cls: Type[_BodyT], data: Dict[str, Any]) -> _BodyT:
+    """Validate a raw body dict through a pydantic model, 422 on failure.
+
+    Used only on the in-process path — mirrors the validation FastAPI would have
+    done had the route declared a typed body parameter.
+    """
+    try:
+        return model_cls.model_validate(data)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=json.loads(exc.json())) from exc
+
+
+def _lookup_engine_model(model_string: Any) -> Optional[ModelConfig]:
+    """Resolve a request's ``model`` field to a registry entry (None if unknown).
+
+    Strips the AICluster ``model@worker`` suffix before the lookup so engine
+    dispatch sees the bare model name.
+    """
+    if not isinstance(model_string, str):
+        return None
+    model_name, _ = _parse_model_and_worker(model_string)
+    return ModelRegistry.get_model(model_name)
+
+
+def _worker_host(address: str) -> str:
+    """Host portion of a worker's gRPC address ('host:port' -> 'host')."""
+    return address.rsplit(":", 1)[0] if ":" in address else address
+
+
+def _proxy_response(result: proxy.ProxyResponse) -> Response:
+    """Adapt a proxy result into a FastAPI response.
+
+    Preserves the upstream status code and Content-Type; streams SSE verbatim
+    (never buffered) and buffers ordinary JSON replies. Content-Type is set via
+    ``media_type`` so it is not duplicated by the forwarded header set.
+    """
+    headers = dict(result.headers)
+    media_type = headers.pop("content-type", None)
+    if isinstance(result, proxy.StreamingProxyResponse):
+        return StreamingResponse(
+            result.body,
+            status_code=result.status_code,
+            media_type=media_type,
+            headers=headers or None,
+        )
+    return Response(
+        content=result.content,
+        status_code=result.status_code,
+        media_type=media_type,
+        headers=headers or None,
+    )
+
+
+async def _proxy_to_llamaserver(
+    request: Request,  # type: ignore[type-arg]
+    coordinator: Any,
+    model_cfg: ModelConfig,
+    raw_body: bytes,
+    stream: bool,
+) -> Response:
+    """Forward a request to the worker-local llama-server serving ``model_cfg``.
+
+    Plan 13 Task 2: pick a worker that already reports the model loaded (no
+    auto-load in Phase 1), build ``http://<worker_host>:<port><same_path>`` and
+    pass the raw body straight through. Returns 404 (pointing at the load
+    endpoint) when the model is loaded on no worker.
+    """
+    worker = await coordinator.find_worker_for_model(model_cfg.name)
+    if worker is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Model '{model_cfg.name}' (engine=llamaserver) is not loaded on any worker. "
+                "Load it first with POST /v1/models/load."
+            ),
+        )
+    if model_cfg.llamaserver_port is None:  # defensive: validated at registry load
+        raise HTTPException(
+            status_code=500,
+            detail=f"Model '{model_cfg.name}' has no llamaserver_port configured",
+        )
+    host = _worker_host(worker.address)
+    url = f"http://{host}:{model_cfg.llamaserver_port}{request.url.path}"
+    headers = proxy.filter_request_headers(request.headers)
+    result = await proxy.proxy_request(request.method, url, raw_body, headers, stream)
+    return _proxy_response(result)
+
+
+def _require_llamaserver_model(model_string: Any) -> ModelConfig:
+    """Resolve an Anthropic body's ``model`` to a llamaserver registry entry.
+
+    404 when the model is unknown; 501 when it exists but is not a
+    llamaserver-engine model (the Anthropic ``/v1/messages`` surface has no
+    in-process path — only llama-server serves it).
+    """
+    model_cfg = _lookup_engine_model(model_string)
+    if model_cfg is None:
+        raise HTTPException(status_code=404, detail=f"Unknown model '{model_string}'")
+    if model_cfg.engine != "llamaserver":
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                f"Model '{model_cfg.name}' (engine={model_cfg.engine}) does not support the "
+                "Anthropic /v1/messages API; only engine=llamaserver models do."
+            ),
+        )
+    return model_cfg
+
+
+@router.post("/completions", response_model=None)
+async def create_completion(request: Request) -> Any:  # type: ignore[type-arg]
+    """Run inference on the cluster (OpenAI text-completion endpoint).
+
+    Resolves the requested model's engine FIRST (Plan 13 Task 2): a model with
+    ``engine == "llamaserver"`` is proxied verbatim to its worker-local
+    llama-server (raw body + SSE passthrough, context compression skipped —
+    Phase 2); every other engine runs the existing in-process path below.
+    """
     coordinator = _get_coordinator(request)
 
+    raw_body, data = await _read_json_body(request)
+    model_cfg = _lookup_engine_model(data.get("model"))
+    if model_cfg is not None and model_cfg.engine == "llamaserver":
+        return await _proxy_to_llamaserver(
+            request, coordinator, model_cfg, raw_body, bool(data.get("stream", False))
+        )
+
+    body = _parse_body(CompletionRequest, data)
     model_name, target_worker = _parse_model_and_worker(body.model)
     worker_id = body.worker_id or target_worker
 
@@ -282,11 +435,27 @@ async def _stream_chat_completion(
 
 @router.post("/chat/completions", response_model=None)
 async def create_chat_completion(
-    body: ChatCompletionRequest, request: Request  # type: ignore[type-arg]
-) -> Union[Dict[str, Any], StreamingResponse]:
-    """OpenAI-compatible chat completions endpoint used by Open-WebUI."""
-    logger.info(f"Received chat completion request for model: {body.model}")
+    request: Request,  # type: ignore[type-arg]
+) -> Union[Dict[str, Any], Response, StreamingResponse]:
+    """OpenAI-compatible chat completions endpoint used by Open-WebUI + agents.
+
+    Resolves the model's engine FIRST (Plan 13 Task 2): ``engine ==
+    "llamaserver"`` models are proxied verbatim to a worker-local llama-server
+    so OpenAI ``tools``/streaming ``tool_calls`` pass through unmodified (raw
+    body + SSE passthrough, context compression skipped — Phase 2). Every other
+    engine runs the in-process Zephyr-flattening path below.
+    """
     coordinator = _get_coordinator(request)
+
+    raw_body, data = await _read_json_body(request)
+    model_cfg = _lookup_engine_model(data.get("model"))
+    if model_cfg is not None and model_cfg.engine == "llamaserver":
+        return await _proxy_to_llamaserver(
+            request, coordinator, model_cfg, raw_body, bool(data.get("stream", False))
+        )
+
+    body = _parse_body(ChatCompletionRequest, data)
+    logger.info(f"Received chat completion request for model: {body.model}")
 
     model_name, worker_id = _parse_model_and_worker(body.model)
 
@@ -351,6 +520,39 @@ async def create_chat_completion(
     except Exception as exc:
         logger.exception("Inference failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/messages", response_model=None)
+async def create_message(request: Request) -> Response:  # type: ignore[type-arg]
+    """Anthropic-format messages endpoint (Plan 13 Task 2), llamaserver-only.
+
+    The in-process engines have no Anthropic templating, so only ``engine ==
+    "llamaserver"`` models are served here: the coordinator proxies the raw body
+    — ``system``, ``tools``, ``thinking`` and all — to a worker-local
+    llama-server, which natively serves ``POST /v1/messages``. Anthropic clients
+    request streaming via ``"stream": true`` in the body, which is sniffed here
+    to decide SSE passthrough. Unknown model → 404; any other engine → 501.
+    """
+    coordinator = _get_coordinator(request)
+    raw_body, data = await _read_json_body(request)
+    model_cfg = _require_llamaserver_model(data.get("model"))
+    return await _proxy_to_llamaserver(
+        request, coordinator, model_cfg, raw_body, bool(data.get("stream", False))
+    )
+
+
+@router.post("/messages/count_tokens", response_model=None)
+async def count_message_tokens(request: Request) -> Response:  # type: ignore[type-arg]
+    """Anthropic ``POST /v1/messages/count_tokens`` (Plan 13 Task 2).
+
+    llamaserver-only (unknown model → 404, other engine → 501) and never
+    streaming — the raw body is proxied verbatim to the worker-local
+    llama-server, whose token count is returned unchanged.
+    """
+    coordinator = _get_coordinator(request)
+    raw_body, data = await _read_json_body(request)
+    model_cfg = _require_llamaserver_model(data.get("model"))
+    return await _proxy_to_llamaserver(request, coordinator, model_cfg, raw_body, False)
 
 
 @router.get("/models", response_model=ModelsResponse)

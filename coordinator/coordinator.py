@@ -382,6 +382,32 @@ class ClusterCoordinator:
             workers = dict(self.workers)
         return await self.router.pick_worker(workers, model_name, session_id)
 
+    async def find_worker_for_model(
+        self, model_name: str, session_id: Optional[str] = None
+    ) -> Optional[WorkerInfo]:
+        """Return a healthy worker that ALREADY reports ``model_name`` loaded.
+
+        Used by the Plan 13 llamaserver proxy path (`coordinator/proxy.py`): the
+        coordinator forwards HTTP requests to the llama-server child process on
+        whichever worker already serves the model. Unlike the in-process path
+        there is no auto-load in Phase 1 — callers 404 when this returns None.
+        Prefers the router's strategy among the workers that hold the model,
+        falling back to the first such worker when the router declines every one
+        (e.g. all at capacity).
+        """
+        async with self._workers_lock:
+            holders = {
+                wid: w
+                for wid, w in self.workers.items()
+                if model_name in w.loaded_models and w.state == WorkerState.HEALTHY
+            }
+        if not holders:
+            return None
+        picked = await self.router.pick_worker(holders, model_name, session_id)
+        if picked is not None:
+            return picked
+        return next(iter(holders.values()))
+
     async def _execute_request(self, ctx: RequestContext, worker: WorkerInfo) -> None:
         """Execute a request on a worker."""
         ctx.started_at = time.time()
