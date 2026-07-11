@@ -17,6 +17,7 @@
 - [Supported Models](#supported-models)
 - [Performance](#performance)
 - [Use Cases](#use-cases)
+- [Use on Real Scenarios](#use-on-real-scenarios)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [API Reference](#api-reference)
@@ -286,6 +287,18 @@ worker roadmap; today one GGUF model loads per worker process.
 |-------|--------|-------|
 | **Any GGUF checkpoint** (e.g. Qwen2.5, Llama 3.1, Qwen2.5-Coder, …) | ✅ Implemented (opt-in: build worker with `--features llamacpp` [+ `llamacpp-vulkan`/`llamacpp-cuda`]) | Native quantization: Q4_K_M, Q5_K_M, Q8_0, …; NVIDIA + AMD; multi-GPU split upcoming |
 
+### Agentic serving via llama-server (tool calling)
+
+A third serving mode, `engine = "llamaserver"`, runs OpenAI/Anthropic **tool
+calling** for coding agents (Claude Code, Cline, aider, …): the worker supervises
+a `llama-server` process per model and the coordinator proxies agentic HTTP
+requests (including `/v1/messages`) straight to it. The default Docker worker
+image bundles the `llama-server` binary; bare-metal setup, the pinned llama.cpp
+version, and the coordinator↔worker port requirements are covered in the
+[Deployment Guide](docs/deployment.md). See
+[Use on Real Scenarios](#use-on-real-scenarios) for the end-to-end Claude Code
+walkthrough.
+
 ### Burn / safetensors models (experimental FP32 reference)
 
 The Burn engine is the **default** cargo build feature (`--features
@@ -485,6 +498,75 @@ When fully implemented, you will be able to configure model splitting like this:
       -d '{"model_name": "llama3-70b", "worker_id": "nvidia-gpu-0"}'
     ```
 The system will automatically allocate 4 GPUs and use **Tensor Parallelism** (faster) or **Pipeline Parallelism** (inter-node) based on topology.
+
+---
+
+## Use on Real Scenarios
+
+AICluster turns your own PCs into a private AI coding assistant. One PC (the
+**coordinator**) receives requests; the PCs with graphics cards (the **workers**)
+run the AI models. Once it's running, coding tools like
+[Claude Code](https://docs.claude.com/en/docs/claude-code) on your laptop talk to
+it exactly like they'd talk to a cloud AI — but every request, and your code,
+stay on your own network.
+
+Here's the whole thing, end to end:
+
+**1. On a PC with a graphics card, start a worker.** It needs a small helper
+program (`llama-server`) that actually runs the models; the Docker image already
+includes it, so `docker compose up -d --build` is all you need. (On a bare-metal
+install you build it once — see
+[Deployment → llama-server for agentic serving](docs/deployment.md).)
+
+**2. On the PC that will receive requests, start the coordinator.** With Docker
+Compose it comes up next to the worker. To require a password on every request,
+set one variable before starting (skip it to run with no password):
+
+```bash
+export COORDINATOR_API_KEYS=your-secret-key
+```
+
+**3. From your laptop, check it works** — replace `<coordinator-host>` with the
+coordinator PC's name or IP address:
+
+```bash
+python scripts/validate_agentic.py \
+  --base-url http://<coordinator-host>:8000 \
+  --api-key your-secret-key
+```
+
+**4. Point Claude Code at it.** On each laptop, copy these four lines into the
+terminal — changing `<coordinator-host>` to the coordinator PC's address — then
+run `claude`:
+
+```bash
+export ANTHROPIC_BASE_URL=http://<coordinator-host>:8000
+export ANTHROPIC_AUTH_TOKEN=your-secret-key                          # any text if you skipped the password
+export ANTHROPIC_MODEL=qwen3-coder-30b-a3b-instruct-gguf             # the "big" model
+export ANTHROPIC_SMALL_FAST_MODEL=devstral-small-2-24b-instruct-gguf # the "quick" model
+claude
+```
+
+That's it — Claude Code now uses your cluster. It can read files, run commands,
+and edit code (tool use) just as it does against the cloud, because the models
+above are trained for exactly that.
+
+**Good to know:**
+
+- **The first question is slow, then it's fast.** The first time you use a model,
+  its file (~15 GB) downloads and starts up automatically; after that it stays
+  loaded and answers quickly. Running the check in step 3 first gets this out of
+  the way.
+- **Your chat history stays on your laptop.** Claude Code keeps each conversation
+  locally; the cluster just answers one request at a time and remembers nothing
+  between them.
+- **The model name must match one from `config/models.toml`** (like the two
+  above). Claude Code's built-in menu only lists cloud models, so pick yours with
+  the `ANTHROPIC_MODEL` variables, not the in-app menu.
+- **Seeing `400` errors?** Add `export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`
+  and restart `claude`.
+- **Using a different tool?** Setups for Cline, aider, Continue, and Open WebUI
+  live in [docs/clients.md](docs/clients.md).
 
 ---
 

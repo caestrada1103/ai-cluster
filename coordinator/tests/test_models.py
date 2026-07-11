@@ -966,3 +966,154 @@ def test_real_models_toml_cache_type_example_loads() -> None:
     metadata = cfg.grpc_metadata()
     assert metadata["cache_type_k"] == "q8_0"
     assert metadata["cache_type_v"] == "q8_0"
+
+
+# ---------------------------------------------------------------------------
+# Plan 13 Task 2 — llamaserver engine: fields, validation, metadata emission
+# ---------------------------------------------------------------------------
+
+
+def _llamaserver_kwargs(**overrides: Any) -> Dict[str, Any]:
+    """Minimal required ModelConfig kwargs for an engine='llamaserver' model."""
+    base: Dict[str, Any] = dict(
+        name="agentic-test",
+        family=ModelFamily.QWEN,
+        parameters="7B",
+        min_memory_gb=6,
+        recommended_gpus=1,
+        max_gpus=1,
+        num_layers=0,
+        hidden_size=0,
+        num_attention_heads=0,
+        vocab_size=0,
+        max_seq_len=8192,
+        intermediate_size=0,
+        engine="llamaserver",
+        gguf_repo_id="Qwen/Qwen2.5-7B-Instruct-GGUF",
+        gguf_file="qwen2.5-7b-instruct-q4_k_m.gguf",
+        llamaserver_port=8090,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_llamaserver_engine_is_accepted() -> None:
+    cfg = ModelConfig(**_llamaserver_kwargs())
+    assert cfg.engine == "llamaserver"
+    assert cfg.llamaserver_port == 8090
+
+
+def test_llamaserver_requires_port() -> None:
+    with pytest.raises(ValueError, match="llamaserver_port"):
+        ModelConfig(**_llamaserver_kwargs(llamaserver_port=None))
+
+
+def test_llamaserver_requires_gguf_source() -> None:
+    with pytest.raises(ValueError, match="gguf"):
+        ModelConfig(**_llamaserver_kwargs(gguf_repo_id=None, gguf_file=None))
+
+
+def test_llamaserver_metadata_exact_keys() -> None:
+    # gguf.* source keys (repo/file/n_ctx/cache types) ride alongside the three
+    # EXACT llamaserver.* contract keys, and engine flips to "llamaserver".
+    cfg = ModelConfig(
+        **_llamaserver_kwargs(
+            gguf_n_ctx=32768,
+            gguf_cache_type_k="q8_0",
+            gguf_cache_type_v="q8_0",
+            llamaserver_parallel=8,
+            llamaserver_extra_args="--flash-attn --mlock",
+        )
+    )
+    assert cfg.grpc_metadata() == {
+        "engine": "llamaserver",
+        "gguf_repo_id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
+        "gguf_file": "qwen2.5-7b-instruct-q4_k_m.gguf",
+        "n_ctx": "32768",
+        "cache_type_k": "q8_0",
+        "cache_type_v": "q8_0",
+        "llamaserver.port": "8090",
+        "llamaserver.parallel": "8",
+        "llamaserver.extra_args": "--flash-attn --mlock",
+    }
+
+
+def test_llamaserver_metadata_parallel_defaults_to_4_and_omits_extra_args() -> None:
+    cfg = ModelConfig(**_llamaserver_kwargs())  # no parallel, no extra_args
+    metadata = cfg.grpc_metadata()
+    assert metadata["engine"] == "llamaserver"
+    assert metadata["llamaserver.port"] == "8090"
+    assert metadata["llamaserver.parallel"] == "4"  # default when unset
+    assert "llamaserver.extra_args" not in metadata
+
+
+def test_validate_llamaserver_ports_rejects_duplicates() -> None:
+    a = ModelConfig(**_llamaserver_kwargs(name="model-a", llamaserver_port=9000))
+    b = ModelConfig(**_llamaserver_kwargs(name="model-b", llamaserver_port=9000))
+    with pytest.raises(ValueError, match="unique per model"):
+        ModelRegistry.validate_llamaserver_ports({"model-a": a, "model-b": b})
+
+
+def test_validate_llamaserver_ports_accepts_distinct_ports() -> None:
+    a = ModelConfig(**_llamaserver_kwargs(name="model-a", llamaserver_port=9001))
+    b = ModelConfig(**_llamaserver_kwargs(name="model-b", llamaserver_port=9002))
+    ModelRegistry.validate_llamaserver_ports({"model-a": a, "model-b": b})  # no raise
+
+
+def test_load_from_dict_parses_llamaserver_section() -> None:
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "agentic-toml-test": {
+                    "family": "qwen",
+                    "parameters": "7B",
+                    "min_memory_gb": 6,
+                    "engine": "llamaserver",
+                    "gguf": {
+                        "repo_id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
+                        "file": "qwen2.5-7b-instruct-q4_k_m.gguf",
+                        "n_ctx": 16384,
+                    },
+                    "llamaserver": {
+                        "port": 8123,
+                        "parallel": 6,
+                        "extra_args": "--no-webui",
+                    },
+                }
+            }
+        }
+    )
+    cfg = ModelRegistry.get_model("agentic-toml-test")
+    assert cfg is not None
+    assert cfg.engine == "llamaserver"
+    assert cfg.llamaserver_port == 8123
+    assert cfg.llamaserver_parallel == 6
+    assert cfg.llamaserver_extra_args == "--no-webui"
+    assert cfg.grpc_metadata()["llamaserver.port"] == "8123"
+    assert cfg.grpc_metadata()["llamaserver.parallel"] == "6"
+
+
+def test_load_from_dict_parses_flat_llamaserver_keys() -> None:
+    # Flat `llamaserver_port` etc. under the model are accepted too (the plan's
+    # contract names the fields flat; a nested [llamaserver] table also works).
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "agentic-flat-test": {
+                    "family": "qwen",
+                    "parameters": "7B",
+                    "min_memory_gb": 6,
+                    "engine": "llamaserver",
+                    "gguf": {
+                        "repo_id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
+                        "file": "qwen2.5-7b-instruct-q4_k_m.gguf",
+                    },
+                    "llamaserver_port": 8124,
+                }
+            }
+        }
+    )
+    cfg = ModelRegistry.get_model("agentic-flat-test")
+    assert cfg is not None
+    assert cfg.llamaserver_port == 8124
+    assert cfg.grpc_metadata()["llamaserver.parallel"] == "4"  # default emitted

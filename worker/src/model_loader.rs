@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use crate::backend::WorkerBackend;
 use crate::error::WorkerError;
 use crate::gpu_manager::GPUManager;
+use crate::llamaserver_process::{llamaserver_spec_from_metadata, LlamaServerProcess};
 use crate::models::{
     common::{RMSNormRecord, RotaryEmbeddingRecord},
     deepseek::{
@@ -34,7 +35,7 @@ use half::f16;
 use hf_hub::{api::tokio::Api, Repo, RepoType};
 use safetensors::SafeTensors;
 use tokio::sync::Semaphore;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Model loader configuration
 #[derive(Debug, Clone)]
@@ -50,6 +51,14 @@ pub struct ModelLoaderConfig {
     pub llamacpp_n_threads: i32,
     /// Default GPU layer offload for llama.cpp models (-1 = all layers).
     pub llamacpp_default_n_gpu_layers: i32,
+    /// Path to the `llama-server` binary spawned for `engine = "llamaserver"`
+    /// models (env `LLAMASERVER_BINARY_PATH` wins; default `"llama-server"`).
+    pub llamaserver_binary_path: String,
+    /// Bind interface passed to `llama-server --host` (default `"0.0.0.0"`).
+    pub llamaserver_bind_host: String,
+    /// Seconds to poll `llama-server`'s `/health` before declaring the load
+    /// failed — reuses the worker's `request_timeout_secs`.
+    pub llamaserver_health_timeout_secs: u64,
 }
 
 impl Default for ModelLoaderConfig {
@@ -62,6 +71,9 @@ impl Default for ModelLoaderConfig {
             hf_cache_dir: None,
             llamacpp_n_threads: 0,
             llamacpp_default_n_gpu_layers: -1,
+            llamaserver_binary_path: "llama-server".to_string(),
+            llamaserver_bind_host: "0.0.0.0".to_string(),
+            llamaserver_health_timeout_secs: 120,
         }
     }
 }
@@ -79,6 +91,16 @@ pub struct ModelLoader {
     llamacpp_n_threads: i32,
     /// Default GPU layer offload for llama.cpp models (-1 = all).
     llamacpp_default_n_gpu_layers: i32,
+    /// Supervised `llama-server` child processes, keyed by model name. Kept
+    /// separate from `loaded_models` because the child handle (not a
+    /// `TextGeneration`) must be reachable for kill-on-unload and liveness.
+    llamaserver_processes: Arc<DashMap<String, Arc<tokio::sync::Mutex<LlamaServerProcess>>>>,
+    /// Path to the `llama-server` binary (env/config resolved).
+    llamaserver_binary_path: String,
+    /// `--host` bind interface for spawned `llama-server` processes.
+    llamaserver_bind_host: String,
+    /// `/health` poll timeout (seconds) for a spawned `llama-server`.
+    llamaserver_health_timeout_secs: u64,
 }
 
 impl ModelLoader {
@@ -116,6 +138,10 @@ impl ModelLoader {
             hf_api,
             llamacpp_n_threads: config.llamacpp_n_threads,
             llamacpp_default_n_gpu_layers: config.llamacpp_default_n_gpu_layers,
+            llamaserver_processes: Arc::new(DashMap::new()),
+            llamaserver_binary_path: config.llamaserver_binary_path,
+            llamaserver_bind_host: config.llamaserver_bind_host,
+            llamaserver_health_timeout_secs: config.llamaserver_health_timeout_secs,
         })
     }
 
@@ -179,6 +205,16 @@ impl ModelLoader {
                     .load_rpc_server_stub(model_name, gpu_ids, quantization, parallelism)
                     .await;
             }
+        }
+
+        // Engine routing: `llamaserver` models supervise a `llama-server`
+        // child process (Plan 13). Checked BEFORE the gguf branch below —
+        // `gguf_spec_from_metadata` errors on an unknown engine string like
+        // "llamaserver", so this must intercept it first.
+        if let Some(spec) = llamaserver_spec_from_metadata(model_config.map(|c| &c.metadata))? {
+            return self
+                .load_llamaserver_model(model_name, spec, gpu_ids, quantization, parallelism)
+                .await;
         }
 
         // Engine routing: GGUF/llama.cpp models bypass the entire
@@ -453,24 +489,186 @@ impl ModelLoader {
         Ok(instance)
     }
 
+    /// Supervise a `llama-server` child process for a `engine = "llamaserver"`
+    /// model (Plan 13). Pure process management — no in-process weights, no
+    /// `TextGeneration`; agentic inference is proxied to the child over HTTP by
+    /// the coordinator, so the [`ModelInstance`] carries `model: None`.
+    ///
+    /// Flow: resolve/download the GGUF (same hf-hub path as llama.cpp) → reserve
+    /// its file size as an honest VRAM estimate → spawn `llama-server` → poll
+    /// `/health` until 200 or the load timeout. Any failure kills the child and
+    /// rolls back the GPU reservations.
+    async fn load_llamaserver_model(
+        &self,
+        model_name: &str,
+        spec: crate::llamaserver_process::LlamaServerSpec,
+        gpu_ids: &[u32],
+        quantization: crate::cluster::Quantization,
+        parallelism: crate::cluster::ParallelismStrategy,
+    ) -> Result<ModelInstance, WorkerError> {
+        info!(
+            "Loading model {} via llama-server (port {}, {}/{})",
+            model_name, spec.port, spec.repo_id, spec.file
+        );
+
+        // Resolve/download the GGUF — identical hf-hub pattern to llama.cpp.
+        let api = self
+            .hf_api
+            .as_ref()
+            .ok_or_else(|| WorkerError::ModelLoad("HF API not initialized".to_string()))?;
+        let repo = api.repo(Repo::new(spec.repo_id.clone(), RepoType::Model));
+        let gguf_path = repo.get(&spec.file).await.map_err(|e| {
+            WorkerError::ModelLoad(format!(
+                "Failed to download GGUF {}/{}: {}",
+                spec.repo_id, spec.file, e
+            ))
+        })?;
+
+        // Honest VRAM estimate: the GGUF file size (llama-server holds the real
+        // weights in its own process; this is bookkeeping for placement).
+        let file_size = tokio::fs::metadata(&gguf_path)
+            .await
+            .map_err(|e| WorkerError::ModelLoad(format!("Failed to stat GGUF: {}", e)))?
+            .len();
+        let mut reserved_gpus: Vec<usize> = Vec::new();
+        for &gpu_id in gpu_ids {
+            match self
+                .gpu_manager
+                .allocate_memory(gpu_id as usize, file_size, model_name)
+                .await
+            {
+                Ok(()) => reserved_gpus.push(gpu_id as usize),
+                Err(e) => {
+                    for &g in &reserved_gpus {
+                        self.gpu_manager.free_memory(g, model_name).await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        // Build argv + spawn. On failure roll back the reservations.
+        let args = spec.build_args(&gguf_path, &self.llamaserver_bind_host);
+        let spawn_res =
+            LlamaServerProcess::spawn(model_name, spec.port, &self.llamaserver_binary_path, &args);
+        let mut process = match spawn_res {
+            Ok(p) => p,
+            Err(e) => {
+                for &g in &reserved_gpus {
+                    self.gpu_manager.free_memory(g, model_name).await;
+                }
+                return Err(e);
+            }
+        };
+
+        // Loaded == GET /health returns 200 within the load timeout. On failure
+        // kill the child and roll back.
+        let health_timeout = std::time::Duration::from_secs(self.llamaserver_health_timeout_secs);
+        if let Err(e) = process.wait_until_healthy(health_timeout).await {
+            let _ = process.start_kill();
+            for &g in &reserved_gpus {
+                self.gpu_manager.free_memory(g, model_name).await;
+            }
+            return Err(e);
+        }
+
+        // Register the supervised child + a model-less instance (inference goes
+        // through the coordinator HTTP proxy, not this worker's gRPC Infer).
+        let handle = Arc::new(tokio::sync::Mutex::new(process));
+        self.llamaserver_processes
+            .insert(model_name.to_string(), handle);
+
+        let instance = ModelInstance::new(
+            model_name.to_string(),
+            file_size as usize,
+            gpu_ids.to_vec(),
+            quantization as i32,
+            parallelism as i32,
+            None,
+        );
+        self.loaded_models
+            .insert(model_name.to_string(), instance.clone());
+        info!(
+            "Model {} loaded via llama-server on port {}",
+            model_name, spec.port
+        );
+        Ok(instance)
+    }
+
+    /// Whether `model_name` is served by a supervised `llama-server` child
+    /// (so worker gRPC Infer must reject it with a FAILED_PRECONDITION).
+    pub fn is_llamaserver(&self, model_name: &str) -> bool {
+        self.llamaserver_processes.contains_key(model_name)
+    }
+
+    /// Reap `llama-server` children that exited on their own: kill nothing (they
+    /// are already gone), drop them from both the process map and
+    /// `loaded_models`, and free their GPU reservations. Returns the reaped
+    /// model names so callers can prune their own view too. Keeps status honest
+    /// ("report as not loaded" once the child dies) without a background task.
+    pub async fn reap_exited_llamaservers(&self) -> Vec<String> {
+        let names: Vec<String> = self
+            .llamaserver_processes
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        let mut reaped = Vec::new();
+        for name in names {
+            // Clone the Arc out and drop the DashMap ref before awaiting.
+            let proc = self
+                .llamaserver_processes
+                .get(&name)
+                .map(|r| r.value().clone());
+            let dead = match proc {
+                Some(p) => !p.lock().await.is_running(),
+                None => continue,
+            };
+            if dead {
+                self.llamaserver_processes.remove(&name);
+                if let Some((_, instance)) = self.loaded_models.remove(&name) {
+                    for &gpu_id in instance.gpu_ids() {
+                        self.gpu_manager.free_memory(gpu_id as usize, &name).await;
+                    }
+                }
+                warn!(
+                    "llama-server for {} exited on its own — marked unloaded",
+                    name
+                );
+                reaped.push(name);
+            }
+        }
+        reaped
+    }
+
     /// Remove a model from the registry and release its GPU memory reservations.
     /// Returns true when the model was loaded.
     pub async fn unload(&self, model_name: &str) -> bool {
-        let Some((_, instance)) = self.loaded_models.remove(model_name) else {
-            return false;
+        // Kill a supervised llama-server child first, if this model is one.
+        let killed_server = if let Some((_, proc)) = self.llamaserver_processes.remove(model_name) {
+            if let Err(e) = proc.lock().await.shutdown().await {
+                warn!("error shutting down llama-server for {}: {}", model_name, e);
+            }
+            info!("Unload {}: llama-server child terminated", model_name);
+            true
+        } else {
+            false
         };
-        for &gpu_id in instance.gpu_ids() {
-            let freed = self
-                .gpu_manager
-                .free_memory(gpu_id as usize, model_name)
-                .await;
-            info!(
-                "Unload {}: freed {} bytes on GPU {}",
-                model_name, freed, gpu_id
-            );
+
+        let removed = self.loaded_models.remove(model_name);
+        if let Some((_, instance)) = &removed {
+            for &gpu_id in instance.gpu_ids() {
+                let freed = self
+                    .gpu_manager
+                    .free_memory(gpu_id as usize, model_name)
+                    .await;
+                info!(
+                    "Unload {}: freed {} bytes on GPU {}",
+                    model_name, freed, gpu_id
+                );
+            }
         }
         // instance drops here — last Arc clone (worker.rs removed its copy first) frees the weights.
-        true
+        removed.is_some() || killed_server
     }
 
     async fn load_safetensors(
@@ -802,7 +1000,10 @@ const ALLOWED_KV_CACHE_TYPES: &[&str] = &["f16", "q8_0", "q4_0", "q5_0", "q5_1",
 
 /// Parse one KV-cache-type metadata key, validating it against
 /// [`ALLOWED_KV_CACHE_TYPES`]. `Ok(None)` when the key is absent.
-fn parse_cache_type(
+///
+/// `pub(crate)` so the `llamaserver` engine ([`crate::llamaserver_process`])
+/// validates the SAME `cache_type_k`/`cache_type_v` keys identically.
+pub(crate) fn parse_cache_type(
     metadata: &HashMap<String, String>,
     key: &str,
 ) -> Result<Option<String>, WorkerError> {

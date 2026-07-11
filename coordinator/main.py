@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import make_asgi_app
 
 from coordinator.api import router as api_router
+from coordinator.auth import APIKeyAuthMiddleware
 from coordinator.config import Settings
 from coordinator.coordinator import ClusterCoordinator
 
@@ -69,6 +70,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Opt-in API-key auth (Plan 15 Phase A / Plan 13 Task 3). No-op unless
+# COORDINATOR_API_KEYS is set; see coordinator/auth.py for the contract.
+# Covers every router mounted below, including /metrics and routes other
+# modules add to api_router, except the /health and /metrics paths it
+# exempts itself.
+app.add_middleware(APIKeyAuthMiddleware)
 
 # Add Prometheus metrics endpoint
 metrics_app = make_asgi_app()

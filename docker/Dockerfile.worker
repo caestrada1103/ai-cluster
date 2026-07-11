@@ -30,9 +30,27 @@
 #   CUDA but injects no Vulkan ICD — wgpu falls back to llvmpipe (CPU). Use the
 #   BACKEND=cuda variant there. On native Linux the NVIDIA Container Toolkit
 #   injects the Vulkan ICD and the default image uses the real GPU.
+#
+# llama-server (agentic serving, Plan 13 — engine="llamaserver"): ALL variants
+# also bake in a `llama-server` binary (Stage 2), built with the Vulkan backend
+# from a PINNED llama.cpp release, at /usr/local/bin/llama-server with
+# ENV LLAMASERVER_BINARY_PATH set. This is what the worker spawns per
+# engine="llamaserver" model (Devstral, Qwen3-Coder — see config/models.toml) to
+# get real OpenAI/Anthropic tool calling; the in-process llama.cpp engine cannot,
+# and cargo does not build it. The default universal image already ships the
+# Vulkan LOADER (libvulkan1 + mesa-vulkan-drivers), so it runs as-is; the vendor
+# ROCm/CUDA variants (RUNTIME_EXTRA_PKGS="") must add "libvulkan1
+# mesa-vulkan-drivers" for GPU offload. To build a pure-Burn / CPU-only image
+# WITHOUT the (heavy) llama.cpp compile, pass --build-arg
+# LLAMASERVER_SRC=llamaserver-none. See docs/deployment.md.
 
 ARG BUILDER_IMAGE=ubuntu:24.04
 ARG RUNTIME_IMAGE=ubuntu:24.04
+# Pinned llama.cpp release for the bundled llama-server (Stage 2). b9941 was
+# released 2026-07-09 (https://github.com/ggml-org/llama.cpp/releases/tag/b9941),
+# well after the mid-March-2026 tool_calls `arguments` bug (issue #20198, fixed in
+# PR #20213). Keep any bump at or beyond that fix.
+ARG LLAMASERVER_TAG=b9941
 
 # ── Stage 1: Build ──────────────────────────────────────────────────────────
 FROM ${BUILDER_IMAGE} AS builder
@@ -100,7 +118,71 @@ COPY worker/models ./models/
 RUN touch src/main.rs && cargo build --release --features="${BACKEND}${WORKER_FEATURES:+,${WORKER_FEATURES}}"
 
 
-# ── Stage 2: Runtime ────────────────────────────────────────────────────────
+# ── Stage 2: llama-server (agentic serving, Plan 13 — engine="llamaserver") ──
+# Builds ONLY the `llama-server` target from the PINNED llama.cpp tag with the
+# Vulkan backend. CMake flags verified against this tag on 2026-07-10 (upstream
+# renames options occasionally):
+#   -DGGML_VULKAN=ON        Vulkan backend (the old LLAMA_VULKAN was renamed to
+#                           GGML_VULKAN when ggml split out of llama.cpp).
+#   -DLLAMA_BUILD_SERVER=ON gate for the tools/server `llama-server` target
+#                           (defined by set(TARGET llama-server) there).
+#   -DBUILD_SHARED_LIBS=OFF standalone llama.cpp defaults this ON, which would
+#                           emit libllama.so/libggml*.so that the binary needs at
+#                           runtime; OFF links them statically so we can copy ONE
+#                           self-contained binary into the runtime image.
+#   -DLLAMA_CURL=OFF        the worker always passes a local `-m <gguf path>`, so
+#                           llama-server never fetches by URL — drops the libcurl
+#                           build+runtime dep (CURL is required-by-default when
+#                           ON and would otherwise fail this build).
+#   -DGGML_NATIVE=OFF       no -march=native, so the image is portable across the
+#                           fleet's CPUs (matches llama.cpp's own vulkan.Dockerfile).
+#   -DLLAMA_BUILD_TESTS=OFF only the server target is needed.
+FROM ${BUILDER_IMAGE} AS llamaserver-build
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG LLAMASERVER_TAG
+
+# Vulkan build deps (Ubuntu 24.04, main/universe): glslc + spirv-headers compile
+# the Vulkan compute shaders, libvulkan-dev links the loader. No GPU is needed to
+# build (shaders are cross-compiled). build-essential provides gcc/strip/OpenMP.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    ca-certificates \
+    glslc \
+    spirv-headers \
+    libvulkan-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Shallow single-tag clone → small, cache-friendly layer.
+RUN git clone --depth 1 --branch "${LLAMASERVER_TAG}" \
+    https://github.com/ggml-org/llama.cpp.git /opt/llama.cpp
+
+WORKDIR /opt/llama.cpp
+RUN cmake -B build \
+    -DGGML_VULKAN=ON \
+    -DLLAMA_BUILD_SERVER=ON \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DLLAMA_CURL=OFF \
+    -DGGML_NATIVE=OFF \
+    -DLLAMA_BUILD_TESTS=OFF \
+    && cmake --build build --target llama-server -j "$(nproc)" \
+    && cp build/bin/llama-server /llama-server \
+    && strip /llama-server
+
+# No-op alternative for a pure-Burn / CPU-only image: build with
+#   --build-arg LLAMASERVER_SRC=llamaserver-none
+# BuildKit then prunes the (unreferenced) llamaserver-build stage above, so none
+# of the llama.cpp compile runs. The stub keeps the runtime COPY valid and fails
+# LOUDLY (exit 127) if an engine="llamaserver" model is ever loaded on such an
+# image — the worker's HTTP health-check sees the child exit during startup.
+FROM ${BUILDER_IMAGE} AS llamaserver-none
+RUN printf '#!/bin/sh\necho "llama-server not built into this image (LLAMASERVER_SRC=llamaserver-none); rebuild the default universal worker image to serve engine=llamaserver models" >&2\nexit 127\n' > /llama-server \
+    && chmod +x /llama-server
+
+
+# ── Stage 3: Runtime ────────────────────────────────────────────────────────
 FROM ${RUNTIME_IMAGE} AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -145,6 +227,17 @@ RUN mkdir -p /app/config /app/models /app/data /app/logs /tmp/worker && \
 WORKDIR /app
 
 COPY --from=builder --chown=worker:worker /build/target/release/ai-worker /usr/local/bin/
+
+# llama-server for agentic serving (Plan 13, engine="llamaserver"), from Stage 2.
+# Statically linked, so the single binary is self-contained (it still uses the
+# Vulkan LOADER libvulkan1 + mesa-vulkan-drivers installed above, plus libgomp1).
+# LLAMASERVER_SRC selects the real build (default) or the no-op stub — see Stage 2.
+ARG LLAMASERVER_SRC=llamaserver-build
+COPY --from=${LLAMASERVER_SRC} /llama-server /usr/local/bin/llama-server
+# The worker spawns this per engine="llamaserver" model. Env wins over
+# worker.toml's llamaserver_binary_path (whose default is "llama-server" on PATH).
+ENV LLAMASERVER_BINARY_PATH=/usr/local/bin/llama-server
+
 COPY --chown=worker:worker config/worker.toml /app/config/
 COPY --chown=worker:worker config/models.toml /app/config/
 COPY --chown=worker:worker docker/entrypoint.sh /app/entrypoint.sh
@@ -159,5 +252,12 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
 
 EXPOSE 50051-50058
 EXPOSE 9091-9098
+# llama-server (Plan 13) registry ports: one per engine="llamaserver" model in
+# config/models.toml (8081 Devstral, 8082 Qwen3-Coder; 8083-8085 reserved for the
+# commented-out DGX Spark tier). The coordinator — possibly on another host —
+# proxies agentic HTTP inference to worker_host:<port>, so these must be published
+# and reachable across the LAN (firewall to the trusted LAN; that hop is
+# unauthenticated — see docs/deployment.md and Plan 15).
+EXPOSE 8081-8085
 
 ENTRYPOINT ["/app/entrypoint.sh"]

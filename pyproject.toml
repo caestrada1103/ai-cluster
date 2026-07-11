@@ -19,6 +19,7 @@ dependencies = [
     "pyyaml>=6.0",
     "toml>=0.10.2",
     "prometheus-client>=0.19.0",
+    "httpx>=0.28.1",  # runtime: transparent llama-server proxy (coordinator/proxy.py, Plan 13)
 ]
 
 [project.optional-dependencies]

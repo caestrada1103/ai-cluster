@@ -113,6 +113,17 @@ class ModelConfig:
     gguf_cache_type_k: Optional[str] = None
     gguf_cache_type_v: Optional[str] = None
 
+    # llama-server engine (Plan 13 — agentic serving). The worker supervises a
+    # `llama-server` child process per model; the coordinator proxies raw
+    # OpenAI/Anthropic JSON+SSE straight to it (see coordinator/proxy.py), so
+    # `tools`, streaming `tool_calls` and Anthropic `/v1/messages` flow through
+    # unmodified. These models reuse the SAME gguf.* source keys as the
+    # in-process `llamacpp` engine (the child still loads a GGUF) plus the
+    # llamaserver.* runtime knobs below.
+    llamaserver_port: Optional[int] = None  # REQUIRED for engine=="llamaserver"; unique per model
+    llamaserver_parallel: Optional[int] = None  # llama-server --parallel (default 4 when emitted)
+    llamaserver_extra_args: Optional[str] = None  # extra CLI args, whitespace-split by the worker
+
     # Level 1 — local multi-GPU split (llama.cpp splitting a model across a
     # single node's OWN same-vendor GPUs, in-process, no network). Both None
     # (the default) is today's behavior: the coordinator picks
@@ -141,11 +152,26 @@ class ModelConfig:
         if self.num_kv_heads is None:
             self.num_kv_heads = self.num_attention_heads
 
-        if self.engine not in ("burn", "llamacpp"):
-            raise ValueError(f"Unknown engine '{self.engine}' (expected 'burn' or 'llamacpp')")
+        if self.engine not in ("burn", "llamacpp", "llamaserver"):
+            raise ValueError(
+                f"Unknown engine '{self.engine}' " "(expected 'burn', 'llamacpp', or 'llamaserver')"
+            )
 
-        if self.engine == "llamacpp" and not (self.gguf_repo_id and self.gguf_file):
-            raise ValueError("llamacpp engine models must set gguf.repo_id and gguf.file")
+        # Both llama.cpp transports load a GGUF: the in-process 'llamacpp' engine
+        # and the 'llamaserver' child process the coordinator proxies to. Both
+        # therefore require the gguf.* source keys.
+        if self.engine in ("llamacpp", "llamaserver") and not (
+            self.gguf_repo_id and self.gguf_file
+        ):
+            raise ValueError(f"{self.engine} engine models must set gguf.repo_id and gguf.file")
+
+        # llamaserver_port is coordinator-assigned and REQUIRED so the proxy
+        # knows where the worker-local llama-server listens (Plan 13 contract).
+        # Registry-wide uniqueness is enforced separately by
+        # ModelRegistry.validate_llamaserver_ports() (a single config can't see
+        # its peers).
+        if self.engine == "llamaserver" and self.llamaserver_port is None:
+            raise ValueError("llamaserver engine models must set llamaserver_port")
 
         if self.gguf_cache_type_k is not None and self.gguf_cache_type_k not in (
             _ALLOWED_KV_CACHE_TYPES
@@ -183,11 +209,14 @@ class ModelConfig:
                 raise ValueError("distributed models must set at least one distributed peer")
 
     def _gguf_metadata(self) -> Dict[str, str]:
-        """Base engine + GGUF-source metadata shared by every llama.cpp
-        transport helper (single-node, distributed lead, and distributed
-        rpc_server all need the same model source keys)."""
+        """Base engine + GGUF-source metadata shared by every GGUF transport
+        helper (in-process single-node, distributed lead, distributed
+        rpc_server, and the llama-server child all need the same model source
+        keys). ``engine`` carries ``self.engine`` verbatim so the worker can
+        dispatch ``"llamacpp"`` (in-process) vs ``"llamaserver"`` (child
+        process) off the same map."""
         metadata: Dict[str, str] = {
-            "engine": "llamacpp",
+            "engine": self.engine,
             "gguf_repo_id": self.gguf_repo_id or "",
             "gguf_file": self.gguf_file or "",
         }
@@ -201,15 +230,37 @@ class ModelConfig:
             metadata["cache_type_v"] = self.gguf_cache_type_v
         return metadata
 
+    def _llamaserver_metadata(self) -> Dict[str, str]:
+        """Metadata for a llamaserver-engine model (Plan 13 Task 2).
+
+        Rides the shared engine/gguf.* source keys from `_gguf_metadata()` (the
+        worker's llama-server child still loads a GGUF) plus the EXACT
+        cross-language contract keys the worker parses to spawn/configure the
+        process: `llamaserver.port`, `llamaserver.parallel`, and — only when set
+        — `llamaserver.extra_args`. Parallel defaults to 4 when unset (maps to
+        llama-server `--parallel`).
+        """
+        metadata = self._gguf_metadata()
+        metadata["llamaserver.port"] = str(self.llamaserver_port)
+        metadata["llamaserver.parallel"] = str(
+            self.llamaserver_parallel if self.llamaserver_parallel is not None else 4
+        )
+        if self.llamaserver_extra_args:
+            metadata["llamaserver.extra_args"] = self.llamaserver_extra_args
+        return metadata
+
     def grpc_metadata(self) -> Dict[str, str]:
         """Engine-routing metadata carried in the gRPC ModelConfig.metadata map.
 
-        The worker's model loader reads these string keys to route the model to
-        the llama.cpp engine. Burn models send an empty map (zero proto change,
-        fully backwards compatible). When `local_tensor_split` is set (Level 1
-        — local multi-GPU split), a `tensor_split` key rides along so the
-        worker can apportion layers across this node's own GPUs.
+        The worker's model loader reads these string keys to route the model.
+        Burn models send an empty map (zero proto change, fully backwards
+        compatible). `llamacpp` models send the gguf.* source (plus a
+        `tensor_split` key for Level-1 local multi-GPU splits). `llamaserver`
+        models send the gguf.* source plus the `llamaserver.*` keys the worker
+        uses to spawn the llama-server child (see `_llamaserver_metadata`).
         """
+        if self.engine == "llamaserver":
+            return self._llamaserver_metadata()
         if self.engine != "llamacpp":
             return {}
         metadata = self._gguf_metadata()
@@ -652,6 +703,14 @@ class ModelRegistry:
                 paths = get_dict(final_data, "paths")
                 hf = get_dict(final_data, "hf")
                 gguf = get_dict(final_data, "gguf")
+                # llama-server knobs: accept either a nested `[models.X.llamaserver]`
+                # table (port/parallel/extra_args, mirrors the dotted metadata
+                # keys) or flat `llamaserver_port`/`llamaserver_parallel`/
+                # `llamaserver_extra_args` keys under the model.
+                llamaserver = get_dict(final_data, "llamaserver")
+                ls_port = llamaserver.get("port", final_data.get("llamaserver_port"))
+                ls_parallel = llamaserver.get("parallel", final_data.get("llamaserver_parallel"))
+                ls_extra = llamaserver.get("extra_args", final_data.get("llamaserver_extra_args"))
                 distributed_cfg = get_dict(final_data, "distributed")
                 distributed_gpu_ids_raw = get_dict(distributed_cfg, "gpu_ids")
 
@@ -709,6 +768,9 @@ class ModelRegistry:
                     gguf_n_ctx=int(gguf["n_ctx"]) if "n_ctx" in gguf else None,
                     gguf_cache_type_k=gguf.get("cache_type_k"),
                     gguf_cache_type_v=gguf.get("cache_type_v"),
+                    llamaserver_port=(int(ls_port) if ls_port is not None else None),
+                    llamaserver_parallel=(int(ls_parallel) if ls_parallel is not None else None),
+                    llamaserver_extra_args=(str(ls_extra) if ls_extra is not None else None),
                     local_gpu_ids=(
                         [int(x) for x in final_data["local_gpu_ids"]]
                         if "local_gpu_ids" in final_data
@@ -737,7 +799,35 @@ class ModelRegistry:
             except Exception as e:
                 logger.error(f"Failed to load model {name} from config: {e}")
 
+        # Fail loudly on a mis-configured registry: two llamaserver models
+        # sharing a port would make the proxy route to the wrong process.
+        cls.validate_llamaserver_ports()
+
         logger.info(f"Updated model registry. Total models: {len(cls.MODELS)}")
+
+    @classmethod
+    def validate_llamaserver_ports(cls, models: Optional[Dict[str, ModelConfig]] = None) -> None:
+        """Assert every llamaserver-engine model has a unique `llamaserver_port`.
+
+        A single `ModelConfig.__post_init__` can only check that its own port is
+        set; registry-wide uniqueness (Plan 13 contract) has to be checked
+        across all entries. Called at the end of `load_from_dict` so a
+        mis-configured `config/models.toml` fails loudly at load time. Raises
+        `ValueError` on the first duplicate. Operates on ``cls.MODELS`` unless an
+        explicit ``models`` mapping is supplied (used by tests for isolation).
+        """
+        registry = cls.MODELS if models is None else models
+        seen: Dict[int, str] = {}
+        for cfg in registry.values():
+            if cfg.engine != "llamaserver" or cfg.llamaserver_port is None:
+                continue
+            owner = seen.get(cfg.llamaserver_port)
+            if owner is not None and owner != cfg.name:
+                raise ValueError(
+                    f"llamaserver_port {cfg.llamaserver_port} is assigned to both "
+                    f"'{owner}' and '{cfg.name}' — ports must be unique per model"
+                )
+            seen[cfg.llamaserver_port] = cfg.name
 
     @classmethod
     def get_model(cls, name: str) -> Optional[ModelConfig]:

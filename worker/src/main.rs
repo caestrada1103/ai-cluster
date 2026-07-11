@@ -25,6 +25,7 @@ mod error;
 mod gpu_manager;
 #[cfg(feature = "llamacpp")]
 mod llamacpp_engine;
+mod llamaserver_process;
 mod metrics;
 mod model_loader;
 #[path = "../models/mod.rs"]
@@ -207,6 +208,14 @@ async fn async_main(
         hf_cache_dir: config.hf_cache_dir.clone(),
         llamacpp_n_threads: config.llamacpp_n_threads,
         llamacpp_default_n_gpu_layers: config.llamacpp_default_n_gpu_layers,
+        // env LLAMASERVER_BINARY_PATH wins over the config file (mirrors HF_TOKEN).
+        llamaserver_binary_path: std::env::var("LLAMASERVER_BINARY_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| config.llamaserver_binary_path.clone()),
+        llamaserver_bind_host: config.llamaserver_bind_host.clone(),
+        // Reuse the worker's single load/inference timeout for /health polling.
+        llamaserver_health_timeout_secs: config.request_timeout_secs,
     };
     let model_loader = Arc::new(ModelLoader::new(loader_config, gpu_manager.clone())?);
 

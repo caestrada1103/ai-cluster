@@ -70,6 +70,17 @@ pub struct WorkerConfig {
     /// ggml-RPC has no auth — never bind this to a public interface
     /// (trusted-LAN only).
     pub rpc_server_bind_host: Option<String>,
+
+    /// Path to the `llama-server` binary the worker spawns for models with
+    /// `engine = "llamaserver"` metadata (Plan 13). NOT built by cargo — install
+    /// llama.cpp's `llama-server` on the host. Env `LLAMASERVER_BINARY_PATH`
+    /// wins over this value. Default `"llama-server"` (resolved on `PATH`).
+    pub llamaserver_binary_path: String,
+
+    /// Bind interface passed to `llama-server --host`. Default `"0.0.0.0"` so
+    /// the coordinator can reach it across the trusted LAN — firewall the
+    /// llamaserver ports to the LAN (there is no built-in auth on that port).
+    pub llamaserver_bind_host: String,
 }
 
 impl Default for WorkerConfig {
@@ -91,6 +102,8 @@ impl Default for WorkerConfig {
             rpc_server_enabled: false,
             rpc_server_port: 50151,
             rpc_server_bind_host: None,
+            llamaserver_binary_path: "llama-server".to_string(),
+            llamaserver_bind_host: "0.0.0.0".to_string(),
         }
     }
 }
@@ -197,5 +210,24 @@ mod tests {
         assert!(config.rpc_server_enabled);
         assert_eq!(config.rpc_server_port, 60000);
         assert_eq!(config.rpc_server_bind_host, Some("0.0.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_llamaserver_defaults() {
+        let config = WorkerConfig::default();
+        assert_eq!(config.llamaserver_binary_path, "llama-server");
+        assert_eq!(config.llamaserver_bind_host, "0.0.0.0");
+    }
+
+    #[test]
+    fn test_llamaserver_keys_parse_from_flat_toml() {
+        let toml_str =
+            "llamaserver_binary_path = \"/opt/llama.cpp/llama-server\"\nllamaserver_bind_host = \"127.0.0.1\"\n";
+        let config: WorkerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.llamaserver_binary_path,
+            "/opt/llama.cpp/llama-server"
+        );
+        assert_eq!(config.llamaserver_bind_host, "127.0.0.1");
     }
 }

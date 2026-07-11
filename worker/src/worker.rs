@@ -215,6 +215,18 @@ impl Worker for WorkerService {
             req.prompt.len()
         );
 
+        // llamaserver-engine models are served over the coordinator's HTTP
+        // proxy (agentic tool-calling / streaming), never through this gRPC
+        // data plane. Reject clearly instead of falling into the generic
+        // "no runnable model" path — and before consuming a concurrency permit.
+        if self.model_loader.is_llamaserver(&req.model_name) {
+            return Err(Status::failed_precondition(format!(
+                "model '{}' uses the llamaserver engine; send agentic inference to the \
+                 coordinator HTTP proxy (POST /v1/...), not the worker gRPC Infer API",
+                req.model_name
+            )));
+        }
+
         // Concurrency limit — reject instead of queueing unboundedly.
         let permit = match self.infer_semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
@@ -390,6 +402,18 @@ impl Worker for WorkerService {
     #[instrument(skip(self))]
     async fn get_status(&self, _request: Request<Empty>) -> Result<Response<WorkerStatus>, Status> {
         debug!("Status request received - waiting for locks");
+
+        // Reap any llama-server children that exited on their own so status
+        // reports them as unloaded (Plan 13 contract: process exit => unloaded).
+        let reaped = self.model_loader.reap_exited_llamaservers().await;
+        if !reaped.is_empty() {
+            let mut models = self.loaded_models.write().await;
+            for name in &reaped {
+                models.remove(name);
+                self.metrics.remove_model_metrics(name);
+            }
+            self.metrics.set_loaded_models(models.len());
+        }
 
         // Get GPU info
         let gpu_infos = self.gpu_manager.get_all_gpu_info().await;

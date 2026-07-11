@@ -73,6 +73,30 @@ rocm-smi                      # AMD
 - **Streaming**: only `POST /v1/chat/completions` streams (SSE);
   `/v1/completions` always buffers. There is no WebSocket endpoint.
 
+## Agentic serving (`engine = "llamaserver"`)
+
+- **`failed to spawn llama-server binary ...`** — the worker can't find
+  `llama-server`. The Docker worker image ships it at
+  `/usr/local/bin/llama-server` (env `LLAMASERVER_BINARY_PATH` preset); on bare
+  metal install it and put it on `PATH` or set `LLAMASERVER_BINARY_PATH`
+  (see [deployment.md](deployment.md) "llama-server for agentic serving"). A
+  pure-Burn image built with `--build-arg LLAMASERVER_SRC=llamaserver-none` has
+  only a stub that exits 127 — rebuild the default worker image to serve
+  llamaserver models.
+- **`llama-server ... did not become healthy` / `exited during startup`** — the
+  child died before its `/health` returned 200. Usual causes: the model OOM'd the
+  GPU (lower `n_ctx`/`parallel` or add MoE CPU-offload via `llamaserver.extra_args`
+  in `config/models.toml`), the `llamaserver_port` is already in use, or a bad
+  `extra_args` flag. Check `docker compose logs worker` for the child's stderr.
+- **Coordinator returns 404/502/504 for a llamaserver model** — the coordinator
+  proxies to `http://<worker_host>:<llamaserver_port>`; it must be able to reach
+  that port over the LAN. Publish 8081/8082 on the worker container (Docker) or
+  open them in the worker's firewall (bare metal). 404 with a "load the model"
+  message means it isn't loaded anywhere yet.
+- **Agent sees garbled/empty tool-call `arguments`** — your `llama-server` build
+  predates the mid-March-2026 fix (llama.cpp issue #20198 / PR #20213). Rebuild
+  at the pinned tag (**b9941** or newer); the Docker image already pins it.
+
 ## Monitoring gaps
 
 - Coordinator metrics: `http://localhost:8000/metrics` (there is NO :9090 coordinator port).

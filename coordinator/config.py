@@ -98,6 +98,19 @@ class Settings(BaseSettings):
         600.0, description="How long a session sticks to a worker (affinity strategy)", gt=0
     )
 
+    # llama-server auto-load-on-demand (Plan 13 Task 5). When True (default), a
+    # proxied request for an `engine="llamaserver"` model that no worker reports
+    # loaded triggers the standard load path on a healthy worker (single-flight
+    # per model) before proxying. When False the coordinator preserves Phase-1
+    # behavior — it 404s and the client must POST /models/load first.
+    llamaserver_autoload: bool = Field(
+        True,
+        description=(
+            "Auto-load an unloaded engine=llamaserver model on demand before proxying "
+            "(env COORDINATOR_LLAMASERVER_AUTOLOAD)"
+        ),
+    )
+
     # Context compression middleware (coordinator/context_compression/) — see
     # pending-work/12-context-compression-pipeline.md. Off by default: a
     # request is only ever touched when (a) this is True or the request sets

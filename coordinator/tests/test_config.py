@@ -164,6 +164,18 @@ def test_context_compression_techniques_accepts_comma_string() -> None:
     assert settings.context_compression_techniques == ["skeletonize", "summarize"]
 
 
+def test_llamaserver_autoload_default_on() -> None:
+    """Plan 13 Task 5 gate defaults to on (auto-load unloaded llamaserver models)."""
+    assert make_settings().llamaserver_autoload is True
+
+
+def test_llamaserver_autoload_env_override(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("COORDINATOR_LLAMASERVER_AUTOLOAD=false\n")
+    s = Settings(_env_file=str(env_file))
+    assert s.llamaserver_autoload is False
+
+
 def test_dead_settings_fields_removed() -> None:
     s = make_settings()
     for dead in (

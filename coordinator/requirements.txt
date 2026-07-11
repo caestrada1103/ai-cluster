@@ -11,6 +11,10 @@ pyyaml==6.0.3
 toml==0.10.2
 prometheus-client==0.19.0
 
+# Transparent HTTP/SSE proxy to worker-local llama-server instances
+# (coordinator/proxy.py — Plan 13 agentic serving). Async client + streaming.
+httpx==0.28.1
+
 # Context compression middleware (coordinator/context_compression/) — see
 # pending-work/12-context-compression-pipeline.md. Pure-Python-wheel installs,
 # no build toolchain required.

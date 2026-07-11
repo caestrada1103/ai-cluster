@@ -52,6 +52,7 @@ dependencies = [
  "proptest",
  "prost",
  "rand 0.8.6",
+ "reqwest",
  "safetensors 0.4.5",
  "serde",
  "serde_json",
