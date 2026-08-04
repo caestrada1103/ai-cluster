@@ -44,8 +44,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
             println!("cargo:rustc-link-search=native={}/lib", cuda_path);
             println!("cargo:rustc-link-lib=dylib=cudart");
-            println!("cargo:rustc-link-lib=dylib=nccl");
             println!("cargo:rustc-link-lib=dylib=cublas");
+
+            // NCCL is a MULTI-GPU collective-communication library. Linking it
+            // unconditionally broke every single-GPU CUDA box that does not
+            // ship it — notably DGX Spark, whose CUDA 13 toolkit has cudart and
+            // cublas but no libnccl, giving `cannot find -lnccl` only at the
+            // final link, after ~10 minutes of CUDA compilation.
+            //
+            // Probe the same directories we just added to the link search path,
+            // plus the multiarch system dir, and link it only if present.
+            let candidates = [
+                format!("{}/lib64", cuda_path),
+                format!("{}/lib", cuda_path),
+                "/usr/lib/x86_64-linux-gnu".to_string(),
+                "/usr/lib/aarch64-linux-gnu".to_string(),
+            ];
+            let has_nccl = candidates.iter().any(|dir| {
+                std::path::Path::new(&format!("{}/libnccl.so", dir)).exists()
+                    || std::path::Path::new(&format!("{}/libnccl.so.2", dir)).exists()
+            });
+            if has_nccl {
+                println!("cargo:rustc-link-lib=dylib=nccl");
+            } else {
+                println!(
+                    "cargo:warning=libnccl not found — building without NCCL. \
+                     This is expected on single-GPU hosts (e.g. DGX Spark); \
+                     multi-GPU collective ops will be unavailable."
+                );
+            }
         }
     }
 
