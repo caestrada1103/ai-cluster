@@ -302,14 +302,24 @@ impl GPUManager {
         }
 
         let lname = adapter_name.to_lowercase();
-        if lname.contains("nvidia") {
-            if let Some(pair) = Self::detect_nvidia_memory(device_idx) {
-                return pair;
-            }
+        let vendor = if lname.contains("nvidia") {
+            Self::detect_nvidia_memory(device_idx)
         } else if lname.contains("amd") || lname.contains("radeon") {
-            if let Some(pair) = Self::detect_amd_memory(device_idx) {
-                return pair;
+            Self::detect_amd_memory(device_idx)
+        } else {
+            None
+        };
+
+        if let Some((total, free)) = vendor {
+            // On unified memory the vendor "free" figure treats reclaimable
+            // page cache as used, so it can understate what is actually
+            // obtainable by tens of GB. Prefer the headroom-adjusted budget,
+            // which is derived from total RAM. See docs/configuration.md.
+            if is_unified {
+                let budget = Self::unified_memory_budget().unwrap_or(total).min(total);
+                return (total, budget.max(free));
             }
+            return (total, free);
         }
 
         let total = Self::estimate_total_memory(is_unified);
