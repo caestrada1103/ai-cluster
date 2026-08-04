@@ -32,6 +32,30 @@
 # block), so `COORDINATOR_STATIC_WORKERS=["worker:50051"]` keeps working no
 # matter which one profile is active. Only activate one single-worker profile
 # at a time — see "Multi-GPU hosts" further down for running several at once.
+#
+# SECURE BY DEFAULT / OPT IN TO EXPOSURE (security audit C1/H1/M11):
+# - No worker (`50051`/`9091`/`8081`/`8082`) or Open-WebUI (`8080`) port is
+#   published to the HOST by this file anymore — only the coordinator's own
+#   API port (`8000`) is. Every worker still binds `0.0.0.0` INSIDE its own
+#   container so the coordinator container can reach it over the private
+#   `ai-cluster-net` bridge (not the same thing as host/LAN exposure —
+#   nothing outside this compose project can reach an unpublished port).
+# - The worker's gRPC server additionally supports a shared-secret
+#   (`WORKER_GRPC_AUTH_TOKEN`, wired in below) — set it once any of these
+#   ports ARE published beyond this host.
+# - To reach a worker (or Open-WebUI) from ANOTHER host — the actual LAN
+#   multi-node cluster case this project targets — explicitly opt in with
+#   the override file: `docker-compose.expose-ports.yml`, e.g.:
+#     docker compose -f docker-compose.yml -f docker-compose.expose-ports.yml \
+#       --profile cuda-native up -d
+#   See that file's header comment and docs/deployment.md.
+# - The coordinator itself REFUSES to start when `COORDINATOR_HOST` is not
+#   loopback and `COORDINATOR_API_KEYS` is unset (see coordinator/main.py) —
+#   since this file's coordinator service DOES publish `8000` to the host by
+#   design (it's the REST API clients are meant to call), set
+#   `COORDINATOR_API_KEYS` in your `.env` before `docker compose up`, or the
+#   coordinator container will exit immediately with an explanatory error.
+#   See .env.example.
 
 services:
   # Coordinator
@@ -46,7 +70,19 @@ services:
       - COORDINATOR_PORT=8000
       - COORDINATOR_DISCOVERY_METHOD=static
       - COORDINATOR_STATIC_WORKERS=["worker:50051"]
-      - COORDINATOR_CORS_ORIGINS=${COORDINATOR_CORS_ORIGINS:-*}
+      # C4: was hardcoded to "*" here, unconditionally — this port IS
+      # published to the host below, so a wildcard-with-no-auth default was
+      # the real-world exposure the audit flagged. Default now comes from
+      # coordinator/config.py (empty + an always-on loopback allowance);
+      # override in .env only when a browser app on another origin needs it.
+      - COORDINATOR_CORS_ORIGINS=${COORDINATOR_CORS_ORIGINS:-}
+      # C4: previously not wired through AT ALL — COORDINATOR_API_KEYS could
+      # be set in the shell/.env forever and the coordinator process would
+      # never see it, silently leaving every route open. Empty by default;
+      # the coordinator now refuses to start with a non-loopback
+      # COORDINATOR_HOST (true here, since 8000 is published) and no keys —
+      # set this in .env before `docker compose up`. See .env.example.
+      - COORDINATOR_API_KEYS=${COORDINATOR_API_KEYS:-}
     volumes:
       - ./config:/app/config:ro
       - ./models:/app/models:ro
@@ -68,6 +104,10 @@ services:
       retries: 3
       start_period: 10s
     restart: unless-stopped
+    # M8: bound, not workload-dependent (unlike the GPU workers, whose
+    # memory need scales with whatever model is loaded) — safe to cap.
+    mem_limit: ${COORDINATOR_MEM_LIMIT:-2g}
+    pids_limit: 512
 
   # ==========================================================================
   # Worker — Universal wgpu/Vulkan, AMD device passthrough
@@ -91,6 +131,13 @@ services:
       - RUST_LOG=${RUST_LOG:-info}
       - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
       - HF_TOKEN=${HF_TOKEN:-}
+      # C1: shared-secret gRPC auth (worker/src/grpc_auth.rs). Empty by
+      # default — this compose network doesn't publish the gRPC port (see
+      # the file header), so loopback-equivalent trust already applies
+      # inside the bridge network. REQUIRED once you publish this worker's
+      # ports via docker-compose.expose-ports.yml or run it as a standalone
+      # LAN-cluster node the coordinator reaches from another host.
+      - WORKER_GRPC_AUTH_TOKEN=${WORKER_GRPC_AUTH_TOKEN:-}
     volumes: &worker-common-volumes
       - ./config:/app/config:ro
       - ./models:/app/models
@@ -99,18 +146,12 @@ services:
       ai-cluster-net:
         aliases:
           - worker
-    ports: &worker-common-ports
-      - "${GRPC_PORT:-50051}:${GRPC_PORT:-50051}"
-      - "${METRICS_PORT:-9091}:${METRICS_PORT:-9091}"
-      # llama-server (Plan 13, engine="llamaserver") registry ports — one per
-      # llamaserver model in config/models.toml (8081 Devstral, 8082 Qwen3-Coder;
-      # coordinator-assigned, globally unique per model). The coordinator proxies
-      # agentic HTTP inference to worker_host:<port>. Within this compose network
-      # it reaches the worker as "worker:8081" without publishing; publish them (as
-      # below) only when the coordinator runs on ANOTHER host and must reach these
-      # over the LAN. Trusted-LAN only — firewall them (that hop is unauthenticated).
-      - "8081:8081"
-      - "8082:8082"
+    # H1/C1: no ports published here by default (was 50051/9091/8081/8082) —
+    # see the file header comment and docker-compose.expose-ports.yml for the
+    # explicit opt-in (LAN cluster / coordinator-on-another-host case). The
+    # worker container still binds these ports on 0.0.0.0 INSIDE its own
+    # network namespace so sibling containers (the coordinator) can reach it
+    # via the "worker" alias — that is not the same as host/LAN exposure.
     logging: *default-logging
     depends_on:
       coordinator:
@@ -119,12 +160,16 @@ services:
     devices:
       - /dev/kfd
       - /dev/dri
-    security_opt:
-      - seccomp=unconfined
     group_add:
       - video
       - render
     restart: unless-stopped
+    # M8: no mem_limit here (unlike coordinator/monitoring) — model size
+    # varies per deployment (a few GB up to 100+ GB unified memory on a DGX
+    # Spark), so a fixed cap would break legitimate large-model configs.
+    # pids_limit is safe regardless of model size (guards against a runaway
+    # fork bomb, not legitimate memory use).
+    pids_limit: 2048
 
   # ==========================================================================
   # Worker — Universal wgpu/Vulkan, NVIDIA device passthrough (same image as
@@ -147,7 +192,7 @@ services:
       ai-cluster-net:
         aliases:
           - worker
-    ports: *worker-common-ports
+    # H1/C1: not published by default — see the file header comment.
     logging: *default-logging
     deploy:
       resources:
@@ -160,6 +205,7 @@ services:
       coordinator:
         condition: service_healthy
     restart: unless-stopped
+    pids_limit: 2048
 
   # ==========================================================================
   # Worker — Universal wgpu/Vulkan, Intel device passthrough. Works out of the
@@ -180,7 +226,7 @@ services:
       ai-cluster-net:
         aliases:
           - worker
-    ports: *worker-common-ports
+    # H1/C1: not published by default — see the file header comment.
     logging: *default-logging
     depends_on:
       coordinator:
@@ -191,6 +237,7 @@ services:
       - video
       - render
     restart: unless-stopped
+    pids_limit: 2048
 
   # ==========================================================================
   # Worker — AMD native ROCm (burn/rocm, maximum AMD performance).
@@ -214,13 +261,18 @@ services:
       ai-cluster-net:
         aliases:
           - worker
-    ports: *worker-common-ports
+    # H1/C1: not published by default — see the file header comment.
     logging: *default-logging
     devices:
       - /dev/kfd
       - /dev/dri
-    security_opt:
-      - seccomp=unconfined
+    # M7: seccomp=unconfined removed — device passthrough + group_add
+    # (video/render) is the modern, narrower way to grant ROCm/KFD access on
+    # current Docker/kernel versions; unconfined disables seccomp filtering
+    # entirely (every syscall allowed), which is broader than this actually
+    # needs. If your ROCm build hits an EPERM/ENOSYS from a blocked syscall
+    # on your kernel, re-add `security_opt: [seccomp=unconfined]` locally as
+    # an explicit, documented exception rather than carrying it by default.
     group_add:
       - video
       - render
@@ -228,6 +280,7 @@ services:
       coordinator:
         condition: service_healthy
     restart: unless-stopped
+    pids_limit: 2048
 
   # ==========================================================================
   # Worker — NVIDIA native CUDA (burn/cuda, maximum NVIDIA performance).
@@ -256,7 +309,7 @@ services:
       ai-cluster-net:
         aliases:
           - worker
-    ports: *worker-common-ports
+    # H1/C1: not published by default — see the file header comment.
     logging: *default-logging
     deploy:
       resources:
@@ -269,6 +322,7 @@ services:
       coordinator:
         condition: service_healthy
     restart: unless-stopped
+    pids_limit: 2048
 
   # ==========================================================================
   # Multi-GPU example: uncomment and adjust for machines with multiple GPUs
@@ -364,6 +418,8 @@ services:
       - "9099:9090"
     logging: *default-logging
     restart: unless-stopped
+    mem_limit: ${PROMETHEUS_MEM_LIMIT:-2g}
+    pids_limit: 256
 
   grafana:
     image: grafana/grafana:11.1.0
@@ -384,8 +440,15 @@ services:
     depends_on:
       - prometheus
     restart: unless-stopped
+    mem_limit: ${GRAFANA_MEM_LIMIT:-1g}
+    pids_limit: 256
 
-  # Open-WebUI (Chat Interface)
+  # Open-WebUI (Chat Interface). M11: WEBUI_AUTH now defaults to True (was
+  # False — "disable login screen for local network", but this service DOES
+  # publish 8080 by default... except it no longer does either, see below)
+  # and the host port is opt-in via docker-compose.expose-ports.yml, same as
+  # the worker ports — set WEBUI_AUTH=False yourself only if you've deliberately
+  # decided this instance never leaves a trusted LAN.
   open-webui:
     image: ghcr.io/open-webui/open-webui:v0.6.5
     container_name: ai-open-webui
@@ -393,17 +456,20 @@ services:
       - OPENAI_API_BASE_URLS=http://coordinator:8000/v1
       - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-placeholder}
       - ENABLE_OLLAMA_API=False
-      - WEBUI_AUTH=False # Disable login screen for local network
+      - WEBUI_AUTH=${WEBUI_AUTH:-True}
     volumes:
       - open-webui-data:/app/backend/data
     networks:
       - ai-cluster-net
-    ports:
-      - "8080:8080"
+    # M11: not published by default — opt in via docker-compose.expose-ports.yml
+    # (adds "8080:8080") once you actually want to browse to this from
+    # outside the host running Docker.
     depends_on:
       coordinator:
         condition: service_healthy
     restart: unless-stopped
+    mem_limit: ${OPEN_WEBUI_MEM_LIMIT:-2g}
+    pids_limit: 512
 
 networks:
   ai-cluster-net:
