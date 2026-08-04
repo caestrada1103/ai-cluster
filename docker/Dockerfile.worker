@@ -16,10 +16,21 @@
 #   NVIDIA native CUDA base:
 #     docker build -f docker/Dockerfile.worker -t ai-worker-nvidia:latest \
 #       --build-arg BACKEND=cuda \
-#       --build-arg BUILDER_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu24.04 \
-#       --build-arg RUNTIME_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04 \
+#       --build-arg BUILDER_IMAGE=nvidia/cuda:13.0.3-devel-ubuntu24.04 \
+#       --build-arg RUNTIME_IMAGE=nvidia/cuda:13.0.3-runtime-ubuntu24.04 \
 #       --build-arg BUILDER_EXTRA_PKGS="" \
-#       --build-arg RUNTIME_EXTRA_PKGS="libcublas-12-6" .
+#       --build-arg RUNTIME_EXTRA_PKGS="libcublas-13-0" .
+#     ⚠ CUDA version note: bumped from 12.6.3 -> 13.0.3 (2026-08) because 12.6's
+#     nvcc predates sm_121 (compute capability 12.1 — NVIDIA Grace-Blackwell
+#     GB10, e.g. DGX Spark) support; nvcc 13.0 lists both compute_120/sm_120 and
+#     compute_121/sm_121. 13.0.x devel+runtime tags were confirmed (via the
+#     Docker Hub registry HTTP API, 2026-08-03) to publish BOTH linux/amd64 and
+#     linux/arm64 manifests, so this stays multi-arch — RTX 3080 (x86_64) and
+#     DGX Spark (aarch64) build from the exact same tags. `libcublas-13-0` is
+#     the matching apt package name (confirmed against the NVIDIA CUDA apt repo
+#     Packages index — the `-12-6`-style suffix tracks the CUDA major.minor,
+#     not the image patch version). This does not affect the default wgpu/
+#     Vulkan image or the AMD ROCm variant.
 #
 # GPU passthrough (unchanged conventions):
 #   AMD    → mount /dev/kfd + /dev/dri, group_add: [video, render]
@@ -43,6 +54,10 @@
 # mesa-vulkan-drivers" for GPU offload. To build a pure-Burn / CPU-only image
 # WITHOUT the (heavy) llama.cpp compile, pass --build-arg
 # LLAMASERVER_SRC=llamaserver-none. See docs/deployment.md.
+#
+# ⚠ Node.js is required to build Stage 2 (verified on real DGX Spark hardware,
+# 2026-08-03 — see Stage 2 comments below for why `-DLLAMA_BUILD_UI=OFF` does
+# NOT avoid this).
 
 ARG BUILDER_IMAGE=ubuntu:24.04
 ARG RUNTIME_IMAGE=ubuntu:24.04
@@ -137,6 +152,30 @@ RUN touch src/main.rs && cargo build --release --features="${BACKEND}${WORKER_FE
 #   -DGGML_NATIVE=OFF       no -march=native, so the image is portable across the
 #                           fleet's CPUs (matches llama.cpp's own vulkan.Dockerfile).
 #   -DLLAMA_BUILD_TESTS=OFF only the server target is needed.
+#
+# ── Node.js requirement (verified on real DGX Spark hardware, 2026-08-03) ────
+# tools/CMakeLists.txt unconditionally does `add_subdirectory(ui)` whenever
+# LLAMA_BUILD_SERVER=ON (it does NOT gate on LLAMA_BUILD_UI — that option only
+# controls what ui/CMakeLists.txt does *once entered*), and
+# tools/server/CMakeLists.txt links the resulting `llama-ui` static lib into
+# the `llama-server` target. So the embedded Web UI is a HARD dependency of
+# this build — confirmed against the b9941 source itself (and unchanged on
+# upstream master). Passing `-DLLAMA_BUILD_UI=OFF` does NOT skip it: it merely
+# skips the npm step inside ui/CMakeLists.txt, which then falls through to
+# downloading prebuilt assets from a Hugging Face bucket — a network-dependent
+# fallback with its own failure modes (version/bucket resolution, HF
+# reachability) that we do not want to depend on for a reproducible build.
+# tools/ui/package.json pins vite 7.3.5, which requires Node 20.19+ or
+# 22.12+ — Ubuntu 24.04's apt `nodejs` is 18.x and too old, and Debian/Ubuntu
+# does not backport newer majors. Fix: provision a real Node 22 via
+# multi-stage COPY from the official `node` image (deterministic, no piping a
+# vendor install script into a root shell, works identically across the
+# ubuntu/rocm/cuda BUILDER_IMAGE variants since they're all glibc-compatible
+# Ubuntu 24.04 bases). This makes the npm path (CMake's own first-choice
+# provisioning method) succeed directly, so the fragile HF-bucket fallback is
+# never needed.
+FROM node:22-bookworm-slim AS node-toolchain
+
 FROM ${BUILDER_IMAGE} AS llamaserver-build
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -144,7 +183,8 @@ ARG LLAMASERVER_TAG
 
 # Vulkan build deps (Ubuntu 24.04, main/universe): glslc + spirv-headers compile
 # the Vulkan compute shaders, libvulkan-dev links the loader. No GPU is needed to
-# build (shaders are cross-compiled). build-essential provides gcc/strip/OpenMP.
+# build (shaders are cross-compiled). build-essential provides gcc/strip/OpenMP
+# (also satisfies Node's runtime needs for libstdc++/libgcc_s below).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
@@ -154,6 +194,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     spirv-headers \
     libvulkan-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Node 22 (>=22.12, satisfies vite 7's engines requirement) for the embedded
+# Web UI's npm build — see the block comment above Stage 2 for why this is
+# unavoidable at this llama.cpp tag. Copied in from the official Node image
+# rather than an apt/NodeSource repo so the exact binary is content-addressed
+# by the base image digest and identical across BACKEND=wgpu/rocm/cuda builds.
+COPY --from=node-toolchain /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-toolchain /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && \
+    node --version && npm --version
 
 # Shallow single-tag clone → small, cache-friendly layer.
 RUN git clone --depth 1 --branch "${LLAMASERVER_TAG}" \
@@ -167,6 +218,7 @@ RUN cmake -B build \
     -DLLAMA_CURL=OFF \
     -DGGML_NATIVE=OFF \
     -DLLAMA_BUILD_TESTS=OFF \
+    -DLLAMA_BUILD_UI=ON \
     && cmake --build build --target llama-server -j "$(nproc)" \
     && cp build/bin/llama-server /llama-server \
     && strip /llama-server
