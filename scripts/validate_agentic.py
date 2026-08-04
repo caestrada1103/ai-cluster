@@ -55,6 +55,9 @@ TOOLS_MAX_TOKENS = 256
 KNOWN_LLAMASERVER_MODELS: Tuple[str, ...] = (
     "devstral-small-2-24b-instruct-gguf",
     "qwen3-coder-30b-a3b-instruct-gguf",
+    # DGX Spark tier (Plan 16). Keep this list in sync with the
+    # `engine = "llamaserver"` entries in config/models.toml.
+    "qwen3.6-35b-a3b-gguf",
 )
 
 PASS = "PASS"
