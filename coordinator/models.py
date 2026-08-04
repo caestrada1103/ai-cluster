@@ -128,7 +128,9 @@ class ModelConfig:
     # in-process `llamacpp` engine (the child still loads a GGUF) plus the
     # llamaserver.* runtime knobs below.
     llamaserver_port: Optional[int] = None  # REQUIRED for engine=="llamaserver"; unique per model
-    llamaserver_parallel: Optional[int] = None  # llama-server --parallel (default 4 when emitted)
+    # Concurrent conversation slots ("instances"), maps to llama-server --parallel.
+    # Registry key is `instances` (alias `parallel`); default 1 when unset.
+    llamaserver_parallel: Optional[int] = None
     llamaserver_extra_args: Optional[str] = None  # extra CLI args, whitespace-split by the worker
 
     # Level 1 — local multi-GPU split (llama.cpp splitting a model across a
@@ -239,26 +241,26 @@ class ModelConfig:
             metadata["n_cpu_moe"] = str(self.gguf_n_cpu_moe)
         return metadata
 
-    def _llamaserver_metadata(self) -> Dict[str, str]:
+    def _llamaserver_metadata(self, instances: Optional[int] = None) -> Dict[str, str]:
         """Metadata for a llamaserver-engine model (Plan 13 Task 2).
 
         Rides the shared engine/gguf.* source keys from `_gguf_metadata()` (the
         worker's llama-server child still loads a GGUF) plus the EXACT
         cross-language contract keys the worker parses to spawn/configure the
         process: `llamaserver.port`, `llamaserver.parallel`, and — only when set
-        — `llamaserver.extra_args`. Parallel defaults to 4 when unset (maps to
-        llama-server `--parallel`).
+        — `llamaserver.extra_args`. `instances` (a per-request override, e.g. from
+        POST /v1/models/load) wins over the registry value, which defaults to 1.
         """
         metadata = self._gguf_metadata()
         metadata["llamaserver.port"] = str(self.llamaserver_port)
-        metadata["llamaserver.parallel"] = str(
-            self.llamaserver_parallel if self.llamaserver_parallel is not None else 4
-        )
+        registry_value = self.llamaserver_parallel if self.llamaserver_parallel is not None else 1
+        resolved_instances = instances if instances is not None else registry_value
+        metadata["llamaserver.parallel"] = str(resolved_instances)
         if self.llamaserver_extra_args:
             metadata["llamaserver.extra_args"] = self.llamaserver_extra_args
         return metadata
 
-    def grpc_metadata(self) -> Dict[str, str]:
+    def grpc_metadata(self, instances: Optional[int] = None) -> Dict[str, str]:
         """Engine-routing metadata carried in the gRPC ModelConfig.metadata map.
 
         The worker's model loader reads these string keys to route the model.
@@ -267,9 +269,11 @@ class ModelConfig:
         `tensor_split` key for Level-1 local multi-GPU splits). `llamaserver`
         models send the gguf.* source plus the `llamaserver.*` keys the worker
         uses to spawn the llama-server child (see `_llamaserver_metadata`).
+        `instances` overrides the registry's `llamaserver_parallel`/`instances`
+        value for `engine == "llamaserver"` models; ignored otherwise.
         """
         if self.engine == "llamaserver":
-            return self._llamaserver_metadata()
+            return self._llamaserver_metadata(instances)
         if self.engine != "llamacpp":
             return {}
         metadata = self._gguf_metadata()
@@ -718,7 +722,11 @@ class ModelRegistry:
                 # `llamaserver_extra_args` keys under the model.
                 llamaserver = get_dict(final_data, "llamaserver")
                 ls_port = llamaserver.get("port", final_data.get("llamaserver_port"))
+                # `instances` is the canonical key; `parallel` is kept as an
+                # alias so existing entries keep working unchanged.
+                ls_instances = llamaserver.get("instances", final_data.get("llamaserver_instances"))
                 ls_parallel = llamaserver.get("parallel", final_data.get("llamaserver_parallel"))
+                ls_parallel = ls_instances if ls_instances is not None else ls_parallel
                 ls_extra = llamaserver.get("extra_args", final_data.get("llamaserver_extra_args"))
                 distributed_cfg = get_dict(final_data, "distributed")
                 distributed_gpu_ids_raw = get_dict(distributed_cfg, "gpu_ids")
