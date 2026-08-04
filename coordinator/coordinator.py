@@ -12,6 +12,7 @@ import grpc
 
 import coordinator.proto.cluster_pb2 as pb
 import coordinator.proto.cluster_pb2_grpc as pb_grpc
+from coordinator import audit
 from coordinator.config import Settings
 from coordinator.discovery import WorkerDiscovery
 from coordinator.models import ModelRegistry, Quantization
@@ -431,7 +432,10 @@ class ClusterCoordinator:
         return next(iter(healthy.values()))
 
     async def ensure_llamaserver_model_loaded(
-        self, model_name: str, session_id: Optional[str] = None
+        self,
+        model_name: str,
+        session_id: Optional[str] = None,
+        caller: Optional[str] = None,
     ) -> WorkerInfo:
         """Ensure ``model_name`` is loaded on a healthy worker, loading on demand.
 
@@ -458,10 +462,24 @@ class ClusterCoordinator:
             if target is None:
                 raise RuntimeError(f"No healthy worker available to auto-load model '{model_name}'")
 
-            loaded = await self._load_model_on_worker(target, model_name)
+            loaded = await self._load_model_on_worker(target, model_name, caller=caller)
             if not loaded:
+                audit.record(
+                    audit.ACTION_MODEL_AUTOLOAD,
+                    caller=caller or "unknown",
+                    outcome=audit.OUTCOME_FAILURE,
+                    model=model_name,
+                    worker=target.id,
+                )
                 raise RuntimeError(f"Failed to load model '{model_name}' on worker {target.id}")
 
+            audit.record(
+                audit.ACTION_MODEL_AUTOLOAD,
+                caller=caller or "unknown",
+                outcome=audit.OUTCOME_SUCCESS,
+                model=model_name,
+                worker=target.id,
+            )
             # Reflect the load immediately so waiters don't trigger a second
             # load; get_status() overwrites this on its next health tick.
             target.loaded_models.setdefault(model_name, pb.LoadedModelInfo(model_name=model_name))
@@ -585,6 +603,7 @@ class ClusterCoordinator:
         model_name: str,
         quantization: Quantization = Quantization.NONE,
         instances: Optional[int] = None,
+        caller: Optional[str] = None,
     ) -> bool:
         """Load a model on a worker.
 
@@ -671,7 +690,18 @@ class ClusterCoordinator:
                 )
                 # Refresh state synchronously instead of waiting on the
                 # periodic health-check loop, so callers see it immediately.
+                before = set(worker.loaded_models)
                 await self._refresh_worker_state(worker)
+                # The worker may have evicted another model on its own to fit
+                # this one — the only place that eviction is observable.
+                for evicted in before - set(worker.loaded_models):
+                    audit.record(
+                        audit.ACTION_MODEL_EVICTED,
+                        caller=caller or "unknown",
+                        outcome=audit.OUTCOME_SUCCESS,
+                        model=evicted,
+                        worker=worker.id,
+                    )
                 return True
             else:
                 logger.error(f"Failed to load model: {response.message}")

@@ -14,11 +14,13 @@ a v1 route is reachable (not 401'd) rather than asserting its exact
 """
 
 import inspect
+from pathlib import Path
 
 import pytest
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
-from coordinator import auth
+from coordinator import auth, identity
 from coordinator.main import app
 
 client = TestClient(app)
@@ -26,8 +28,11 @@ client = TestClient(app)
 
 @pytest.fixture(autouse=True)
 def _clear_api_keys_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Ensure no stray COORDINATOR_API_KEYS leaks in from the real environment/.env."""
+    """Ensure no stray COORDINATOR_API_KEYS/COORDINATOR_API_KEY_FILE leaks in
+    from the real environment/.env."""
     monkeypatch.delenv("COORDINATOR_API_KEYS", raising=False)
+    monkeypatch.delenv("COORDINATOR_API_KEY_FILE", raising=False)
+    identity._file_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -206,3 +211,101 @@ def test_options_preflight_bypasses_auth_when_keys_set(monkeypatch: pytest.Monke
         },
     )
     assert response.status_code != 401
+
+
+# ---------------------------------------------------------------------------
+# load_api_keys() merges the identity file
+# ---------------------------------------------------------------------------
+
+
+def test_load_api_keys_merges_identity_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    toml_path = tmp_path / "keys.toml"
+    toml_path.write_text('[keys.ops]\nkey = "file-only-secret"\nrole = "admin"\n')
+    monkeypatch.setenv("COORDINATOR_API_KEY_FILE", str(toml_path))
+    monkeypatch.setenv("COORDINATOR_API_KEYS", "flat-secret")
+
+    keys = auth.load_api_keys()
+
+    assert "flat-secret" in keys
+    assert "file-only-secret" in keys
+
+
+def test_load_api_keys_file_only_is_enough_to_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A deployment configuring only the file must still count as 'auth
+    configured' for callers like main.py's insecure-bind refusal and the
+    manual-worker-registration gate."""
+    toml_path = tmp_path / "keys.toml"
+    toml_path.write_text('[keys.ops]\nkey = "file-only-secret"\nrole = "admin"\n')
+    monkeypatch.setenv("COORDINATOR_API_KEY_FILE", str(toml_path))
+
+    assert auth.load_api_keys() == {"file-only-secret"}
+
+
+# ---------------------------------------------------------------------------
+# request.state.caller / caller_from_request
+# ---------------------------------------------------------------------------
+
+_probe_app = FastAPI()
+_probe_app.add_middleware(auth.APIKeyAuthMiddleware)
+
+
+@_probe_app.get("/probe")
+async def _probe(request: Request) -> dict:  # type: ignore[type-arg]
+    caller = auth.caller_from_request(request)
+    return {"id": caller.id, "role": caller.role, "models": sorted(caller.models)}
+
+
+_probe_client = TestClient(_probe_app)
+
+
+def test_request_state_caller_populated_for_valid_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    toml_path = tmp_path / "keys.toml"
+    toml_path.write_text('[keys.ci-runner]\nkey = "ci-secret"\nrole = "user"\n')
+    monkeypatch.setenv("COORDINATOR_API_KEY_FILE", str(toml_path))
+
+    response = _probe_client.get("/probe", headers={"x-api-key": "ci-secret"})
+
+    assert response.status_code == 200
+    assert response.json() == {"id": "ci-runner", "role": "user", "models": []}
+
+
+def test_caller_from_request_returns_unrestricted_when_auth_off() -> None:
+    response = _probe_client.get("/probe")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == identity.UNRESTRICTED.id
+    assert body["role"] == identity.UNRESTRICTED.role
+
+
+# ---------------------------------------------------------------------------
+# Unusable identity file: fail closed, never fall through open
+# ---------------------------------------------------------------------------
+
+
+def test_unusable_identity_file_returns_503_not_open_access(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    toml_path = tmp_path / "keys.toml"
+    toml_path.write_text("this is not [ valid toml")
+    monkeypatch.setenv("COORDINATOR_API_KEY_FILE", str(toml_path))
+
+    response = _probe_client.get("/probe", headers={"x-api-key": "anything"})
+
+    assert response.status_code == 503
+    assert response.json()["error"]["type"] == "server_error"
+
+
+def test_unusable_identity_file_keeps_health_and_metrics_exempt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    toml_path = tmp_path / "keys.toml"
+    toml_path.write_text("this is not [ valid toml")
+    monkeypatch.setenv("COORDINATOR_API_KEY_FILE", str(toml_path))
+
+    assert client.get("/health").status_code == 200

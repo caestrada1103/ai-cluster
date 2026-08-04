@@ -1,6 +1,7 @@
 """Minimal opt-in API-key auth for the coordinator's HTTP surface.
 
-Keys come from ``COORDINATOR_API_KEYS`` (comma-separated), read live from
+Keys come from ``COORDINATOR_API_KEYS`` (comma-separated) and/or
+``COORDINATOR_API_KEY_FILE`` (see ``coordinator.identity``), read live from
 the environment rather than ``Settings``. Empty/unset ⇒ no-op (every route
 open). Set ⇒ every route needs ``Authorization: Bearer <key>`` or
 ``x-api-key: <key>``, except ``/health`` and ``/metrics``. See
@@ -9,13 +10,18 @@ docs/configuration.md.
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
-from typing import FrozenSet, Optional
+from typing import Any, FrozenSet, Optional
 
 from starlette.datastructures import Headers
+from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+from coordinator import identity
+from coordinator.identity import Caller
 
 #: Paths that stay reachable with no API key, even when auth is enabled.
 _EXEMPT_PATHS: FrozenSet[str] = frozenset({"/health", "/metrics"})
@@ -24,15 +30,24 @@ _UNAUTHORIZED_BODY = {
     "error": {"message": "invalid or missing API key", "type": "authentication_error"}
 }
 
+#: Returned when the identity file is unusable — fail closed rather than
+#: fall back to an open or partially-resolved key set.
+_CONFIG_ERROR_BODY = {
+    "error": {"message": "API key configuration is unusable", "type": "server_error"}
+}
+
+logger = logging.getLogger(__name__)
+
 
 def load_api_keys() -> FrozenSet[str]:
-    """Parse ``COORDINATOR_API_KEYS`` from the environment.
+    """Return the merged valid-key set: flat env keys union identity-file keys.
 
     Re-read on every call (not cached) so a running process picks up a
-    changed env without a restart.
+    changed env/file without a restart.
     """
     raw = os.environ.get("COORDINATOR_API_KEYS", "")
-    return frozenset(key.strip() for key in raw.split(",") if key.strip())
+    flat_keys = frozenset(key.strip() for key in raw.split(",") if key.strip())
+    return flat_keys | frozenset(identity.load_identities().keys())
 
 
 def _is_exempt(path: str) -> bool:
@@ -85,12 +100,18 @@ class APIKeyAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        valid_keys = load_api_keys()
-        if not valid_keys:
+        if _is_exempt(scope["path"]):
             await self.app(scope, receive, send)
             return
 
-        if _is_exempt(scope["path"]):
+        try:
+            valid_keys = load_api_keys()
+        except ValueError as exc:
+            logger.error("Refusing the request: %s", exc)
+            await JSONResponse(_CONFIG_ERROR_BODY, status_code=503)(scope, receive, send)
+            return
+
+        if not valid_keys:
             await self.app(scope, receive, send)
             return
 
@@ -113,4 +134,19 @@ class APIKeyAuthMiddleware:
             await response(scope, receive, send)
             return
 
+        try:
+            caller = identity.resolve_caller(candidate)
+        except ValueError as exc:
+            logger.error("Refusing the request: %s", exc)
+            await JSONResponse(_CONFIG_ERROR_BODY, status_code=503)(scope, receive, send)
+            return
+        if caller is not None:
+            scope.setdefault("state", {})["caller"] = caller
+
         await self.app(scope, receive, send)
+
+
+def caller_from_request(request: "Request[Any]") -> Caller:
+    """The `Caller` resolved for `request`, or UNRESTRICTED when auth is off."""
+    caller = getattr(request.state, "caller", None)
+    return caller if isinstance(caller, Caller) else identity.UNRESTRICTED

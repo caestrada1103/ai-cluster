@@ -284,6 +284,7 @@ def _fake_request(
 
     return SimpleNamespace(
         app=SimpleNamespace(state=SimpleNamespace(coordinator=coordinator)),
+        state=SimpleNamespace(),
         url=SimpleNamespace(path=path),
         method=method,
         headers=headers or {"content-type": "application/json"},
@@ -317,7 +318,9 @@ class _AutoloadCoordinator:
     async def find_worker_for_model(self, name: str, session_id: Any = None) -> Any:
         return None
 
-    async def ensure_llamaserver_model_loaded(self, name: str, session_id: Any = None) -> Any:
+    async def ensure_llamaserver_model_loaded(
+        self, name: str, session_id: Any = None, caller: Any = None
+    ) -> Any:
         self.ensure_calls += 1
         return SimpleNamespace(address=self._address, id="w-auto")
 
@@ -331,7 +334,9 @@ class _AutoloadFailCoordinator:
     async def find_worker_for_model(self, name: str, session_id: Any = None) -> Any:
         return None
 
-    async def ensure_llamaserver_model_loaded(self, name: str, session_id: Any = None) -> Any:
+    async def ensure_llamaserver_model_loaded(
+        self, name: str, session_id: Any = None, caller: Any = None
+    ) -> Any:
         raise RuntimeError("llama-server health check timed out")
 
 
@@ -492,7 +497,7 @@ async def test_autoload_single_flight_loads_once(monkeypatch: Any) -> None:
 
     load_calls = 0
 
-    async def fake_load(w: Any, name: str, quantization: Any = None) -> bool:
+    async def fake_load(w: Any, name: str, quantization: Any = None, caller: Any = None) -> bool:
         nonlocal load_calls
         load_calls += 1
         # Hold the single-flight lock while the other callers pile up behind it.
@@ -532,7 +537,7 @@ async def test_autoload_load_failure_raises(monkeypatch: Any) -> None:
     worker.state = WorkerState.HEALTHY
     coord.workers["w1"] = worker
 
-    async def fake_load(w: Any, name: str, quantization: Any = None) -> bool:
+    async def fake_load(w: Any, name: str, quantization: Any = None, caller: Any = None) -> bool:
         return False
 
     monkeypatch.setattr(coord, "_load_model_on_worker", fake_load)

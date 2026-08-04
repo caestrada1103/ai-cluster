@@ -11,7 +11,9 @@ Rate limiting is still planned, not implemented.
 Interactive docs: `/docs` (Swagger UI), `/redoc`, schema at `/openapi.json`.
 
 Errors use FastAPI's standard shape — `{"detail": "<message>"}` — with status
-codes 200, 401 (missing/bad API key), 404, 413 (request body over
+codes 200, 401 (missing/bad API key), 403 (admin-required route with a
+non-admin key, or a model outside the key's scope — see
+[configuration.md](configuration.md)), 404, 413 (request body over
 `COORDINATOR_MAX_REQUEST_BODY_BYTES`, 25 MB default), 422 (validation), 500,
 503 (no workers / not ready), 504 (timeout).
 
@@ -41,9 +43,12 @@ Returns a bare JSON array:
 ]
 ```
 
-### POST /v1/workers/manual
+### POST /v1/workers/manual (admin-only)
 
 Body: a JSON array of `host:port` strings. Connects each and reports per-address status.
+Requires an admin API key when `COORDINATOR_API_KEY_FILE` is configured (see
+[configuration.md](configuration.md)), on top of its existing
+feature-flag/credential gates.
 
 ```bash
 curl -X POST http://localhost:8000/v1/workers/manual \
@@ -52,7 +57,10 @@ curl -X POST http://localhost:8000/v1/workers/manual \
 
 ### GET /v1/models
 
-OpenAI-style list with cluster extensions:
+OpenAI-style list with cluster extensions. When the calling key has a model
+scope (`COORDINATOR_API_KEY_FILE`), the list is filtered to only the models
+that key may address; an unrestricted key, or auth off entirely, sees every
+registered model.
 
 ```json
 {
@@ -80,7 +88,11 @@ quantized. A registry entry with `engine = "llamacpp"` runs a GGUF file
 that's already quantized (e.g. Q4_K_M) regardless of this field; see
 [configuration.md](configuration.md).
 
-### POST /v1/models/load
+### POST /v1/models/load (admin-only)
+
+Requires an admin API key when `COORDINATOR_API_KEY_FILE` is configured; a
+`models`-scoped key is also refused (403) for a `model_name` outside its
+scope. See [configuration.md](configuration.md).
 
 Request: `{"model_name": "<registry key or HF repo id>", "worker_id": null, "quantization": "none", "instances": null}`
 — the `quantization` field only accepts `"none"` today (other values are
@@ -94,10 +106,12 @@ number of concurrent conversation slots; see
 [configuration.md](configuration.md).
 Response: `{"status": "loaded"|"failed", "model_name": "...", "worker_id": "...", "memory_used_gb": null, "message": null}`
 
-### DELETE /v1/models/{model_name}
+### DELETE /v1/models/{model_name} (admin-only)
 
 Unloads the model and frees GPU memory on every worker holding it (or one
-worker via `?worker_id=`). 404 when not loaded anywhere.
+worker via `?worker_id=`). 404 when not loaded anywhere. Requires an admin
+API key when `COORDINATOR_API_KEY_FILE` is configured; a `models`-scoped key
+is also refused (403) for a model outside its scope.
 
 ```json
 {"status": "unloaded", "model_name": "llama3-8b", "workers": ["worker-0"]}

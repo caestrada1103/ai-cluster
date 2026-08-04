@@ -16,6 +16,7 @@ keys are ignored, so the shared `.env` can also carry worker variables.
 | `COORDINATOR_HOST` | `0.0.0.0` | Bind address. Refuses to start when this is not loopback (`127.0.0.1`/`::1`/`localhost`) AND `COORDINATOR_API_KEYS` is unset — secure by default. |
 | `COORDINATOR_PORT` | `8000` | HTTP port |
 | `COORDINATOR_API_KEYS` | *(unset)* | Comma-separated API keys gating the whole HTTP surface (except `/health`/`/metrics`); `Authorization: Bearer <key>` or `x-api-key: <key>`. Empty = open (only safe with a loopback `COORDINATOR_HOST`). |
+| `COORDINATOR_API_KEY_FILE` | *(unset)* | Path to a TOML file assigning a `role`/`models` identity to individual keys, layered on top of `COORDINATOR_API_KEYS`. See "Per-key identity" below. |
 | `COORDINATOR_DISCOVERY_METHOD` | `static` | Only `static` is implemented (`mdns`/`broadcast`/`consul` are planned and fail fast) |
 | `COORDINATOR_STATIC_WORKERS` | `[]` | Comma-separated `host:port` list (or JSON array) |
 | `COORDINATOR_DISCOVERY_INTERVAL` | `30` | Discovery loop seconds (min 5) |
@@ -35,19 +36,23 @@ keys are ignored, so the shared `.env` can also carry worker variables.
 | `COORDINATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Failures before a worker's circuit opens |
 | `COORDINATOR_CIRCUIT_BREAKER_RECOVERY_TIMEOUT` | `30.0` | Seconds before half-open |
 | `COORDINATOR_AFFINITY_TTL_SECONDS` | `600.0` | Session stickiness TTL (affinity strategy) |
+| `COORDINATOR_LLAMASERVER_SLOT_AFFINITY` | `true` | Pin a resolved caller to a consistent llama-server conversation slot (`id_slot`) on `engine="llamaserver"` models with 2+ slots. Only takes effect once `COORDINATOR_API_KEY_FILE` is set. See "llama-server knobs" below. |
 
 There is no `coordinator.yaml` — YAML config was removed in favor of env-only.
 
 ### Security notes
 
-- **API keys**: env-only (`COORDINATOR_API_KEYS`), checked via
-  `Authorization: Bearer <key>` or `x-api-key: <key>`. `/health` and
+- **API keys**: env-only (`COORDINATOR_API_KEYS` and/or
+  `COORDINATOR_API_KEY_FILE`), checked via `Authorization: Bearer <key>` or
+  `x-api-key: <key>`. The valid-key set is the union of both sources,
+  re-read on every request (no restart needed after an edit). `/health` and
   `/metrics` are always exempt. Comparison is constant-time over UTF-8 bytes
   (not `hmac.compare_digest` directly, which requires ASCII-only `str`
   arguments and would 500 on a non-ASCII candidate key instead of 401ing). A
   CORS preflight (`OPTIONS`) always bypasses the key check — browsers don't
   attach credentials to preflights, and gating it would make browsers
   misreport a 401 as a CORS failure.
+
 - **Middleware order**: `add_middleware` prepends, so registration order is
   reversed at request time. Auth is registered before CORS so a preflight
   reaches CORS first; the request-body-size cap is registered last (so it
@@ -69,6 +74,74 @@ There is no `coordinator.yaml` — YAML config was removed in favor of env-only.
   HuggingFace repo id.
 - **Context-compression budget**: sized as `n_ctx - max_tokens - 512`, where
   512 is headroom for chat-template/formatting overhead.
+
+#### Per-key identity (`COORDINATOR_API_KEY_FILE`)
+
+`COORDINATOR_API_KEYS` alone still behaves exactly as before: every key it
+lists resolves to an admin, unrestricted caller — this is the compatibility
+guarantee for a deployment that sets nothing new. Pointing
+`COORDINATOR_API_KEY_FILE` at a TOML file layers a role and an optional
+model scope onto individual keys instead:
+
+```toml
+[keys.ci-runner]
+key = "3f9a..."
+role = "user"                   # "admin" or "user"; default "user"
+models = ["qwen2.5-0.5b-gguf"]  # omitted or [] = unrestricted
+
+[keys.ops]
+key = "b711..."
+role = "admin"
+```
+
+The table label (`ci-runner`, `ops`) is the caller id recorded in the audit
+log. Once the file is configured: a key defined in it uses that entry; a key
+present only in `COORDINATOR_API_KEYS` is demoted to `role = "user"` with an
+unrestricted model list; this holds even when the file declares zero keys.
+The file is validated strictly and fails closed — bad TOML, a missing or
+empty `key`, an invalid `role`, a non-string/empty `models` entry, a
+duplicate key across labels, or an unknown top-level table all raise, and
+the coordinator responds 503 to every request rather than falling back to
+open or partially-resolved access. The parsed file is cached on
+`(path, mtime, size)`, so an edit is picked up without a restart but a
+request doesn't re-parse the TOML every time. Key comparison is the same
+constant-time UTF-8-byte comparison used for `COORDINATOR_API_KEYS`.
+
+#### Model scoping
+
+A key's `models` list (from `COORDINATOR_API_KEY_FILE`) restricts which
+model names it may address on `/v1/completions`, `/v1/chat/completions`,
+`/v1/messages`, `/v1/messages/count_tokens`, `/v1/embeddings`, `/infill`,
+`POST /v1/models/load`, and `DELETE /v1/models/{model_name}`. A request
+naming any other model gets **403, never 404** — and the message is
+identical whether or not that model actually exists in the registry, so the
+response never reveals which models are registered to a key that's probing
+for them. `GET /v1/models` returns only the models a key may address (an
+unrestricted key, or auth off entirely, still sees everything). An empty or
+absent `models` list means unrestricted, same as a plain
+`COORDINATOR_API_KEYS` entry.
+
+#### Admin-only routes
+
+`POST /v1/models/load`, `DELETE /v1/models/{model_name}`, and
+`POST /v1/workers/manual` additionally require `role = "admin"`; a
+non-admin key gets 403. `/v1/workers/manual` keeps its existing gates too
+(feature flag off by default, plus its own independent credential check) —
+the admin check runs after those, so its existing 401/403 responses for a
+disabled or unauthenticated request are unchanged.
+
+#### Audit log
+
+Management actions (`model.load`, `model.unload`, `model.autoload`,
+`model.evicted`, `worker.register`) each emit one single-line JSON record
+at INFO on the `coordinator.audit` logger: `ts` (UTC ISO-8601), `action`,
+`caller`, `outcome` (`success`, `failure`, or `denied`), and optionally
+`model`, `worker`, `detail`. Prompts, request/response bodies, and key
+material are never logged; `caller`/`model`/`worker` are capped at 128
+characters and `detail` at 200, each truncated with a trailing `...` rather
+than rejected. `model.evicted` is attributed to the caller whose load
+triggered the worker-side eviction — that's the only point at which an
+eviction is observable to the coordinator at all.
 
 ## Worker
 
@@ -148,6 +221,31 @@ request_timeout_secs = 120
   the GGUF header and reserves that memory up front, refusing the load with
   a resource-exhausted error (rolling back any prior reservation) if it
   will not fit, rather than spawning `llama-server` and finding out later.
+- **Slot affinity** (`COORDINATOR_LLAMASERVER_SLOT_AFFINITY`, default on):
+  when a model has 2+ slots, the coordinator derives a stable slot index
+  from the caller id (`sha256`, so it survives a restart) and injects
+  `id_slot` into the forwarded body, giving a resolved caller a consistent
+  slot across requests. It's a routing preference, not a reservation:
+  `llama-server` queues a request naming a busy slot until that slot frees
+  rather than rejecting it, and the coordinator never overrides an
+  `id_slot` the client already sent. Injection only happens when all of the
+  following hold: the setting is on, `COORDINATOR_API_KEY_FILE` is
+  configured, the caller resolved to a real identity (not the unrestricted
+  fallback), the request path is `/v1/chat/completions` or
+  `/v1/completions` (the two routes that funnel into llama-server's shared
+  completions handler), the model has 2 or more slots, and the client
+  didn't already send `id_slot`. Every other request is still forwarded
+  byte-for-byte; this is the one case where that raw-bytes passthrough is
+  relaxed (the body is re-serialized to add the field). The coordinator
+  never consults `GET /slots` for this — slot count comes from the
+  registry's `instances`/`parallel` value, since `/slots` is disabled by
+  default on the worker (`llamaserver_enable_slots_endpoint = false`) as it
+  can leak another slot's cached prompt text. Two practical consequences: a
+  caller pinned to one slot has its own concurrent requests served serially
+  by that slot; and because the index is a hash modulo the slot count, two
+  callers can collide onto the same slot (there are more possible callers
+  than slots, and nothing reserves one). Treat it as a consistency hint, not
+  a guarantee — and note the mapping shifts if `instances` changes.
 - **`n_ctx` is per conversation slot, not a raw `-c` passthrough.**
   `llama-server` divides its own `-c` value evenly across `--parallel`
   slots (verified on hardware: `-c 262144` with `--parallel 4` reports
