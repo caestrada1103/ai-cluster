@@ -245,10 +245,11 @@ mod tests {
         // 600 differs from the removed default on purpose — proves parsing works.
         assert_eq!(config.request_timeout_secs, 120);
         assert_eq!(config.grpc_port, 50051);
-        // The shipped Docker config explicitly opts into non-loopback binds
-        // for cross-container reachability — see config/worker.toml.
-        assert_eq!(config.grpc_bind_host, "0.0.0.0");
-        assert_eq!(config.llamaserver_bind_host, "0.0.0.0");
+        // The shipped file must NOT widen the binds; containers open them up
+        // through WORKER_GRPC_BIND_HOST / LLAMASERVER_BIND_HOST instead, so a
+        // bare-metal run stays on loopback.
+        assert_eq!(config.grpc_bind_host, "127.0.0.1");
+        assert_eq!(config.llamaserver_bind_host, "127.0.0.1");
     }
 
     #[test]

@@ -211,7 +211,13 @@ async fn async_main(
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| config.llamaserver_binary_path.clone()),
-        llamaserver_bind_host: config.llamaserver_bind_host.clone(),
+        // env LLAMASERVER_BIND_HOST wins over the config file. Containers set
+        // it to 0.0.0.0 so the coordinator can reach the child across the
+        // Compose network; bare-metal keeps the loopback default.
+        llamaserver_bind_host: std::env::var("LLAMASERVER_BIND_HOST")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| config.llamaserver_bind_host.clone()),
         // Reuse the worker's single load/inference timeout for /health polling.
         llamaserver_health_timeout_secs: config.request_timeout_secs,
         max_loaded_models: config.max_loaded_models,
@@ -231,13 +237,16 @@ async fn async_main(
         .or_else(|| config.worker_id.clone())
         .unwrap_or_else(|| format!("worker-{}", gpu_ids[0]));
 
-    // Bind interface defaults to loopback; non-loopback is an explicit
-    // opt-in. Computed before `config` moves into `WorkerService::new` below.
-    let bind_ip: std::net::IpAddr = config.grpc_bind_host.parse().map_err(|e| {
-        WorkerError::Configuration(format!(
-            "invalid grpc_bind_host '{}': {e}",
-            config.grpc_bind_host
-        ))
+    // Bind interface defaults to loopback; non-loopback is an explicit opt-in.
+    // env WORKER_GRPC_BIND_HOST wins over the config file so containers can
+    // open up without the bare-metal default changing. Computed before
+    // `config` moves into `WorkerService::new` below.
+    let grpc_bind_host = std::env::var("WORKER_GRPC_BIND_HOST")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| config.grpc_bind_host.clone());
+    let bind_ip: std::net::IpAddr = grpc_bind_host.parse().map_err(|e| {
+        WorkerError::Configuration(format!("invalid grpc_bind_host '{grpc_bind_host}': {e}"))
     })?;
     let addr = SocketAddr::from((bind_ip, grpc_port));
 
