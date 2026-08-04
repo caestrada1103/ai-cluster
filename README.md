@@ -12,6 +12,7 @@
 - [Overview](#overview)
 - [Features](#features)
 - [Architecture](#architecture)
+- [Security: Secure by Default](#security-secure-by-default)
 - [Quick Start](#quick-start)
 - [Documentation](#documentation)
 - [Supported Models](#supported-models)
@@ -158,6 +159,30 @@ For detailed architecture information, see the [Architecture Guide](docs/archite
 
 ---
 
+## Security: Secure by Default
+
+Everything binds to loopback until you explicitly open it up:
+
+- Worker gRPC and spawned `llama-server` children bind `127.0.0.1` by
+  default, on bare metal and in containers alike.
+- `WORKER_GRPC_AUTH_TOKEN` is a shared secret required on every gRPC call
+  once set; the worker logs a warning if it ends up bound to a non-loopback
+  address with no token configured.
+- The coordinator refuses to start bound to a non-loopback address unless
+  `COORDINATOR_API_KEYS` is set.
+- `docker compose up` publishes only the coordinator (8000), Grafana (3000),
+  and Prometheus (9099) — worker gRPC/metrics, `llama-server`, and
+  Open-WebUI ports stay off the host. Opt in with
+  `docker compose -f docker-compose.yml -f docker-compose.expose-ports.yml up`.
+
+Containers open the worker binds up via `WORKER_GRPC_BIND_HOST` /
+`LLAMASERVER_BIND_HOST` (both default to `0.0.0.0` in `docker-compose.yml`);
+`config/worker.toml` itself never widens a bind. See
+[Deployment Guide](docs/deployment.md) and
+[Configuration Guide](docs/configuration.md) for the full picture.
+
+---
+
 ## Quick Start
 
 > **Recommended for consumer GPUs**: the steps below bring up the full stack
@@ -178,19 +203,25 @@ The easiest way to get started is using Docker Compose, which handles all depend
 git clone https://github.com/caestrada1103/ai-cluster.git
 cd ai-cluster
 
-# 2. Configure Environment (REQUIRED: compose refuses to start Grafana without
-#    GRAFANA_ADMIN_PASSWORD; HF_TOKEN is needed for gated models like Llama 3)
+# 2. Configure Environment. REQUIRED:
+#    - GRAFANA_ADMIN_PASSWORD (compose refuses to start Grafana without it)
+#    - COORDINATOR_API_KEYS (the coordinator's port is published to the host,
+#      a non-loopback bind, so it refuses to start with no keys set — secure
+#      by default; generate one with `openssl rand -hex 32`)
+#    - COMPOSE_PROFILES matching your GPU vendor (no profile = no worker starts)
+#    HF_TOKEN is needed for gated models like Llama 3.
 cp .env.example .env
-# Edit .env: set GRAFANA_ADMIN_PASSWORD=<something> and HF_TOKEN=hf_...
+# Edit .env: set GRAFANA_ADMIN_PASSWORD, COORDINATOR_API_KEYS, COMPOSE_PROFILES, HF_TOKEN
 
 # 3. Build and start with Docker Compose
 docker compose up -d --build
 
-# 4. Check that everything is running
+# 4. Check that everything is running (/health needs no key)
 curl http://localhost:8000/health
 
 # 5. Run your first inference (Model will auto-download and load)
-curl -X POST http://localhost:8000/v1/completions \
+H='Authorization: Bearer <your COORDINATOR_API_KEYS value>'
+curl -H "$H" -X POST http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-7b",
@@ -199,52 +230,54 @@ curl -X POST http://localhost:8000/v1/completions \
   }'
 ```
 
-### Method 2: Local Execution (Native GPU)
+See [GPU variants](docs/deployment.md#gpu-variants) for the exact
+`COMPOSE_PROFILES` value per vendor.
 
-If you prefer to run the cluster natively on your host machine to manually manage the GPU environment:
+### Method 2: Local Execution (Native GPU) — verified
+
+**Shortcut:** once the one-time setup below is done, `./scripts/run-local.sh`
+starts the worker and coordinator together, waits for both to be ready, prints
+working `curl` examples, and stops both on Ctrl-C. `--build` rebuilds the
+worker first; `--model NAME` loads a model once healthy. The manual steps
+follow for when you want the two processes in separate terminals.
+
+Runs entirely on loopback (secure by default) — no ports leave the machine.
+This example uses `qwen3.6-35b-a3b-gguf`, a `llamaserver`-engine model, so it
+also needs a `llama-server` binary on `PATH` (build steps in
+[Deployment → llama-server for agentic serving](docs/deployment.md); Node
+20+ is required for that build only, not for anything below).
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/caestrada1103/ai-cluster.git
-cd ai-cluster
+# one-time
+sudo apt-get install -y protobuf-compiler libclang-dev libssl-dev
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+python3 -m venv .venv && . .venv/bin/activate && pip install -r coordinator/requirements-dev.txt
+cd worker && cargo build --release --features wgpu,llamacpp,llamacpp-cuda && cd ..
 
-# 2. Run the setup script for your GPU architecture
-# For AMD GPUs
-./scripts/setup_rocm.sh
-# Or for NVIDIA GPUs
-./scripts/setup_cuda.sh
+# terminal 1
+export PATH="$HOME/.local/bin:$PATH"          # so the worker finds llama-server
+RUST_LOG=info ./target/release/ai-worker --port 50051
 
-# 3. Set up Python environment for Coordinator
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-pip install -r coordinator/requirements.txt
-
-# 4. Build and run the Rust Worker locally
-# In a new terminal:
-cd worker
-# For AMD: cargo run --release --features rocm
-# For NVIDIA: cargo run --release --features cuda
-cargo run --release --features cuda
-# Recommended for consumer GPUs — add the llama.cpp/GGUF engine for quantized models:
-#   cargo run --release --features wgpu,llamacpp,llamacpp-vulkan   (Vulkan offload, AMD or NVIDIA)
-#   cargo run --release --features cuda,llamacpp,llamacpp-cuda     (NVIDIA CUDA offload)
-
-# 5. Start the Coordinator locally
-# In the original python terminal:
-# From the repo root (module path matters — cd coordinator breaks imports):
-# Loopback-only is the secure-by-default choice for local use; the coordinator
-# refuses --host 0.0.0.0 unless COORDINATOR_API_KEYS is set (see below).
+# terminal 2
+. .venv/bin/activate
+export COORDINATOR_STATIC_WORKERS='["localhost:50051"]'
+export COORDINATOR_API_KEYS='sk-local-dev'
 uvicorn coordinator.main:app --host 127.0.0.1 --port 8000
 
-# 6. Run your first inference (Model will auto-download and load)
-curl -X POST http://localhost:8000/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "deepseek-7b",
-    "prompt": "Explain quantum computing in simple terms",
-    "max_tokens": 100
-  }'
+# use it
+H='Authorization: Bearer sk-local-dev'
+curl -H "$H" -X POST localhost:8000/v1/models/load -H 'Content-Type: application/json' \
+  -d '{"model_name":"qwen3.6-35b-a3b-gguf"}'
+curl -H "$H" -X POST localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.6-35b-a3b-gguf","messages":[{"role":"user","content":"hi"}],"max_tokens":200}'
 ```
+
+The worker binary lands at the **workspace root** `target/release/ai-worker`
+— not `worker/target/` — because `worker` is a Cargo workspace member. Swap
+`llamacpp-cuda` for `llamacpp-vulkan` on AMD/Intel, or drop it for CPU-only
+GGUF inference; add `cuda`/`rocm` in place of `wgpu` for a native (non-Vulkan)
+Burn backend. See [Adding a GGUF model](#adding-a-gguf-model-llamacpp-engine-recommended)
+for a lighter `llamacpp`-engine example instead of `llamaserver`.
 
 ---
 
@@ -263,8 +296,8 @@ curl -X POST http://localhost:8000/v1/completions \
 - [Installation Guide](#installation)
 - [Configuration Examples](#configuration)
 - [API Examples](#api-reference)
-- [Performance Tuning](docs/configuration.md#performance-tuning)
-- [Security Hardening](docs/deployment.md#security-hardening)
+- [Sizing Examples (measured on real hardware)](docs/configuration.md#sizing-examples-measured-on-real-hardware)
+- [Security: Secure by Default](#security-secure-by-default)
 
 ---
 
@@ -297,7 +330,11 @@ a `llama-server` process per model and the coordinator proxies agentic HTTP
 requests (including `/v1/messages`) straight to it. The default Docker worker
 image bundles the `llama-server` binary; bare-metal setup, the pinned llama.cpp
 version, and the coordinator↔worker port requirements are covered in the
-[Deployment Guide](docs/deployment.md). See
+[Deployment Guide](docs/deployment.md). The number of concurrent
+conversation slots is `[models.X.llamaserver] instances` in
+`config/models.toml` (default 1), also overridable per request with
+`POST /v1/models/load {"instances": N}` — see
+[Configuration Guide](docs/configuration.md). See
 [Use on Real Scenarios](#use-on-real-scenarios) for the end-to-end Claude Code
 walkthrough.
 
@@ -610,22 +647,20 @@ mkdir -p models
 # From the repo root (module path matters — cd coordinator breaks imports):
 uvicorn coordinator.main:app --host 127.0.0.1 --port 8000
 
-# In another terminal, start worker
-cd worker
+# In another terminal (from the repo root — the binary is at the workspace
+# root target/, not worker/target/, since `worker` is a Cargo workspace member):
 ./target/release/ai-worker --port 50051 --gpu-ids 0
 ```
 
 ### Method 2: Docker Compose
 
+See [Quick Start → Method 1](#method-1-docker-compose) above for the full,
+current command sequence (env vars required, GPU profile selection).
+
 ```bash
-# Build and start all services
-docker-compose up -d
-
-# View logs
-docker-compose logs -f
-
-# Stop
-docker-compose down
+docker compose up -d --build
+docker compose logs -f
+docker compose down
 ```
 
 ### Method 3: Kubernetes (planned)
@@ -664,6 +699,8 @@ grpc_port = 50051
 metrics_port = 9091
 gpu_ids = [0]
 model_cache_dir = "./models"
+# grpc_bind_host / llamaserver_bind_host both default to 127.0.0.1 — see
+# Security: Secure by Default above for the opt-in env vars.
 ```
 
 For complete configuration options, see the [Configuration Guide](docs/configuration.md).
