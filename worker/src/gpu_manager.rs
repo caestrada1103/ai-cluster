@@ -935,6 +935,33 @@ mod cuda_driver {
 }
 
 #[cfg(test)]
+impl GPUManager {
+    /// Single-device manager with an exact, caller-chosen capacity (bytes) —
+    /// lets other modules' tests exercise real admission/refusal without
+    /// depending on detected hardware.
+    pub(crate) fn test_with_capacity(bytes: u64) -> Self {
+        let device = GPUDevice {
+            id: 0,
+            name: "test-gpu".to_string(),
+            total_memory: bytes,
+            available_memory: bytes,
+            utilization: 0.0,
+            temperature: 0.0,
+            power_usage: 0,
+            capabilities: vec![],
+        };
+        GPUManager {
+            devices: vec![device],
+            allocations: Arc::new(DashMap::new()),
+            used_bytes: Arc::new(vec![AtomicU64::new(0)]),
+            memory_locks: vec![Arc::new(Semaphore::new(1))],
+            telemetry: Arc::new(tokio::sync::RwLock::new(vec![Default::default()])),
+            _p2p_enabled: false,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
