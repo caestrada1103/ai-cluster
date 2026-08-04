@@ -83,6 +83,7 @@ services:
       # own default stays 127.0.0.1 for bare-metal runs.
       - WORKER_GRPC_BIND_HOST=${WORKER_GRPC_BIND_HOST:-0.0.0.0}
       - LLAMASERVER_BIND_HOST=${LLAMASERVER_BIND_HOST:-0.0.0.0}
+      - GPU_MEMORY_HEADROOM_PERCENT=${GPU_MEMORY_HEADROOM_PERCENT:-}
     volumes: &worker-common-volumes
       - ./config:/app/config:ro
       - ./models:/app/models
