@@ -5,10 +5,18 @@ Dockerfiles for the coordinator and worker, plus the compose stack at the repo r
 ## Quick Start
 
 ```bash
-cp .env.example .env            # set GRAFANA_ADMIN_PASSWORD (required) and HF_TOKEN
+cp .env.example .env
+# Required in .env — without all three, no worker starts and the coordinator
+# refuses to bind:
+#   GRAFANA_ADMIN_PASSWORD=...
+#   COORDINATOR_API_KEYS=...
+#   COMPOSE_PROFILES=cuda-native   # or nvidia-vulkan / amd-vulkan / intel-vulkan / rocm-native
 docker compose up -d --build
-curl http://localhost:8000/health
+curl -H "Authorization: Bearer $COORDINATOR_API_KEYS" http://localhost:8000/health
 ```
+
+No profile means no worker: the stack assumes no GPU vendor. Pick the one that
+matches your hardware. See docs/deployment.md.
 
 ## Images
 
@@ -23,11 +31,16 @@ curl http://localhost:8000/health
 | Variant | Build | Backend feature | Base images |
 |---|---|---|---|
 | Universal (default) | `docker build -f docker/Dockerfile.worker .` | `wgpu` (Vulkan) | ubuntu:24.04 |
-| AMD native | `--build-arg BACKEND=rocm --build-arg BUILDER_IMAGE=rocm/dev-ubuntu-24.04:6.2.1 --build-arg RUNTIME_IMAGE=rocm/dev-ubuntu-24.04:6.2.1 --build-arg BUILDER_EXTRA_PKGS="" --build-arg RUNTIME_EXTRA_PKGS=""` | `rocm` | rocm/dev-ubuntu-24.04 |
-| NVIDIA native | `--build-arg BACKEND=cuda --build-arg BUILDER_IMAGE=nvidia/cuda:13.0.3-devel-ubuntu24.04 --build-arg RUNTIME_IMAGE=nvidia/cuda:13.0.3-runtime-ubuntu24.04 --build-arg BUILDER_EXTRA_PKGS="" --build-arg RUNTIME_EXTRA_PKGS="libcublas-13-0"` | `cuda` | nvidia/cuda 13.0.3 |
+| AMD native | `--build-arg BACKEND=rocm --build-arg BUILDER_IMAGE=rocm/dev-ubuntu-24.04:6.2.2 --build-arg RUNTIME_IMAGE=rocm/dev-ubuntu-24.04:6.2.2 --build-arg BUILDER_EXTRA_PKGS="" --build-arg RUNTIME_EXTRA_PKGS="libvulkan1"` | `rocm` | rocm/dev-ubuntu-24.04 (amd64 only; 6.2.1 was never published) |
+| NVIDIA native | `--build-arg BACKEND=cuda --build-arg BUILDER_IMAGE=nvidia/cuda:13.0.3-devel-ubuntu24.04 --build-arg RUNTIME_IMAGE=nvidia/cuda:13.0.3-runtime-ubuntu24.04 --build-arg BUILDER_EXTRA_PKGS="" --build-arg RUNTIME_EXTRA_PKGS="libcublas-13-0 libvulkan1 libx11-6 libxext6 libegl1"` | `cuda` | nvidia/cuda 13.0.3 |
 
 There is no `GPU_BACKEND` arg and no `hip` feature — the arg is `BACKEND`
 and the AMD feature is `rocm`.
+
+> `RUNTIME_EXTRA_PKGS` **replaces** the Dockerfile default rather than
+> extending it, so the vendor-native rows must repeat the Vulkan loader (and,
+> on NVIDIA, the injected ICD's own deps) or the worker enumerates no GPU.
+> See docs/deployment.md.
 
 > CUDA 13.0.3 (bumped from 12.6.3) — 12.6's nvcc predates Blackwell/`sm_121`,
 > so it cannot build for GB10 (DGX Spark). Both `13.0.3-devel-ubuntu24.04` and
