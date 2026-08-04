@@ -20,16 +20,13 @@ llamacpp_default_n_gpu_layers = -1  # -1 = offload all layers to the GPU (both e
 # cargo — install llama.cpp's `llama-server` on the host.
 # llamaserver_binary_path = "llama-server"  # PATH lookup by default; or an absolute path
 #
-# Set to "0.0.0.0" here because the worker and coordinator are separate
-# Docker Compose containers on an isolated bridge network. See docs/deployment.md.
-llamaserver_bind_host = "0.0.0.0"
+# Both bind hosts default to 127.0.0.1. Containers open them up via
+# LLAMASERVER_BIND_HOST / WORKER_GRPC_BIND_HOST. See docs/deployment.md.
+# llamaserver_bind_host = "127.0.0.1"
 # llamaserver_enable_slots_endpoint = false  # default; leave off unless something needs /slots
 
 # worker_id = "my-worker"        # optional; auto-generated when absent everywhere
-#
-# grpc_bind_host: same Docker Compose networking reasoning as
-# llamaserver_bind_host above — see docs/deployment.md.
-grpc_bind_host = "0.0.0.0"
+# grpc_bind_host = "127.0.0.1"
 # grpc_auth_token wires to env WORKER_GRPC_AUTH_TOKEN (wins over this value).
 # See docs/deployment.md.
 # grpc_auth_token = "change-me"
