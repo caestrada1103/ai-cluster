@@ -8,8 +8,10 @@ Endpoints:
     GET  /workers      - List connected workers
 """
 import asyncio
+import ipaddress
 import json
 import logging
+import re
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Type, TypeVar, Union
 
@@ -17,7 +19,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from coordinator import proxy
+from coordinator import auth, proxy
 from coordinator.models import ModelConfig, ModelRegistry
 
 logger = logging.getLogger(__name__)
@@ -102,6 +104,9 @@ class LoadModelRequest(BaseModel):
     model_name: str
     worker_id: Optional[str] = None
     quantization: str = "none"  # only "none" is accepted by workers today; others are planned
+    # Conversation slots for an engine="llamaserver" model, overriding the
+    # registry's `instances` value for this load only.
+    instances: Optional[int] = Field(default=None, ge=1)
 
 
 class LoadModelResponse(BaseModel):
@@ -175,7 +180,7 @@ def _parse_model_and_worker(model_string: str) -> tuple[str, Optional[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Engine dispatch + transparent llama-server proxy (Plan 13 Task 2)
+# Engine dispatch + transparent llama-server proxy
 # ---------------------------------------------------------------------------
 
 
@@ -228,6 +233,74 @@ def _worker_host(address: str) -> str:
     return address.rsplit(":", 1)[0] if ":" in address else address
 
 
+# ---------------------------------------------------------------------------
+# POST /v1/workers/manual address validation
+# ---------------------------------------------------------------------------
+
+#: Hard cap on addresses accepted in a single POST /v1/workers/manual call.
+_MAX_MANUAL_WORKERS_PER_REQUEST = 16
+
+_HOSTNAME_RE = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$")
+
+
+def _split_host_port(address: str) -> tuple[str, int]:
+    """Split 'host:port' or '[ipv6]:port' into (host, port); ValueError on any other shape."""
+    if address.startswith("["):
+        end = address.find("]")
+        if end == -1 or address[end + 1 : end + 2] != ":":
+            raise ValueError(f"invalid address '{address}': expected '[ipv6-host]:port'")
+        host, port_str = address[1:end], address[end + 2 :]
+    else:
+        if address.count(":") != 1:
+            raise ValueError(f"invalid address '{address}': expected 'host:port'")
+        host, port_str = address.rsplit(":", 1)
+    if not host:
+        raise ValueError(f"invalid address '{address}': empty host")
+    if not port_str.isdigit():
+        raise ValueError(f"invalid address '{address}': port must be numeric")
+    port = int(port_str)
+    if not 1 <= port <= 65535:
+        raise ValueError(f"invalid address '{address}': port {port} out of range 1-65535")
+    return host, port
+
+
+def _is_well_formed_host(host: str) -> bool:
+    """True for a syntactically valid IPv4/IPv6 literal or DNS hostname."""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    return bool(_HOSTNAME_RE.match(host)) and len(host) <= 253
+
+
+def _host_allowed(host: str, allowed: List[str]) -> bool:
+    """Empty allowlist == accept any well-formed host (the auth+opt-in gate
+    on the route is the primary control then). Otherwise the host must
+    exactly match an allowed entry, OR — if the entry parses as a network —
+    fall inside that CIDR."""
+    if not allowed:
+        return True
+    for entry in allowed:
+        if entry == host:
+            return True
+        try:
+            if ipaddress.ip_address(host) in ipaddress.ip_network(entry, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _validate_manual_worker_address(address: str, allowed_hosts: List[str]) -> None:
+    """Raise ValueError for anything that isn't a plausible, allowed worker address."""
+    host, _port = _split_host_port(address)
+    if not _is_well_formed_host(host):
+        raise ValueError(f"invalid address '{address}': '{host}' is not a valid host")
+    if not _host_allowed(host, allowed_hosts):
+        raise ValueError(f"host '{host}' in address '{address}' is not in the configured allowlist")
+
+
 def _proxy_response(result: proxy.ProxyResponse) -> Response:
     """Adapt a proxy result into a FastAPI response.
 
@@ -263,12 +336,9 @@ def _not_loaded_detail(model_name: str) -> str:
 async def _resolve_llamaserver_worker(coordinator: Any, model_cfg: ModelConfig) -> Any:
     """Find — or, when auto-load is on, load — a worker serving ``model_cfg``.
 
-    Plan 13 Task 5. The already-loaded common case takes the fast path
-    (``find_worker_for_model``) untouched. When no worker reports the model
-    loaded, ``settings.llamaserver_autoload`` decides: True (default) triggers
-    the coordinator's single-flight auto-load and returns the freshly-loaded
-    worker (a load failure/timeout surfaces as 503); False preserves the
-    Phase-1 behavior — 404 pointing at ``POST /v1/models/load``.
+    When no worker reports the model loaded, ``settings.llamaserver_autoload``
+    decides: True (default) auto-loads (a failure surfaces as 503); False
+    404s pointing at ``POST /v1/models/load``.
     """
     worker = await coordinator.find_worker_for_model(model_cfg.name)
     if worker is not None:
@@ -289,6 +359,32 @@ async def _resolve_llamaserver_worker(coordinator: Any, model_cfg: ModelConfig) 
         ) from exc
 
 
+#: llama-server has no admission control of its own; the proxy path forwards
+#: raw bytes, so this ceiling is looser than the in-process path's but bounded.
+_PROXY_MAX_TOKENS_CEILING = 131_072
+
+
+def _validate_proxy_envelope(data: Dict[str, Any]) -> None:
+    """Minimal sanity checks on a proxied body before it's forwarded verbatim.
+
+    Not a full re-model of the OpenAI/Anthropic schema — that would break
+    ``tools``/``tool_calls``/``thinking`` passthrough. Only checks the
+    couple of fields llama-server has no bound of its own for.
+    """
+    max_tokens = data.get("max_tokens")
+    if max_tokens is not None:
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, (int, float)):
+            raise HTTPException(status_code=422, detail="'max_tokens' must be a number")
+        if not (1 <= max_tokens <= _PROXY_MAX_TOKENS_CEILING):
+            raise HTTPException(
+                status_code=422,
+                detail=f"'max_tokens' must be between 1 and {_PROXY_MAX_TOKENS_CEILING}",
+            )
+    stream = data.get("stream")
+    if stream is not None and not isinstance(stream, bool):
+        raise HTTPException(status_code=422, detail="'stream' must be a boolean")
+
+
 async def _proxy_to_llamaserver(
     request: Request,  # type: ignore[type-arg]
     coordinator: Any,
@@ -296,17 +392,20 @@ async def _proxy_to_llamaserver(
     raw_body: bytes,
     stream: bool,
     *,
+    data: Optional[Dict[str, Any]] = None,
     upstream_path: Optional[str] = None,
 ) -> Response:
     """Forward a request to the worker-local llama-server serving ``model_cfg``.
 
-    Resolves a serving worker (auto-loading on demand — Plan 13 Task 5 — via
-    :func:`_resolve_llamaserver_worker`), builds
-    ``http://<worker_host>:<port><path>`` and passes the raw body straight
-    through. ``path`` defaults to the incoming ``request.url.path``; callers pass
-    ``upstream_path`` to override it (``/infill`` is served at llama-server's
-    root, not under the coordinator's ``/v1`` mount — see :func:`create_infill`).
+    Resolves a serving worker (auto-loading on demand via
+    :func:`_resolve_llamaserver_worker`) and passes the raw body straight
+    through to ``http://<worker_host>:<port><path>``. ``upstream_path``
+    overrides the default ``request.url.path`` (see :func:`create_infill`).
+    ``data``, when given, is sanity-checked via
+    :func:`_validate_proxy_envelope` first.
     """
+    if data is not None:
+        _validate_proxy_envelope(data)
     worker = await _resolve_llamaserver_worker(coordinator, model_cfg)
     if model_cfg.llamaserver_port is None:  # defensive: validated at registry load
         raise HTTPException(
@@ -344,11 +443,10 @@ def _require_llamaserver_model(model_string: Any, *, surface: str = "this endpoi
 
 
 async def _resolve_single_loaded_llamaserver(coordinator: Any) -> ModelConfig:
-    """Resolve ``/infill`` when the body omits ``model`` (Plan 13 Task 6).
+    """Resolve ``/infill`` when the body omits ``model``.
 
-    Uses the sole llamaserver model currently loaded across the fleet; raises a
-    400 telling the client to specify ``model`` when zero or more than one are
-    loaded (the request is genuinely ambiguous).
+    Uses the sole llamaserver model currently loaded; 400s asking the client
+    to specify ``model`` when zero or more than one are loaded.
     """
     loaded = await coordinator.loaded_llamaserver_models()
     if len(loaded) == 1:
@@ -369,10 +467,9 @@ async def _resolve_single_loaded_llamaserver(coordinator: Any) -> ModelConfig:
 async def create_completion(request: Request) -> Any:  # type: ignore[type-arg]
     """Run inference on the cluster (OpenAI text-completion endpoint).
 
-    Resolves the requested model's engine FIRST (Plan 13 Task 2): a model with
-    ``engine == "llamaserver"`` is proxied verbatim to its worker-local
-    llama-server (raw body + SSE passthrough, context compression skipped —
-    Phase 2); every other engine runs the existing in-process path below.
+    Resolves the model's engine first: ``engine == "llamaserver"`` is
+    proxied verbatim to its worker-local llama-server; every other engine
+    runs the in-process path below.
     """
     coordinator = _get_coordinator(request)
 
@@ -380,7 +477,7 @@ async def create_completion(request: Request) -> Any:  # type: ignore[type-arg]
     model_cfg = _lookup_engine_model(data.get("model"))
     if model_cfg is not None and model_cfg.engine == "llamaserver":
         return await _proxy_to_llamaserver(
-            request, coordinator, model_cfg, raw_body, bool(data.get("stream", False))
+            request, coordinator, model_cfg, raw_body, bool(data.get("stream", False)), data=data
         )
 
     body = _parse_body(CompletionRequest, data)
@@ -410,13 +507,204 @@ async def create_completion(request: Request) -> Any:  # type: ignore[type-arg]
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except Exception as exc:
+    except ValueError as exc:
+        # An unregistered model_name with pull-through disabled: a client
+        # error, not a server error.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        # Never echo a raw exception string to the client; it's already
+        # logged server-side above.
         logger.exception("Inference failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="Internal server error") from None
 
 
-def _build_flat_response(result: Dict[str, Any], model: str) -> Dict[str, Any]:
-    """Build a standard OpenAI-compatible chat completion response."""
+# ---------------------------------------------------------------------------
+# Chat prompt templates for the in-process engine path.
+#
+# Picks a template per the registry's ModelConfig.family (not a full
+# Jinja/minja engine) and truncates output at that template's stop markers.
+# See docs/troubleshooting.md for why a single hardcoded template doesn't
+# work across model families.
+# ---------------------------------------------------------------------------
+
+_ChatPromptBuilder = Any  # Callable[[List[ChatMessage]], str] — Any avoids a forward-ref headache
+
+
+def _build_chatml_prompt(messages: List[ChatMessage]) -> str:
+    """ChatML (Qwen, and many others fine-tuned on the same format)."""
+    prompt = ""
+    for msg in messages:
+        role = msg.role.lower()
+        prompt += f"<|im_start|>{role}\n{msg.content}<|im_end|>\n"
+    prompt += "<|im_start|>assistant\n"
+    return prompt
+
+
+def _build_llama3_prompt(messages: List[ChatMessage]) -> str:
+    """Llama-3/3.1-Instruct header-block format."""
+    prompt = "<|begin_of_text|>"
+    for msg in messages:
+        role = msg.role.lower()
+        prompt += f"<|start_header_id|>{role}<|end_header_id|>\n\n{msg.content}<|eot_id|>"
+    prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    return prompt
+
+
+def _build_mistral_prompt(messages: List[ChatMessage]) -> str:
+    """Mistral-Instruct [INST]/[/INST] format; system content folds into the
+    next user turn (Mistral has no separate system role)."""
+    parts: List[str] = []
+    pending_system = ""
+    for msg in messages:
+        role = msg.role.lower()
+        if role == "system":
+            pending_system += msg.content + "\n\n"
+        elif role == "user":
+            content = pending_system + msg.content if pending_system else msg.content
+            pending_system = ""
+            parts.append(f"[INST] {content} [/INST]")
+        elif role == "assistant":
+            parts.append(f" {msg.content}</s>")
+    return "".join(parts)
+
+
+def _build_gemma_prompt(messages: List[ChatMessage]) -> str:
+    """Gemma <start_of_turn>/<end_of_turn> format; system content folds into
+    the next user turn (Gemma has no separate system role)."""
+    prompt = ""
+    pending_system = ""
+    for msg in messages:
+        role = msg.role.lower()
+        if role == "system":
+            pending_system += msg.content + "\n\n"
+            continue
+        gemma_role = "model" if role == "assistant" else "user"
+        content = msg.content
+        if gemma_role == "user" and pending_system:
+            content = pending_system + content
+            pending_system = ""
+        prompt += f"<start_of_turn>{gemma_role}\n{content}<end_of_turn>\n"
+    prompt += "<start_of_turn>model\n"
+    return prompt
+
+
+def _build_phi_prompt(messages: List[ChatMessage]) -> str:
+    """Phi-3-style format — structurally like the old fallback but with
+    Phi's actual end-of-turn token (``<|end|>``) instead of Zephyr's
+    ``</s>``."""
+    prompt = ""
+    for msg in messages:
+        role = msg.role.lower()
+        if role in ("system", "user", "assistant"):
+            prompt += f"<|{role}|>\n{msg.content}<|end|>\n"
+    prompt += "<|assistant|>\n"
+    return prompt
+
+
+def _build_deepseek_prompt(messages: List[ChatMessage]) -> str:
+    """DeepSeek-V2/V3-style format (best-effort — DeepSeek checkpoints vary
+    more than most families; the stop sequences below are the real safety
+    net for this one)."""
+    prompt = ""
+    for msg in messages:
+        role = msg.role.lower()
+        if role == "system":
+            prompt += f"{msg.content}\n\n"
+        elif role == "user":
+            prompt += f"<｜User｜>{msg.content}"
+        elif role == "assistant":
+            prompt += f"<｜Assistant｜>{msg.content}<｜end▁of▁sentence｜>"
+    prompt += "<｜Assistant｜>"
+    return prompt
+
+
+def _build_zephyr_prompt(messages: List[ChatMessage]) -> str:
+    """The original hardcoded Zephyr-ish fallback template, used only when
+    the model's family has no dedicated template above (or the model is
+    unregistered)."""
+    prompt = ""
+    for msg in messages:
+        role = msg.role.lower()
+        content = msg.content
+        if role == "system":
+            prompt += f"<|system|>\n{content}</s>\n"
+        elif role == "user":
+            prompt += f"<|user|>\n{content}</s>\n"
+        elif role == "assistant":
+            prompt += f"<|assistant|>\n{content}</s>\n"
+    prompt += "<|assistant|>\n"
+    return prompt
+
+
+# family.value (coordinator/models.py ModelFamily) -> (builder, stop sequences)
+_FAMILY_CHAT_TEMPLATES: Dict[str, tuple[_ChatPromptBuilder, List[str]]] = {
+    "qwen": (_build_chatml_prompt, ["<|im_end|>", "<|im_start|>"]),
+    "llama": (_build_llama3_prompt, ["<|eot_id|>", "<|start_header_id|>"]),
+    "mistral": (_build_mistral_prompt, ["</s>", "[INST]"]),
+    "gemma": (_build_gemma_prompt, ["<end_of_turn>", "<start_of_turn>"]),
+    "phi": (_build_phi_prompt, ["<|end|>", "<|user|>"]),
+    "deepseek": (
+        _build_deepseek_prompt,
+        ["<｜end▁of▁sentence｜>", "<｜User｜>"],
+    ),
+}
+
+_ZEPHYR_FALLBACK_STOP = ["<|user|>", "<|system|>"]
+
+
+def _select_chat_template(
+    model_cfg: Optional[ModelConfig], model_name: str
+) -> tuple[_ChatPromptBuilder, List[str]]:
+    """Pick a (prompt builder, stop sequences) pair for ``model_name``.
+
+    Model-aware when the registry knows the model's ``family``; otherwise
+    falls back to the generic template (with stop sequences) and logs a
+    warning suggesting ``engine="llamaserver"`` instead.
+    """
+    family = model_cfg.family.value if model_cfg is not None else None
+    template = _FAMILY_CHAT_TEMPLATES.get(family) if family else None
+    if template is not None:
+        return template
+    logger.warning(
+        "Model '%s' (family=%s) has no model-aware chat template; falling back to the "
+        "generic template. This can still produce lower-quality output (e.g. a spurious "
+        "extra turn after the real answer) for models that don't match it. For best "
+        'quality and tool-calling support, set engine="llamaserver" for this model in '
+        "config/models.toml instead of relying on the in-process engine's flattened prompt.",
+        model_name,
+        family,
+    )
+    return _build_zephyr_prompt, _ZEPHYR_FALLBACK_STOP
+
+
+def _truncate_at_stop(text: str, stop_sequences: List[str]) -> str:
+    """Cut ``text`` at the earliest occurrence of any ``stop_sequences`` entry.
+
+    Applied to generated text only, so a spurious replayed turn never
+    reaches the client.
+    """
+    cut: Optional[int] = None
+    for stop in stop_sequences:
+        if not stop:
+            continue
+        idx = text.find(stop)
+        if idx != -1 and (cut is None or idx < cut):
+            cut = idx
+    return text if cut is None else text[:cut]
+
+
+def _build_flat_response(result: Dict[str, Any], model: str, prompt: str) -> Dict[str, Any]:
+    """Build a standard OpenAI-compatible chat completion response.
+
+    ``prompt_tokens`` is estimated (the in-process gRPC path has no real
+    token count) using the same heuristic as context-compression's budget
+    check, so ``total_tokens`` stays internally consistent. The proxied
+    ``llamaserver`` path is unaffected — llama-server counts real tokens.
+    """
+    from coordinator.context_compression.tokenizer import estimate_tokens
+
+    prompt_tokens = estimate_tokens(prompt)
+    completion_tokens = result["tokens_generated"]
     return {
         "id": result["request_id"],
         "object": "chat.completion",
@@ -430,18 +718,28 @@ def _build_flat_response(result: Dict[str, Any], model: str) -> Dict[str, Any]:
             }
         ],
         "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": result["tokens_generated"],
-            "total_tokens": result["tokens_generated"],
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
     }
 
 
 async def _stream_chat_completion(
-    coordinator: Any, ctx: Any, model: str, timeout: float
+    coordinator: Any, ctx: Any, model: str, timeout: float, stop_sequences: List[str]
 ) -> AsyncGenerator[str, None]:
-    """Stream chunks live from the request's token queue as the worker produces them."""
+    """Stream chunks live from the request's token queue as the worker produces them.
+
+    ``stop_sequences`` (item 4) are checked against the FULL text accumulated
+    so far on every chunk — not just the newly-arrived piece — so a stop
+    marker split across two queue messages is still caught. Once one is
+    found, only the text up to the marker is emitted, the stream is closed as
+    ``finish_reason: "stop"``, and no further chunks are read from the queue
+    (the in-flight worker request keeps running to completion in the
+    background, same as today's early-break-on-``finished`` path).
+    """
     deadline = time.time() + timeout
+    accumulated = ""
     try:
         while True:
             remaining = deadline - time.time()
@@ -462,6 +760,11 @@ async def _stream_chat_completion(
                     break
                 continue  # still generating — poll again
 
+            new_accumulated = _truncate_at_stop(accumulated + response.text, stop_sequences)
+            delta = new_accumulated[len(accumulated) :]
+            hit_stop = len(new_accumulated) < len(accumulated) + len(response.text)
+            accumulated = new_accumulated
+
             chunk = {
                 "id": ctx.id,
                 "object": "chat.completion.chunk",
@@ -471,14 +774,14 @@ async def _stream_chat_completion(
                     {
                         "index": 0,
                         # Emit the text even on the final chunk (proto allows text+finished)
-                        "delta": {"content": response.text},
-                        "finish_reason": "stop" if response.finished else None,
+                        "delta": {"content": delta},
+                        "finish_reason": "stop" if (response.finished or hit_stop) else None,
                     }
                 ],
             }
             yield f"data: {json.dumps(chunk)}\n\n"
 
-            if response.finished:
+            if response.finished or hit_stop:
                 yield "data: [DONE]\n\n"
                 break
     except Exception as e:
@@ -496,11 +799,10 @@ async def create_chat_completion(
 ) -> Union[Dict[str, Any], Response, StreamingResponse]:
     """OpenAI-compatible chat completions endpoint used by Open-WebUI + agents.
 
-    Resolves the model's engine FIRST (Plan 13 Task 2): ``engine ==
-    "llamaserver"`` models are proxied verbatim to a worker-local llama-server
-    so OpenAI ``tools``/streaming ``tool_calls`` pass through unmodified (raw
-    body + SSE passthrough, context compression skipped — Phase 2). Every other
-    engine runs the in-process Zephyr-flattening path below.
+    Resolves the model's engine first: ``engine == "llamaserver"`` models are
+    proxied verbatim to a worker-local llama-server. Every other engine runs
+    the in-process path, which selects a chat template by ``family`` (see
+    the "Chat prompt templates" section above).
     """
     coordinator = _get_coordinator(request)
 
@@ -508,7 +810,7 @@ async def create_chat_completion(
     model_cfg = _lookup_engine_model(data.get("model"))
     if model_cfg is not None and model_cfg.engine == "llamaserver":
         return await _proxy_to_llamaserver(
-            request, coordinator, model_cfg, raw_body, bool(data.get("stream", False))
+            request, coordinator, model_cfg, raw_body, bool(data.get("stream", False)), data=data
         )
 
     body = _parse_body(ChatCompletionRequest, data)
@@ -522,21 +824,12 @@ async def create_chat_completion(
         body.messages, coordinator=coordinator, override_enabled=body.compress_context
     )
 
-    # Convert chat history to a raw prompt
-    # A simple chat template, can be expanded later for specific models (llama3, chatml, etc)
-    prompt = ""
-    for msg in messages:
-        role = msg.role.lower()
-        content = msg.content
-        if role == "system":
-            prompt += f"<|system|>\n{content}</s>\n"
-        elif role == "user":
-            prompt += f"<|user|>\n{content}</s>\n"
-        elif role == "assistant":
-            prompt += f"<|assistant|>\n{content}</s>\n"
-
-    # Add generation token
-    prompt += "<|assistant|>\n"
+    # Convert chat history to a raw prompt using a template selected by the
+    # model's family (falls back to the legacy generic template, with stop
+    # sequences, for unregistered models or families with no dedicated
+    # template yet — see _select_chat_template).
+    build_prompt, stop_sequences = _select_chat_template(model_cfg, model_name)
+    prompt = build_prompt(messages)
 
     try:
         if body.stream:
@@ -554,7 +847,7 @@ async def create_chat_completion(
             )
             timeout = coordinator.settings.request_timeout
             return StreamingResponse(
-                _stream_chat_completion(coordinator, ctx, body.model, timeout),
+                _stream_chat_completion(coordinator, ctx, body.model, timeout, stop_sequences),
                 media_type="text/event-stream",
             )
 
@@ -569,26 +862,30 @@ async def create_chat_completion(
             worker_id=worker_id,
             session_id=body.session_id,
         )
-        return _build_flat_response(result, body.model)
+        result = dict(result, text=_truncate_at_stop(result["text"], stop_sequences))
+        return _build_flat_response(result, body.model, prompt)
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except Exception as exc:
+    except ValueError as exc:
+        # An unregistered model_name with pull-through disabled: a client
+        # error, not a server error.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        # Never echo a raw exception string to the client; it's already
+        # logged server-side above.
         logger.exception("Inference failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="Internal server error") from None
 
 
 @router.post("/messages", response_model=None)
 async def create_message(request: Request) -> Response:  # type: ignore[type-arg]
-    """Anthropic-format messages endpoint (Plan 13 Task 2), llamaserver-only.
+    """Anthropic-format messages endpoint, llamaserver-only.
 
-    The in-process engines have no Anthropic templating, so only ``engine ==
-    "llamaserver"`` models are served here: the coordinator proxies the raw body
-    — ``system``, ``tools``, ``thinking`` and all — to a worker-local
-    llama-server, which natively serves ``POST /v1/messages``. Anthropic clients
-    request streaming via ``"stream": true`` in the body, which is sniffed here
-    to decide SSE passthrough. Unknown model → 404; any other engine → 501.
+    The in-process engines have no Anthropic templating, so only
+    ``engine == "llamaserver"`` models are served: the raw body is proxied
+    to a worker-local llama-server. Unknown model → 404; other engine → 501.
     """
     coordinator = _get_coordinator(request)
     raw_body, data = await _read_json_body(request)
@@ -596,57 +893,48 @@ async def create_message(request: Request) -> Response:  # type: ignore[type-arg
         data.get("model"), surface="the Anthropic /v1/messages API"
     )
     return await _proxy_to_llamaserver(
-        request, coordinator, model_cfg, raw_body, bool(data.get("stream", False))
+        request, coordinator, model_cfg, raw_body, bool(data.get("stream", False)), data=data
     )
 
 
 @router.post("/messages/count_tokens", response_model=None)
 async def count_message_tokens(request: Request) -> Response:  # type: ignore[type-arg]
-    """Anthropic ``POST /v1/messages/count_tokens`` (Plan 13 Task 2).
+    """Anthropic ``POST /v1/messages/count_tokens``.
 
-    llamaserver-only (unknown model → 404, other engine → 501) and never
-    streaming — the raw body is proxied verbatim to the worker-local
-    llama-server, whose token count is returned unchanged.
+    llamaserver-only (unknown model → 404, other engine → 501), never
+    streaming; the raw body is proxied to the worker-local llama-server.
     """
     coordinator = _get_coordinator(request)
     raw_body, data = await _read_json_body(request)
     model_cfg = _require_llamaserver_model(
         data.get("model"), surface="the Anthropic /v1/messages/count_tokens API"
     )
-    return await _proxy_to_llamaserver(request, coordinator, model_cfg, raw_body, False)
+    return await _proxy_to_llamaserver(request, coordinator, model_cfg, raw_body, False, data=data)
 
 
 @router.post("/embeddings", response_model=None)
 async def create_embeddings(request: Request) -> Response:  # type: ignore[type-arg]
-    """OpenAI-compatible embeddings endpoint (Plan 13 Task 6), llamaserver-only.
+    """OpenAI-compatible embeddings endpoint, llamaserver-only.
 
-    Resolves the model from the JSON body's ``model`` field and proxies the raw
-    body — buffered, NEVER SSE — to the worker-local llama-server's
-    ``/v1/embeddings``. Unknown model → 404; any other engine → 501. Auto-load
-    (Task 5) applies via :func:`_proxy_to_llamaserver`.
+    Proxies the raw body — buffered, never SSE — to the worker-local
+    llama-server's ``/v1/embeddings``. Unknown model → 404; other engine →
+    501.
     """
     coordinator = _get_coordinator(request)
     raw_body, data = await _read_json_body(request)
     model_cfg = _require_llamaserver_model(data.get("model"), surface="the /v1/embeddings API")
-    return await _proxy_to_llamaserver(request, coordinator, model_cfg, raw_body, False)
+    return await _proxy_to_llamaserver(request, coordinator, model_cfg, raw_body, False, data=data)
 
 
 @router.post("/infill", response_model=None)
 async def create_infill(request: Request) -> Response:  # type: ignore[type-arg]
-    """llama.cpp FIM ``/infill`` proxy (Plan 13 Task 6), llamaserver-only.
+    """llama.cpp FIM ``/infill`` proxy, llamaserver-only.
 
-    The body MAY carry ``model``: when present it is resolved like the other
-    routes; when absent, ``/infill`` falls back to the single llamaserver model
-    currently loaded across the fleet (zero or multiple → 400 telling the client
-    to specify ``model``). The raw body is forwarded verbatim — llama-server
-    ignores unknown fields, so the ``model`` key is left in place. Streaming is
-    honored only when the body sets ``"stream": true`` (llama-server's ``/infill``
-    supports SSE), sniffed like ``/v1/messages``.
-
-    NOTE: llama-server serves FIM at its ROOT ``/infill``, not under ``/v1``. This
-    route is registered on the coordinator's ``/v1`` router (mounted in main.py,
-    outside this task's ownership), so the upstream path is pinned to ``/infill``
-    regardless of the coordinator-facing path.
+    ``model`` in the body is resolved like other routes; if absent, falls
+    back to the single llamaserver model currently loaded (zero or multiple
+    → 400). llama-server serves FIM at its root ``/infill``, not under
+    ``/v1``, so the upstream path is pinned regardless of the
+    coordinator-facing path.
     """
     coordinator = _get_coordinator(request)
     raw_body, data = await _read_json_body(request)
@@ -661,6 +949,7 @@ async def create_infill(request: Request) -> Response:  # type: ignore[type-arg]
         model_cfg,
         raw_body,
         bool(data.get("stream", False)),
+        data=data,
         upstream_path="/infill",
     )
 
@@ -693,7 +982,7 @@ async def load_model(body: LoadModelRequest, request: Request) -> LoadModelRespo
     """Load a model onto a worker."""
     coordinator = _get_coordinator(request)
 
-    from coordinator.models import Quantization
+    from coordinator.models import ModelRegistry, Quantization
 
     try:
         quantization = Quantization(body.quantization)
@@ -703,6 +992,14 @@ async def load_model(body: LoadModelRequest, request: Request) -> LoadModelRespo
             detail=f"Invalid quantization '{body.quantization}'. "
             f"Valid values: {[q.value for q in Quantization]} (only 'none' is loadable today)",
         ) from exc
+
+    if body.instances is not None:
+        target_config = ModelRegistry.get_model(body.model_name)
+        if target_config is None or target_config.engine != "llamaserver":
+            raise HTTPException(
+                status_code=422,
+                detail="instances is only applicable to engine='llamaserver' models",
+            )
 
     try:
         if body.worker_id is not None:
@@ -719,6 +1016,7 @@ async def load_model(body: LoadModelRequest, request: Request) -> LoadModelRespo
             worker_info,
             body.model_name,
             quantization=quantization,
+            instances=body.instances,
         )
 
         if success:
@@ -734,9 +1032,13 @@ async def load_model(body: LoadModelRequest, request: Request) -> LoadModelRespo
         )
     except HTTPException:
         raise
-    except Exception as exc:
+    except ValueError as exc:
+        # model_name absent from the registry with pull-through disabled.
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception:
+        # Never echo a raw exception string to the client.
         logger.exception("Model load failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="Internal server error") from None
 
 
 @router.delete("/models/{model_name}")
@@ -749,9 +1051,10 @@ async def unload_model(
         unloaded_from = await coordinator.unload_model(model_name, worker_id=worker_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except Exception as exc:
+    except Exception:
+        # Never echo a raw exception string to the client.
         logger.exception("Model unload failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="Internal server error") from None
     return {"status": "unloaded", "model_name": model_name, "workers": unloaded_from}
 
 
@@ -767,8 +1070,60 @@ async def list_workers(request: Request) -> List[Dict[str, Any]]:  # type: ignor
 async def add_manual_worker(
     addresses: List[str], request: Request  # type: ignore[type-arg]
 ) -> Dict[str, List[Dict[str, str]]]:
-    """Manually add a worker by its host:port address."""
+    """Manually add a worker by its host:port address.
+
+    Disabled by default, always requires its own API key, and validates
+    every address before dialing it — a registered worker can be routed
+    real traffic or used for SSRF otherwise. See docs/configuration.md.
+    """
     coordinator = _get_coordinator(request)
+    settings = coordinator.settings
+
+    if not settings.allow_manual_worker_registration:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Manual worker registration is disabled. Set "
+                "COORDINATOR_ALLOW_MANUAL_WORKER_REGISTRATION=true to enable it — see "
+                ".env.example."
+            ),
+        )
+
+    valid_keys = auth.load_api_keys()
+    if not valid_keys:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Manual worker registration requires COORDINATOR_API_KEYS to be "
+                "configured, independent of whether auth is enabled for the rest of "
+                "the API."
+            ),
+        )
+    candidate = auth._extract_candidate_key(request.headers)
+    if candidate is None or not auth._matches_any(candidate, valid_keys):
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": {"message": "invalid or missing API key", "type": "authentication_error"}
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if len(addresses) > _MAX_MANUAL_WORKERS_PER_REQUEST:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"at most {_MAX_MANUAL_WORKERS_PER_REQUEST} addresses per request "
+                f"(got {len(addresses)})"
+            ),
+        )
+
+    for address in addresses:
+        try:
+            _validate_manual_worker_address(address, settings.manual_worker_allowed_hosts)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     results: List[Dict[str, str]] = []
     for address in addresses:
         worker = await coordinator._connect_worker(address)

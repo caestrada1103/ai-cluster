@@ -1,21 +1,12 @@
 # Root docker-compose.yml
 # =======================
-# Docker Compose configuration for the AI Cluster
-#
-# Worker image selection — uncomment the block that matches your GPU:
-#
-#   ┌───────────────────────────────────────────────────────────────────────┐
-#   │  Dockerfile               BACKEND arg   AMD  NVIDIA  Intel  Perf     │
-#   │  docker/Dockerfile.worker  wgpu (default) ✓    ✓       ✓      good   │ ← default
-#   │  docker/Dockerfile.worker  rocm           ✓    ✗       ✗      best   │
-#   │  docker/Dockerfile.worker  cuda           ✗    ✓       ✗      best   │
-#   └───────────────────────────────────────────────────────────────────────┘
-#
-# One parameterized docker/Dockerfile.worker covers all three variants via
-# --build-arg BACKEND=wgpu|rocm|cuda (see the commented build.args blocks
-# below). The default "worker" service uses the universal wgpu image with
-# AMD device passthrough.  NVIDIA and high-perf AMD alternatives are
-# commented out below — swap the active "worker" block as needed.
+# Worker backend/vendor selection is via Compose profiles (amd-vulkan,
+# nvidia-vulkan, intel-vulkan, rocm-native, cuda-native) — set COMPOSE_PROFILES
+# in .env or pass --profile; none is active by default (`docker compose up -d`
+# alone starts only coordinator + monitoring + open-webui). Only the
+# coordinator's port (8000) is published to the host — worker/Open-WebUI ports
+# require the docker-compose.expose-ports.yml override. Full profile table,
+# security posture, and per-GPU commands: docs/deployment.md, .env.example.
 
 services:
   # Coordinator
@@ -30,7 +21,13 @@ services:
       - COORDINATOR_PORT=8000
       - COORDINATOR_DISCOVERY_METHOD=static
       - COORDINATOR_STATIC_WORKERS=["worker:50051"]
-      - COORDINATOR_CORS_ORIGINS=${COORDINATOR_CORS_ORIGINS:-*}
+      # Default comes from coordinator/config.py (empty + an always-on loopback
+      # allowance); override in .env only when another origin needs CORS.
+      - COORDINATOR_CORS_ORIGINS=${COORDINATOR_CORS_ORIGINS:-}
+      # Empty by default; the coordinator refuses to start with a non-loopback
+      # COORDINATOR_HOST (true here, since 8000 is published) and no keys —
+      # set this in .env before `docker compose up`. See .env.example.
+      - COORDINATOR_API_KEYS=${COORDINATOR_API_KEYS:-}
     volumes:
       - ./config:/app/config:ro
       - ./models:/app/models:ro
@@ -52,21 +49,24 @@ services:
       retries: 3
       start_period: 10s
     restart: unless-stopped
+    # Fixed, unlike the GPU workers whose memory need scales with the loaded model.
+    mem_limit: ${COORDINATOR_MEM_LIMIT:-2g}
+    pids_limit: 512
 
   # ==========================================================================
-  # Worker — Universal wgpu/Vulkan (AMD + NVIDIA + Intel)
-  # Default: AMD device passthrough.
-  # NVIDIA users: remove "devices / security_opt / group_add" and add the
-  #   "deploy.resources.reservations.devices" block from the NVIDIA section.
+  # Worker — Universal wgpu/Vulkan, AMD device passthrough
+  # RX 9060XT and other discrete/APU AMD GPUs. Vendor-neutral Vulkan backend.
+  #   COMPOSE_PROFILES=amd-vulkan docker compose up -d
   # ==========================================================================
-  worker:
+  worker-amd-vulkan:
+    profiles: ["amd-vulkan"]
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
     image: ai-worker:latest
-    environment:
+    environment: &worker-common-env
       - GPU_INDEX=${GPU_INDEX:-0}
-      - GPU_VRAM_GB=${GPU_VRAM_GB:-6}
+      - GPU_VRAM_GB=${GPU_VRAM_GB:-}
       - WORKER_ID=${WORKER_ID:-}
       - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
       - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
@@ -75,176 +75,189 @@ services:
       - RUST_LOG=${RUST_LOG:-info}
       - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
       - HF_TOKEN=${HF_TOKEN:-}
-    volumes:
+      # Shared-secret gRPC auth (worker/src/grpc_auth.rs). Empty by default;
+      # required once this worker's ports are published (expose-ports.yml)
+      # or reached from another host.
+      - WORKER_GRPC_AUTH_TOKEN=${WORKER_GRPC_AUTH_TOKEN:-}
+      # Containers bind the Compose network, not loopback; the worker's
+      # own default stays 127.0.0.1 for bare-metal runs.
+      - WORKER_GRPC_BIND_HOST=${WORKER_GRPC_BIND_HOST:-0.0.0.0}
+      - LLAMASERVER_BIND_HOST=${LLAMASERVER_BIND_HOST:-0.0.0.0}
+      - GPU_MEMORY_HEADROOM_PERCENT=${GPU_MEMORY_HEADROOM_PERCENT:-}
+    volumes: &worker-common-volumes
       - ./config:/app/config:ro
       - ./models:/app/models
       - ./data:/app/data
     networks:
-      - ai-cluster-net
-    ports:
-      - "${GRPC_PORT:-50051}:${GRPC_PORT:-50051}"
-      - "${METRICS_PORT:-9091}:${METRICS_PORT:-9091}"
-      # llama-server (Plan 13, engine="llamaserver") registry ports — one per
-      # llamaserver model in config/models.toml (8081 Devstral, 8082 Qwen3-Coder;
-      # coordinator-assigned, globally unique per model). The coordinator proxies
-      # agentic HTTP inference to worker_host:<port>. Within this compose network
-      # it reaches the worker as "worker:8081" without publishing; publish them (as
-      # below) only when the coordinator runs on ANOTHER host and must reach these
-      # over the LAN. Trusted-LAN only — firewall them (that hop is unauthenticated).
-      - "8081:8081"
-      - "8082:8082"
+      ai-cluster-net:
+        aliases:
+          - worker
+    # No ports published by default — see the file header comment and
+    # docker-compose.expose-ports.yml for the explicit opt-in.
     logging: *default-logging
     depends_on:
       coordinator:
         condition: service_healthy
-    # AMD Vulkan device passthrough — remove these three keys for NVIDIA
+    # AMD Vulkan device passthrough.
     devices:
       - /dev/kfd
       - /dev/dri
-    security_opt:
-      - seccomp=unconfined
     group_add:
       - video
       - render
     restart: unless-stopped
+    # No mem_limit here (unlike coordinator/monitoring) — model size varies
+    # too widely across deployments; pids_limit alone guards against a runaway fork bomb.
+    pids_limit: 2048
 
   # ==========================================================================
-  # Worker — NVIDIA wgpu/Vulkan (same universal image, NVIDIA device access)
-  # Replace the "worker" service above with this block on NVIDIA machines.
-  # Requires NVIDIA Container Toolkit:
-  #   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+  # Worker — Universal wgpu/Vulkan, NVIDIA device passthrough (same image as
+  # above — Vulkan auto-detects the vendor). Requires the NVIDIA Container Toolkit.
+  #   COMPOSE_PROFILES=nvidia-vulkan docker compose up -d
   # ==========================================================================
-  # worker:
-  #   build:
-  #     context: .
-  #     dockerfile: docker/Dockerfile.worker
-  #   image: ai-worker:latest
-  #   environment:
-  #     - GPU_INDEX=${GPU_INDEX:-0}
-  #     - GPU_VRAM_GB=${GPU_VRAM_GB:-6}
-  #     - WORKER_ID=${WORKER_ID:-}
-  #     - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
-  #     - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
-  #     - RUST_LOG=${RUST_LOG:-info}
-  #     - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
-  #     - HF_TOKEN=${HF_TOKEN:-}
-  #   volumes:
-  #     - ./config:/app/config:ro
-  #     - ./models:/app/models
-  #     - ./data:/app/data
-  #   networks:
-  #     - ai-cluster-net
-  #   ports:
-  #     - "${GRPC_PORT:-50051}:${GRPC_PORT:-50051}"
-  #     - "${METRICS_PORT:-9091}:${METRICS_PORT:-9091}"
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             device_ids: ["${GPU_INDEX:-0}"]
-  #             capabilities: [gpu]
-  #   depends_on:
-  #     - coordinator
-  #   restart: unless-stopped
+  worker-nvidia-vulkan:
+    profiles: ["nvidia-vulkan"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    image: ai-worker:latest
+    environment: *worker-common-env
+    volumes: *worker-common-volumes
+    networks:
+      ai-cluster-net:
+        aliases:
+          - worker
+    # Not published by default — see the file header comment.
+    logging: *default-logging
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_INDEX:-0}"]
+              capabilities: [gpu]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    restart: unless-stopped
+    pids_limit: 2048
 
   # ==========================================================================
-  # Worker — AMD native ROCm (burn/rocm, maximum AMD performance)
-  # Replace the "worker" service above with this block for AMD max performance.
+  # Worker — Universal wgpu/Vulkan, Intel device passthrough (Mesa ANV
+  # driver, default image, no BACKEND build arg needed).
+  #   COMPOSE_PROFILES=intel-vulkan docker compose up -d
   # ==========================================================================
-  # worker:
-  #   build:
-  #     context: .
-  #     dockerfile: docker/Dockerfile.worker
-  #     args:
-  #       BACKEND: rocm
-  #       BUILDER_IMAGE: rocm/dev-ubuntu-24.04:6.2.1
-  #       RUNTIME_IMAGE: rocm/dev-ubuntu-24.04:6.2.1
-  #       BUILDER_EXTRA_PKGS: ""
-  #       RUNTIME_EXTRA_PKGS: ""
-  #   image: ai-worker-amd:latest
-  #   environment:
-  #     - GPU_INDEX=${GPU_INDEX:-0}
-  #     - GPU_VRAM_GB=${GPU_VRAM_GB:-6}
-  #     - WORKER_ID=${WORKER_ID:-}
-  #     - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
-  #     - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
-  #     - RUST_LOG=${RUST_LOG:-info}
-  #     - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
-  #     - HF_TOKEN=${HF_TOKEN:-}
-  #   volumes:
-  #     - ./config:/app/config:ro
-  #     - ./models:/app/models
-  #     - ./data:/app/data
-  #   networks:
-  #     - ai-cluster-net
-  #   ports:
-  #     - "${GRPC_PORT:-50051}:${GRPC_PORT:-50051}"
-  #     - "${METRICS_PORT:-9091}:${METRICS_PORT:-9091}"
-  #   devices:
-  #     - /dev/kfd
-  #     - /dev/dri
-  #   security_opt:
-  #     - seccomp=unconfined
-  #   group_add:
-  #     - video
-  #     - render
-  #   depends_on:
-  #     - coordinator
-  #   restart: unless-stopped
+  worker-intel-vulkan:
+    profiles: ["intel-vulkan"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    image: ai-worker:latest
+    environment: *worker-common-env
+    volumes: *worker-common-volumes
+    networks:
+      ai-cluster-net:
+        aliases:
+          - worker
+    # Not published by default — see the file header comment.
+    logging: *default-logging
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    devices:
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    restart: unless-stopped
+    pids_limit: 2048
 
   # ==========================================================================
-  # Worker — NVIDIA native CUDA (burn/cuda, maximum NVIDIA performance)
-  # Replace the "worker" service above with this block for NVIDIA max performance.
-  # Requires NVIDIA Container Toolkit.
+  # Worker — AMD native ROCm (burn/rocm, maximum AMD performance).
+  #   COMPOSE_PROFILES=rocm-native docker compose up -d
   # ==========================================================================
-  # worker:
-  #   build:
-  #     context: .
-  #     dockerfile: docker/Dockerfile.worker
-  #     args:
-  #       BACKEND: cuda
-  #       BUILDER_IMAGE: nvidia/cuda:12.6.3-devel-ubuntu24.04
-  #       RUNTIME_IMAGE: nvidia/cuda:12.6.3-runtime-ubuntu24.04
-  #       BUILDER_EXTRA_PKGS: ""
-  #       RUNTIME_EXTRA_PKGS: "libcublas-12-6"
-  #   image: ai-worker-nvidia:latest
-  #   environment:
-  #     - GPU_INDEX=${GPU_INDEX:-0}
-  #     - GPU_VRAM_GB=${GPU_VRAM_GB:-6}
-  #     - WORKER_ID=${WORKER_ID:-}
-  #     - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
-  #     - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
-  #     - RUST_LOG=${RUST_LOG:-info}
-  #     - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
-  #     - HF_TOKEN=${HF_TOKEN:-}
-  #   volumes:
-  #     - ./config:/app/config:ro
-  #     - ./models:/app/models
-  #     - ./data:/app/data
-  #   networks:
-  #     - ai-cluster-net
-  #   ports:
-  #     - "${GRPC_PORT:-50051}:${GRPC_PORT:-50051}"
-  #     - "${METRICS_PORT:-9091}:${METRICS_PORT:-9091}"
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             device_ids: ["${GPU_INDEX:-0}"]
-  #             capabilities: [gpu]
-  #   depends_on:
-  #     - coordinator
-  #   restart: unless-stopped
+  worker-rocm-native:
+    profiles: ["rocm-native"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+      args:
+        BACKEND: rocm
+        BUILDER_IMAGE: rocm/dev-ubuntu-24.04:6.2.1
+        RUNTIME_IMAGE: rocm/dev-ubuntu-24.04:6.2.1
+        BUILDER_EXTRA_PKGS: ""
+        RUNTIME_EXTRA_PKGS: ""
+    image: ai-worker-amd:latest
+    environment: *worker-common-env
+    volumes: *worker-common-volumes
+    networks:
+      ai-cluster-net:
+        aliases:
+          - worker
+    # Not published by default — see the file header comment.
+    logging: *default-logging
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    # Device passthrough + group_add (video/render) grants ROCm/KFD access
+    # without seccomp=unconfined. If your kernel hits an EPERM/ENOSYS from a
+    # blocked syscall, re-add `security_opt: [seccomp=unconfined]` locally.
+    group_add:
+      - video
+      - render
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    restart: unless-stopped
+    pids_limit: 2048
+
+  # ==========================================================================
+  # Worker — NVIDIA native CUDA (burn/cuda, maximum NVIDIA performance).
+  # CUDA 13.0.3 devel+runtime (needed for sm_121/Grace-Blackwell GB10 support);
+  # publishes both linux/amd64 and linux/arm64. Requires the NVIDIA Container Toolkit.
+  #   COMPOSE_PROFILES=cuda-native docker compose up -d
+  # ==========================================================================
+  worker-cuda-native:
+    profiles: ["cuda-native"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+      args:
+        BACKEND: cuda
+        BUILDER_IMAGE: nvidia/cuda:13.0.3-devel-ubuntu24.04
+        RUNTIME_IMAGE: nvidia/cuda:13.0.3-runtime-ubuntu24.04
+        BUILDER_EXTRA_PKGS: ""
+        RUNTIME_EXTRA_PKGS: "libcublas-13-0"
+    image: ai-worker-nvidia:latest
+    environment: *worker-common-env
+    volumes: *worker-common-volumes
+    networks:
+      ai-cluster-net:
+        aliases:
+          - worker
+    # Not published by default — see the file header comment.
+    logging: *default-logging
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_INDEX:-0}"]
+              capabilities: [gpu]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    restart: unless-stopped
+    pids_limit: 2048
 
   # ==========================================================================
   # Multi-GPU example: uncomment and adjust for machines with multiple GPUs.
-  # Each worker gets a unique GPU_INDEX and port pair.
-  # Applies to any of the Dockerfile variants above — just change the
-  # dockerfile and image fields to match your chosen backend.
+  # Each worker needs its own GPU_INDEX, port pair, and Compose service name
+  # (not the shared "worker" alias). Base each block on the matching
+  # single-GPU service above (copy its devices/deploy block too).
   # ==========================================================================
   # worker-gpu-0:
+  #   profiles: ["multi-gpu"]
   #   build:
   #     context: .
   #     dockerfile: docker/Dockerfile.worker   # add args: BACKEND: rocm|cuda for native variants
@@ -266,6 +279,7 @@ services:
   #     - coordinator
 
   # worker-gpu-1:
+  #   profiles: ["multi-gpu"]
   #   build:
   #     context: .
   #     dockerfile: docker/Dockerfile.worker   # add args: BACKEND: rocm|cuda for native variants
@@ -286,17 +300,12 @@ services:
   #   depends_on:
   #     - coordinator
 
-  # NOTE for multi-GPU: each extra worker needs (a) its own GPU passthrough block
-  # (devices/group_add for AMD or deploy.resources.reservations.devices for NVIDIA),
-  # (b) an entry in COORDINATOR_STATIC_WORKERS, e.g. ["worker-gpu-0:50051","worker-gpu-1:50052"],
-  # (c) a matching target in config/prometheus.yml (workers job).
-  #
-  # NOTE for engine="llamaserver" (Plan 13): the alternate worker blocks above
-  # (NVIDIA/ROCm/CUDA) omit the llamaserver port publishes for brevity — copy the
-  # `- "8081:8081"` / `- "8082:8082"` lines from the default worker when swapping
-  # one in, if the coordinator is on another host. Those ports are per-MODEL and
-  # globally unique (not per-worker), so one publish covers whichever worker loads
-  # that model. See docs/deployment.md "llama-server for agentic serving".
+  # Multi-GPU also needs: (a) GPU passthrough per worker, (b) an entry in
+  # COORDINATOR_STATIC_WORKERS per worker, (c) a matching target in
+  # config/prometheus.yml. Do not also activate a single-GPU profile in the
+  # same project — both would claim the "worker" alias and default ports.
+  # For LAN clusters (a worker per host) and llamaserver port publishing,
+  # see docs/deployment.md.
 
   # Monitoring Stack
   prometheus:
@@ -316,6 +325,8 @@ services:
       - "9099:9090"
     logging: *default-logging
     restart: unless-stopped
+    mem_limit: ${PROMETHEUS_MEM_LIMIT:-2g}
+    pids_limit: 256
 
   grafana:
     image: grafana/grafana:11.1.0
@@ -336,8 +347,11 @@ services:
     depends_on:
       - prometheus
     restart: unless-stopped
+    mem_limit: ${GRAFANA_MEM_LIMIT:-1g}
+    pids_limit: 256
 
-  # Open-WebUI (Chat Interface)
+  # Open-WebUI (Chat Interface). WEBUI_AUTH defaults to True; set it False
+  # yourself only if this instance never leaves a trusted LAN.
   open-webui:
     image: ghcr.io/open-webui/open-webui:v0.6.5
     container_name: ai-open-webui
@@ -345,17 +359,18 @@ services:
       - OPENAI_API_BASE_URLS=http://coordinator:8000/v1
       - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-placeholder}
       - ENABLE_OLLAMA_API=False
-      - WEBUI_AUTH=False # Disable login screen for local network
+      - WEBUI_AUTH=${WEBUI_AUTH:-True}
     volumes:
       - open-webui-data:/app/backend/data
     networks:
       - ai-cluster-net
-    ports:
-      - "8080:8080"
+    # Not published by default — opt in via docker-compose.expose-ports.yml (adds "8080:8080").
     depends_on:
       coordinator:
         condition: service_healthy
     restart: unless-stopped
+    mem_limit: ${OPEN_WEBUI_MEM_LIMIT:-2g}
+    pids_limit: 512
 
 networks:
   ai-cluster-net:

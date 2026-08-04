@@ -123,10 +123,9 @@ class ClusterCoordinator:
 
         # Locks for thread safety
         self._workers_lock = asyncio.Lock()
-        # Per-model single-flight locks for llamaserver auto-load (Plan 13 Task
-        # 5): concurrent proxied requests for the same unloaded model serialize
-        # here so exactly ONE load runs. Created lazily per model name; never
-        # evicted (bounded by the registry size).
+        # Per-model single-flight locks for llamaserver auto-load: concurrent
+        # requests for the same unloaded model serialize here so exactly one
+        # load runs. Lazily created, never evicted.
         self._autoload_locks: Dict[str, asyncio.Lock] = {}
 
         # Background tasks
@@ -262,6 +261,9 @@ class ClusterCoordinator:
         )
         worker.state = WorkerState.HEALTHY
         worker.gpus = list(status.gpus)
+        # Adopt models already resident on the worker (e.g. the coordinator
+        # restarted while the worker kept a model loaded).
+        worker.loaded_models = {m.model_name: m for m in status.loaded_models}
 
         async with self._workers_lock:
             # Re-check: another task may have connected the same address meanwhile.
@@ -293,10 +295,9 @@ class ClusterCoordinator:
                     await asyncio.sleep(self.settings.health_check_interval)
                     continue
 
-                # 2. Perform health checks concurrently (NO LOCK HELD)
-                # This ensures slow network IO doesn't block the request processor.
-                # OFFLINE means "no longer discovered" — do NOT resurrect via get_status;
-                # let the cleanup below evict it even when it still answers RPCs.
+                # Health checks run concurrently with no lock held, so slow
+                # network IO doesn't block the request processor. OFFLINE
+                # workers are skipped, not resurrected, and evicted below.
                 await asyncio.gather(
                     *[
                         worker.get_status()
@@ -392,13 +393,9 @@ class ClusterCoordinator:
     ) -> Optional[WorkerInfo]:
         """Return a healthy worker that ALREADY reports ``model_name`` loaded.
 
-        Used by the Plan 13 llamaserver proxy path (`coordinator/api.py`): the
-        coordinator forwards HTTP requests to the llama-server child process on
-        whichever worker already serves the model. Returns None when no healthy
-        worker holds the model — the caller then either auto-loads (Task 5) or
-        404s (auto-load disabled). Prefers the router's strategy among the
-        workers that hold the model, falling back to the first such worker when
-        the router declines every one (e.g. all at capacity).
+        Used by the llamaserver HTTP proxy path in ``coordinator/api.py``.
+        Returns None when no healthy worker holds the model (caller then
+        either auto-loads or 404s).
         """
         async with self._workers_lock:
             holders = {
@@ -416,16 +413,11 @@ class ClusterCoordinator:
     async def _pick_autoload_worker(
         self, model_name: str, session_id: Optional[str] = None
     ) -> Optional[WorkerInfo]:
-        """Pick a healthy worker to auto-load ``model_name`` onto (Plan 13 Task 5).
+        """Pick a healthy worker to auto-load ``model_name`` onto.
 
-        Prefers the router's strategy (least-load by default) across the HEALTHY
-        workers, using the model's real memory requirement for the fit check;
-        falls back to the first healthy worker when the router declines them all
-        (e.g. none report enough free VRAM yet the operator still wants the load
-        attempted — mirrors POST /models/load's unconditional "pick a worker").
-        Unlike /models/load's "first registered worker", auto-load restricts to
-        HEALTHY workers so it never spawns a llama-server on a still-connecting
-        or unhealthy node. Returns None only when no healthy worker exists.
+        Prefers the router's strategy among HEALTHY workers, falling back to
+        the first healthy one if the router declines them all. Returns None
+        only when no healthy worker exists.
         """
         async with self._workers_lock:
             healthy = {wid: w for wid, w in self.workers.items() if w.state == WorkerState.HEALTHY}
@@ -441,17 +433,12 @@ class ClusterCoordinator:
     ) -> WorkerInfo:
         """Ensure ``model_name`` is loaded on a healthy worker, loading on demand.
 
-        Plan 13 Task 5 auto-load. Reuses ``_load_model_on_worker`` — the exact
-        path ``POST /models/load`` drives — on a router-picked healthy worker.
         Single-flight per model: concurrent callers serialize on a per-model
-        lock and RE-CHECK the loaded state after acquiring it, so exactly one
-        load runs even under a burst of requests for the same cold model. The
-        load itself is the only work done under the lock — the caller's proxy
-        call happens afterwards, lock released.
+        lock and re-check the loaded state after acquiring it, so exactly one
+        load runs under a burst of requests for the same cold model.
 
-        Returns the worker now serving the model. Raises ``RuntimeError`` when no
-        healthy worker is available or the load fails/ times out (the API layer
-        maps that to a 503).
+        Returns the worker now serving the model. Raises ``RuntimeError`` when
+        no healthy worker is available or the load fails (mapped to a 503).
         """
         # Fast path: already loaded somewhere (no lock — the common case).
         worker = await self.find_worker_for_model(model_name, session_id)
@@ -473,18 +460,14 @@ class ClusterCoordinator:
             if not loaded:
                 raise RuntimeError(f"Failed to load model '{model_name}' on worker {target.id}")
 
-            # Reflect the load immediately so waiters (and the next request
-            # arriving before the health loop refreshes GetStatus) see the model
-            # as loaded and don't trigger a second load. get_status() overwrites
-            # this with the worker's authoritative LoadedModelInfo on its next
-            # health tick.
+            # Reflect the load immediately so waiters don't trigger a second
+            # load; get_status() overwrites this on its next health tick.
             target.loaded_models.setdefault(model_name, pb.LoadedModelInfo(model_name=model_name))
             return target
 
     async def loaded_llamaserver_models(self) -> List[str]:
-        """Distinct ``engine=="llamaserver"`` model names reported loaded on any
-        healthy worker (Plan 13 Task 6 — the ``/infill`` single-model fallback).
-        """
+        """Distinct ``engine=="llamaserver"`` model names loaded on any healthy
+        worker. Used for the ``/infill`` single-model fallback."""
         names: Set[str] = set()
         async with self._workers_lock:
             for worker in self.workers.values():
@@ -561,16 +544,63 @@ class ClusterCoordinator:
             worker.active_requests -= 1
             self.active_requests_gauge.set(len(self.active_requests))
 
+    async def _refresh_worker_state(self, worker: WorkerInfo) -> None:
+        """Synchronously refresh one worker's ``gpus``/``loaded_models``.
+
+        Called right after a load/unload RPC completes so a client that just
+        hit ``POST /models/load`` or ``DELETE /models/{name}`` sees consistent
+        data on its very next ``GET /v1/workers`` or ``GET /v1/models`` call,
+        instead of waiting up to ``health_check_interval`` for the periodic
+        health-check loop to catch up (item 3). This also picks up any change
+        the worker made on its own as a side effect of the load/unload (e.g.
+        evicting another model to free VRAM), not just the model we touched.
+
+        Bounded by ``worker.health_check_timeout`` — the exact timeout
+        ``WorkerInfo.get_status()`` already uses for its gRPC call — so this
+        can never hang the load/unload request path longer than a normal
+        health check would. ``get_status()`` itself swallows/logs RPC errors
+        and updates failure bookkeeping rather than raising, so a worker that
+        is momentarily unreachable degrades to "stale until the next periodic
+        poll" rather than failing the load/unload response.
+
+        Deliberately never lets an exception escape: this is a best-effort
+        freshness refresh, not part of the load/unload contract itself — a
+        successful load/unload must still be reported as successful even if
+        this immediate refresh fails for any reason (the periodic health-check
+        loop remains the fallback source of truth).
+        """
+        try:
+            await worker.get_status()
+        except Exception as e:
+            logger.warning(f"Failed to refresh worker {worker.id} state after load/unload: {e}")
+
     async def _load_model_on_worker(
         self,
         worker: WorkerInfo,
         model_name: str,
         quantization: Quantization = Quantization.NONE,
+        instances: Optional[int] = None,
     ) -> bool:
-        """Load a model on a worker."""
-        try:
-            model_config = ModelRegistry.get_model(model_name)
+        """Load a model on a worker.
 
+        `instances` overrides the registry's llamaserver instance/slot count
+        for this load only; ignored for non-llamaserver models.
+        """
+        model_config = ModelRegistry.get_model(model_name)
+
+        # An unregistered model_name would otherwise fall through to an
+        # arbitrary HuggingFace pull. Reject it here (before the try/except
+        # below) unless the operator opts in, so callers get a 4xx instead
+        # of a misleading 200 {"status": "failed"}.
+        if model_config is None and not self.settings.allow_unregistered_model_pull:
+            raise ValueError(
+                f"Model '{model_name}' is not in the registry (config/models.toml) "
+                "and unregistered-model pull-through is disabled. Add it to the "
+                "registry, or set COORDINATOR_ALLOW_UNREGISTERED_MODEL_PULL=true "
+                "to explicitly opt into loading arbitrary HuggingFace repos by name."
+            )
+
+        try:
             if model_config:
                 # Use strict registry configuration if known
                 config_pb = pb.ModelConfig(
@@ -584,7 +614,7 @@ class ClusterCoordinator:
                     intermediate_size=model_config.intermediate_size,
                     # Engine routing (empty for burn models): the worker reads
                     # these string keys to select the llama.cpp GGUF path.
-                    metadata=model_config.grpc_metadata(),
+                    metadata=model_config.grpc_metadata(instances=instances),
                 )
                 if model_config.local_gpu_ids is not None:
                     # Level 1 — local multi-GPU split: send the exact GPU ids
@@ -623,13 +653,20 @@ class ClusterCoordinator:
                 parallelism=pb.ParallelismStrategy.AUTO,
             )
 
-            response = await worker.stub.LoadModel(request, timeout=300)  # 5 min timeout
+            # Deadline covers the worker's GGUF download, not just the load —
+            # see Settings.model_load_timeout for the sizing rationale.
+            response = await worker.stub.LoadModel(
+                request, timeout=self.settings.model_load_timeout
+            )
 
             if response.success:
                 logger.info(
                     f"Loaded {model_name} on worker {worker.id}, "
                     f"using {response.memory_used / 1e9:.2f}GB VRAM"
                 )
+                # Refresh state synchronously instead of waiting on the
+                # periodic health-check loop, so callers see it immediately.
+                await self._refresh_worker_state(worker)
                 return True
             else:
                 logger.error(f"Failed to load model: {response.message}")
@@ -664,6 +701,9 @@ class ClusterCoordinator:
                 worker.loaded_models.pop(model_name, None)
                 unloaded_from.append(worker.id)
                 logger.info(f"Unloaded {model_name} from worker {worker.id}")
+                # Refresh synchronously so freed GPU memory isn't stale until
+                # the next health tick.
+                await self._refresh_worker_state(worker)
             except Exception as e:
                 logger.error(f"Failed to unload {model_name} from {worker.id}: {e}")
         if not unloaded_from:

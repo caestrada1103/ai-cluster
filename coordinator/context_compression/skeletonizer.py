@@ -77,14 +77,8 @@ def _load_language(canonical: str) -> "Language":
 
 
 def _placeholder(canonical: str) -> bytes:
-    # Deliberately terse: this text replaces a whole function/method body, so
-    # it must stay shorter than the bodies it typically replaces (including
-    # small ones) for skeletonization to actually shrink the token estimate
-    # — see coordinator/tests/test_context_compression_pipeline.py::
-    # test_over_budget_skeletonizes_peripheral_code_only. This text is never
-    # executed (only ever re-parsed for syntax validity and shipped in a
-    # prompt string), so a bare name expression is a fine, minimal, valid
-    # Python statement — it doesn't need to actually resolve at runtime.
+    # Deliberately terse (must stay shorter than the bodies it replaces) and
+    # never executed — only re-parsed for syntax validity.
     if canonical == "python":
         return b"skeletonized"
     return b"{ /* skeletonized */ }"

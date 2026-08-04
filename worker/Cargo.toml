@@ -58,10 +58,8 @@ metrics-exporter-prometheus = "0.12"
 # HTTP for metrics server
 axum = "0.7"
 
-# Loopback HTTP health-check for supervised llama-server processes (Plan 13).
-# Already in the tree via hf-hub; default-features off keeps it TLS-free here
-# (only http://127.0.0.1 is used) — feature unification leaves hf-hub's build
-# unchanged.
+# Loopback HTTP health-check for supervised llama-server processes.
+# default-features off keeps it TLS-free (only http://127.0.0.1 is used).
 reqwest = { version = "0.12", default-features = false }
 
 # Utilities

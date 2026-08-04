@@ -13,8 +13,9 @@ keys are ignored, so the shared `.env` can also carry worker variables.
 
 | Variable | Default | Description |
 |---|---|---|
-| `COORDINATOR_HOST` | `0.0.0.0` | Bind address |
+| `COORDINATOR_HOST` | `0.0.0.0` | Bind address. Refuses to start when this is not loopback (`127.0.0.1`/`::1`/`localhost`) AND `COORDINATOR_API_KEYS` is unset — secure by default. |
 | `COORDINATOR_PORT` | `8000` | HTTP port |
+| `COORDINATOR_API_KEYS` | *(unset)* | Comma-separated API keys gating the whole HTTP surface (except `/health`/`/metrics`); `Authorization: Bearer <key>` or `x-api-key: <key>`. Empty = open (only safe with a loopback `COORDINATOR_HOST`). |
 | `COORDINATOR_DISCOVERY_METHOD` | `static` | Only `static` is implemented (`mdns`/`broadcast`/`consul` are planned and fail fast) |
 | `COORDINATOR_STATIC_WORKERS` | `[]` | Comma-separated `host:port` list (or JSON array) |
 | `COORDINATOR_DISCOVERY_INTERVAL` | `30` | Discovery loop seconds (min 5) |
@@ -23,8 +24,12 @@ keys are ignored, so the shared `.env` can also carry worker variables.
 | `COORDINATOR_MAX_FAILURES` | `3` | Consecutive failures before UNHEALTHY |
 | `COORDINATOR_REQUEST_TIMEOUT` | `300` | End-to-end inference timeout seconds |
 | `COORDINATOR_MAX_QUEUE_SIZE` | `1000` | Request queue bound |
+| `COORDINATOR_MAX_REQUEST_BODY_BYTES` | `25000000` | Max HTTP request body size in bytes |
 | `COORDINATOR_MODELS_CONFIG` | `config/models.toml` | Registry path |
-| `COORDINATOR_CORS_ORIGINS` | `*` | `*`, comma-separated list, or JSON array |
+| `COORDINATOR_ALLOW_UNREGISTERED_MODEL_PULL` | `false` | Allow `POST /v1/models/load` for a `model_name` absent from the registry (otherwise sent to the worker as an arbitrary HF repo id) |
+| `COORDINATOR_ALLOW_MANUAL_WORKER_REGISTRATION` | `false` | Enable `POST /v1/workers/manual` — also always requires a valid `COORDINATOR_API_KEYS` credential regardless of global auth state |
+| `COORDINATOR_MANUAL_WORKER_ALLOWED_HOSTS` | `[]` | Optional host/CIDR allowlist for `POST /v1/workers/manual`; empty accepts any well-formed address once the feature above is enabled |
+| `COORDINATOR_CORS_ORIGINS` | `[]` | `*`, comma-separated list, or JSON array — beyond the always-on loopback allowance |
 | `COORDINATOR_MAX_CONCURRENT_REQUESTS_PER_WORKER` | `10` | Per-worker in-flight cap |
 | `COORDINATOR_ROUTING_STRATEGY` | `least_load` | `least_load` / `round_robin` / `random` / `affinity` / `power_of_two` |
 | `COORDINATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Failures before a worker's circuit opens |
@@ -32,6 +37,38 @@ keys are ignored, so the shared `.env` can also carry worker variables.
 | `COORDINATOR_AFFINITY_TTL_SECONDS` | `600.0` | Session stickiness TTL (affinity strategy) |
 
 There is no `coordinator.yaml` — YAML config was removed in favor of env-only.
+
+### Security notes
+
+- **API keys**: env-only (`COORDINATOR_API_KEYS`), checked via
+  `Authorization: Bearer <key>` or `x-api-key: <key>`. `/health` and
+  `/metrics` are always exempt. Comparison is constant-time over UTF-8 bytes
+  (not `hmac.compare_digest` directly, which requires ASCII-only `str`
+  arguments and would 500 on a non-ASCII candidate key instead of 401ing). A
+  CORS preflight (`OPTIONS`) always bypasses the key check — browsers don't
+  attach credentials to preflights, and gating it would make browsers
+  misreport a 401 as a CORS failure.
+- **Middleware order**: `add_middleware` prepends, so registration order is
+  reversed at request time. Auth is registered before CORS so a preflight
+  reaches CORS first; the request-body-size cap is registered last (so it
+  runs outermost) to reject oversized bodies before auth/CORS spend cycles
+  on them.
+- **Request body size cap** (`COORDINATOR_MAX_REQUEST_BODY_BYTES`): enforced
+  two ways — a `Content-Length` pre-check, and a streaming byte counter for
+  chunked or lying-header bodies. Applies to the `engine="llamaserver"` raw
+  proxy path too. Default 25 MB comfortably covers large prompts/context
+  without allowing unbounded memory use per request.
+- **`POST /v1/workers/manual`** is off by default because it lets a caller
+  point the coordinator's gRPC client at an arbitrary host:port — enabling
+  it always requires a valid `COORDINATOR_API_KEYS` credential regardless of
+  the global auth setting, to avoid becoming an SSRF/traffic-hijack vector.
+  A registered worker self-reports `loaded_models`, so this endpoint can
+  make other model names appear served.
+- **`COORDINATOR_ALLOW_UNREGISTERED_MODEL_PULL`** is off by default because,
+  when on, an unrecognized `model_name` is forwarded to the worker as a raw
+  HuggingFace repo id.
+- **Context-compression budget**: sized as `n_ctx - max_tokens - 512`, where
+  512 is headroom for chat-template/formatting overhead.
 
 ## Worker
 
@@ -51,14 +88,35 @@ Precedence for `worker_id` / `grpc_port` / `metrics_port` / `gpu_ids`:
 | `--log-json` | `LOG_JSON` | off | JSON log output |
 
 Additional env: `RUST_LOG`, `RUST_BACKTRACE`, `HF_TOKEN` (gated model downloads),
-`GPU_VRAM_GB` (VRAM hint when the vendor tool can't report it — code default 8).
+`GPU_VRAM_GB` (explicit VRAM override, in GB — takes precedence over any
+detected value; unset by default, including in `docker-compose.yml`),
+`GPU_MEMORY_HEADROOM_PERCENT` (default `15`; on unified-memory hardware
+where the vendor "free" figure is unreliable, the available-memory estimate
+is this percent less than total system RAM, held back as headroom for the
+OS/other processes), `WORKER_GRPC_AUTH_TOKEN` (shared-secret gRPC auth; wins
+over `worker.toml`'s `grpc_auth_token`), `WORKER_GRPC_BIND_HOST` /
+`LLAMASERVER_BIND_HOST` (win over `worker.toml`'s `grpc_bind_host` /
+`llamaserver_bind_host`; `docker-compose.yml` sets both to `0.0.0.0` per
+worker service — see [deployment.md](deployment.md)), `LLAMASERVER_BINARY_PATH`.
 Docker replicas also use `GPU_INDEX`, `GRPC_BASE_PORT`, `METRICS_BASE_PORT`
 (entrypoint computes port = base + index).
+
+### Memory detection
+
+Total VRAM comes from the CUDA driver (`cuMemGetInfo`, via `dlopen`) or a
+vendor tool (`nvidia-smi`) where available. On unified-memory hardware (e.g.
+DGX Spark) the vendor "free" figure counts reclaimable page cache as used
+and can understate available memory by tens of GB, so the *available*
+figure falls back to `GPU_MEMORY_HEADROOM_PERCENT` less than total system
+RAM instead of trusting that number. `GPU_VRAM_GB` overrides total memory
+outright when set, ahead of any detection. See "Hardening notes" below for
+the DGX Spark `nvidia-smi`/NVML failure mode this works around.
 
 ### config/worker.toml (flat — unknown keys are a hard error)
 
 ```toml
 # worker_id = "my-worker"
+grpc_bind_host = "127.0.0.1"  # secure by default — 0.0.0.0 is an explicit opt-in
 grpc_port = 50051
 metrics_port = 9091
 gpu_ids = [0]
@@ -69,7 +127,58 @@ max_concurrent_requests = 32
 request_timeout_secs = 120
 # hf_token = "hf_..."          # HF_TOKEN env var wins
 # hf_cache_dir = "/models/hf"
+# grpc_auth_token = "..."      # WORKER_GRPC_AUTH_TOKEN env var wins
+# llamaserver_bind_host = "127.0.0.1"          # secure by default
+# llamaserver_enable_slots_endpoint = false    # /slots can leak another slot's prompt text
+# llamaserver_port_min = 1024                  # allowed llamaserver.port range
+# llamaserver_port_max = 65535
+# max_n_ctx = 262144                           # ceiling on caller-supplied n_ctx
 ```
+
+### llama-server (`engine = "llamaserver"`) knobs
+
+- **`instances`** (`[models.X.llamaserver] instances = N`, default `1`;
+  `parallel` is still accepted as an alias, `instances` wins if both are
+  set) — the number of concurrent conversation slots, mapped to
+  `llama-server`'s `--parallel`. Also settable per request:
+  `POST /v1/models/load {"model_name": "...", "instances": 3}`. Each slot
+  gets the *full* configured `n_ctx` (see below) — raising `instances`
+  multiplies both the `-c` value passed to `llama-server` and the KV +
+  compute memory the worker reserves before spawning it. The worker reads
+  the GGUF header and reserves that memory up front, refusing the load with
+  a resource-exhausted error (rolling back any prior reservation) if it
+  will not fit, rather than spawning `llama-server` and finding out later.
+- **`n_ctx` is per conversation slot, not a raw `-c` passthrough.**
+  `llama-server` divides its own `-c` value evenly across `--parallel`
+  slots (verified on hardware: `-c 262144` with `--parallel 4` reports
+  `n_ctx: 65536, total_slots: 4` via `GET /props`), so the worker computes
+  `-c = n_ctx * instances` before spawning it, keeping the registry's
+  `n_ctx` meaning "tokens per slot". `verify_props` cross-checks this
+  against the live `/props` response after startup as a diagnostic (warns,
+  never fails the load) — this is the mechanism that originally caught the
+  behavior.
+- **`n_gpu_layers`** (`-ngl`): partial-offload knob for consumer GPUs that
+  can't fit every layer in VRAM; negative = offload all layers.
+- **`n_cpu_moe`** (`--n-cpu-moe <N>`): keeps the first `N` layers' MoE
+  expert weights on CPU while `-ngl` still places everything else on GPU —
+  the way to fit a large MoE model into less VRAM than `n_gpu_layers` alone
+  achieves. Tune by watching VRAM at load time and lowering `N` (more
+  experts on GPU, faster) until it fits; see
+  https://huggingface.co/blog/Doctor-Shotgun/llamacpp-moe-offload-guide.
+- **`extra_args`** is whitespace-split and appended verbatim to
+  `llama-server`'s argv (flag injection is possible, not shell injection).
+  Every flag with filesystem/network/credential semantics is excluded from
+  the allowlist (e.g. `--path`, `--log-file`, `--host`, `--port`,
+  `--api-key-file`, `--lora`, `--slot-save-path`, `--models-dir`,
+  `--hf-token`, `--chat-template-file`, `--ssl-key-file`), as are flags that
+  duplicate a typed field above (`-np`/`--parallel`, `-c`/`--ctx-size`,
+  `-m`/`--model`, `-ngl`, `-ncmoe`, `-ctk`/`-ctv`) so a conflicting flag
+  can't silently override a value already used to size the KV-cache
+  reservation. Unknown flags are rejected outright. Reasoning/thinking
+  controls (`-rea`, `--reasoning`, `--reasoning-budget`,
+  `--reasoning-format`) are on the allowlist — a reasoning model otherwise
+  returns an empty `message.content` until it finishes thinking; see
+  [troubleshooting.md](troubleshooting.md).
 
 ## Model registry: config/models.toml
 
@@ -151,6 +260,43 @@ default = "auto"
 repo_id = "org/real-hf-repo"     # what the worker downloads (model_path)
 ```
 
+### Sizing examples (measured on real hardware)
+
+- **16 GB AMD fleet, Devstral 24B**: Q4_K_M weights are ~14.3 GB, leaving
+  only ~1.0–1.7 GB for KV cache + compute. `cache_type_k`/`cache_type_v =
+  "q8_0"` halves the fp16-default KV footprint, which is what makes 16384
+  tokens of context fit at all; `q4_0` fits more but visibly hurts quality
+  on an already VRAM-starved model. To raise `n_ctx` further without a
+  bigger card, partially offload layers to system RAM via `n_gpu_layers`,
+  or move to a 24 GB+ card.
+- **16 GB AMD fleet, Qwen3-Coder-30B-A3B**: 18.6 GB of Q4_K_M weights alone
+  don't fit a 16 GB card even before KV cache, so MoE experts must be
+  partially CPU-offloaded via `n_cpu_moe`. `parallel` costs `parallel`×
+  the KV footprint (see the per-slot `n_ctx` note above), so raising it
+  needs proportionally more VRAM headroom.
+- **DGX Spark tier (GB10, 121.6 GiB unified memory), Qwen3.6-35B-A3B**:
+  hybrid-attention — only ~1 layer in 4 holds a real KV cache, the rest use
+  a fixed ~63 MiB recurrent buffer that doesn't grow with context. Measured
+  KV: 1360 MiB at 131072 total context, 2720 MiB at 262144 (linear). At
+  `n_ctx=262144, parallel=4` (total context 1,048,576): KV ≈10.6 GiB +
+  ~22.4 GB Q4_K_XL weights ≈ ~33 GB against 121 GiB unified memory (~88 GiB
+  headroom) — `parallel=4` isn't a memory ceiling here, it matches the
+  worker's default parallelism. Qwen3.6 is a reasoning model: with thinking
+  on, `message.content` stays empty until the chain-of-thought (in
+  `reasoning_content`) finishes — a short prompt can burn the whole
+  `max_tokens` budget on thinking and return empty content with
+  `finish_reason="length"`. Pass `--reasoning off` at the process level, or
+  per-request via `{"chat_template_kwargs": {"enable_thinking": true}}`.
+
+### Distributed (Level 2, ggml-RPC) — schema only, not runnable yet
+
+The `[models.<key>.distributed]` block (see `qwen2.5-coder-32b-gguf` in
+`config/models.toml`) documents the TOML shape for splitting one GGUF model
+across multiple machines via ggml-RPC. It isn't usable yet: it needs the
+worker's `llamacpp-rpc` feature built, a running `rpc-server` process on
+each peer node, and coordinator support for reading the block — none of
+which exist today.
+
 ## Monitoring configs
 
 - `config/prometheus.yml` — scrape targets `coordinator:8000` and `worker:9091`.
@@ -162,3 +308,39 @@ repo_id = "org/real-hf-repo"     # what the worker downloads (model_path)
 - Coordinator: settings validate at startup (pydantic) — bad values fail fast with a clear error.
 - Worker: `ai-worker --config <path>` fails fast on unknown/invalid TOML keys.
 - Alerts: `promtool check rules config/alerts.yml`.
+
+## Hardening notes
+
+- **`resolve_head_dim` division guard**: a checkpoint's `config.json` can
+  set `num_attention_heads = 0`; computing `hidden_size / num_attention_heads`
+  eagerly would panic (div-by-zero) before the model-load error path could
+  roll back its GPU memory reservation. The division only runs once the
+  divisor is known non-zero, and an RAII guard releases the reservation on
+  any unwind, not just the `Err` arm.
+- **Eviction race**: two concurrent loads of different models, each
+  evicting under only a per-model lock, could pick the same victim. A
+  single loader-wide eviction lock serializes the "choose victim(s), evict,
+  insert" sequence and re-checks capacity at insert time; the (slow)
+  download itself stays outside the lock.
+- **GGUF shard path safety**: `hf-hub`'s cache path join does not sanitize
+  `..`/absolute paths in a filename (checked against hf-hub 0.4.3), so a
+  shard name like `../../../etc/passwd` could escape the cache directory.
+  Every shard filename — including ones the loader derives at runtime, not
+  just the configured `file` — is validated as a safe relative path before
+  use.
+- **Multi-GPU adapter de-duplication**: `wgpu`'s `AdapterInfo` has no PCI
+  bus/slot address, so name/vendor/device-id dedup can't always tell two
+  identical physical cards apart. Enumerating from a single backend at a
+  time avoids merging genuinely distinct hardware (observed bug: an NVIDIA
+  GB10 double-enumerated as `IntegratedGpu`/Vulkan and `Other`/GL under the
+  same PCI ids) — the tradeoff is that a card double-enumerated *within*
+  one backend by competing ICDs isn't caught.
+- **NVIDIA memory detection on DGX Spark**: `nvidia-smi
+  --query-gpu=memory.total` and `nvmlDeviceGetMemoryInfo` both fail
+  (`[N/A]` / `NVML_ERROR_NOT_SUPPORTED`) on a GB10 host even though the GPU
+  works. `cuMemGetInfo`, loaded via `dlopen` on the CUDA driver API (no
+  build-time link dependency, so non-NVIDIA builds are unaffected),
+  correctly reports the real total/free memory — matching `llama-server
+  --list-devices`'s own independent query. It uses the CUDA *primary*
+  context (refcounted per process/device) so it can't interfere with the
+  in-process Burn or llama.cpp engines' own CUDA usage.

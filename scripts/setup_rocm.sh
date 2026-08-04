@@ -13,9 +13,20 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-ROCM_VERSION="${ROCM_VERSION:-6.0}"
+# 6.2.1 matches the rocm/dev-ubuntu-24.04:6.2.1 image used by
+# docker-compose.yml / Dockerfile.worker's BACKEND=rocm variant.
+ROCM_VERSION="${ROCM_VERSION:-6.2.1}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/rocm}"
 GPU_IDS="${GPU_IDS:-0}"  # Comma-separated list of GPU IDs to use
+
+# AMD's apt repo only publishes amd64 packages — ROCm is x86_64-only here.
+# Fail clearly on arm64 instead of confusing apt errors (use setup_cuda.sh's
+# Vulkan path on e.g. a DGX Spark).
+HOST_ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+if [ "$HOST_ARCH" != "amd64" ] && [ "$HOST_ARCH" != "x86_64" ]; then
+    echo "ROCm's apt repository (repo.radeon.com) does not publish packages for architecture '$HOST_ARCH' (ROCm is x86_64-only here). Use scripts/setup_cuda.sh (NVIDIA) or the Vulkan path (any vendor) instead." >&2
+    exit 1
+fi
 
 print_header() {
     echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
@@ -87,7 +98,11 @@ install_rocm_ubuntu() {
     print_info "Adding ROCm repository..."
     wget -q -O - https://repo.radeon.com/rocm/rocm.gpg.key | sudo apt-key add -
     
-    if [ "$VERSION" = "22.04" ]; then
+    # [arch=amd64] is deliberate: apt's [arch=...] tag wants Debian's
+    # architecture name, not uname's "x86_64".
+    if [ "$VERSION" = "24.04" ]; then
+        echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main" | sudo tee /etc/apt/sources.list.d/rocm.list
+    elif [ "$VERSION" = "22.04" ]; then
         echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} jammy main" | sudo tee /etc/apt/sources.list.d/rocm.list
     elif [ "$VERSION" = "20.04" ]; then
         echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} focal main" | sudo tee /etc/apt/sources.list.d/rocm.list

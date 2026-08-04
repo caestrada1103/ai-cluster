@@ -14,6 +14,19 @@ import pytest
 import coordinator.proto.cluster_pb2 as pb
 from coordinator.coordinator import ClusterCoordinator, WorkerInfo
 from coordinator.models import ModelRegistry
+from coordinator.tests.conftest import make_settings
+
+
+def _bare_coordinator() -> ClusterCoordinator:
+    """A ClusterCoordinator that skips the heavy __init__.
+
+    `_load_model_on_worker` reads `settings.model_load_timeout` for the gRPC
+    deadline, so that one attribute has to be supplied by hand.
+    """
+    coordinator = ClusterCoordinator.__new__(ClusterCoordinator)
+    coordinator.settings = make_settings()
+    return coordinator
+
 
 _GGUF_REGISTRY = {
     "models": {
@@ -71,7 +84,7 @@ def test_metadata_round_trips_through_proto() -> None:
 async def test_load_model_on_worker_sends_llamacpp_metadata() -> None:
     ModelRegistry.load_from_dict(_GGUF_REGISTRY)
     stub = _FakeLoadStub()
-    coordinator = ClusterCoordinator.__new__(ClusterCoordinator)  # skip heavy __init__
+    coordinator = _bare_coordinator()
     ok = await coordinator._load_model_on_worker(_fake_worker(stub), "transport-test-gguf")
     assert ok is True
     assert stub.request is not None
@@ -83,7 +96,7 @@ async def test_load_model_on_worker_sends_llamacpp_metadata() -> None:
 @pytest.mark.asyncio
 async def test_load_model_on_worker_sends_empty_metadata_for_burn() -> None:
     stub = _FakeLoadStub()
-    coordinator = ClusterCoordinator.__new__(ClusterCoordinator)
+    coordinator = _bare_coordinator()
     ok = await coordinator._load_model_on_worker(_fake_worker(stub), "llama3-8b")
     assert ok is True
     assert stub.request is not None
@@ -91,7 +104,7 @@ async def test_load_model_on_worker_sends_empty_metadata_for_burn() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Plan 11 Task 1 — Level 1 local multi-GPU split transport
+# Local multi-GPU split transport
 # ---------------------------------------------------------------------------
 
 _LOCAL_MULTI_GPU_REGISTRY = {
@@ -130,7 +143,7 @@ def _fake_worker_with_gpus(stub: _FakeLoadStub, gpu_ids: List[int]) -> WorkerInf
 async def test_load_model_on_worker_sends_local_gpu_ids_and_tensor_split() -> None:
     ModelRegistry.load_from_dict(_LOCAL_MULTI_GPU_REGISTRY)
     stub = _FakeLoadStub()
-    coordinator = ClusterCoordinator.__new__(ClusterCoordinator)
+    coordinator = _bare_coordinator()
     worker = _fake_worker_with_gpus(stub, [0, 1, 2, 3])
     ok = await coordinator._load_model_on_worker(worker, "local-multi-gpu-gguf")
     assert ok is True
@@ -147,7 +160,7 @@ async def test_load_model_on_worker_default_gpu_selection_unchanged_without_loca
 ):
     ModelRegistry.load_from_dict(_GGUF_REGISTRY)
     stub = _FakeLoadStub()
-    coordinator = ClusterCoordinator.__new__(ClusterCoordinator)
+    coordinator = _bare_coordinator()
     ok = await coordinator._load_model_on_worker(_fake_worker(stub), "transport-test-gguf")
     assert ok is True
     assert stub.request is not None

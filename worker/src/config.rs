@@ -3,6 +3,7 @@
 //! [`WorkerConfig`] holds all tunable settings for the inference worker.
 //! It can be loaded from a TOML file or constructed with defaults.
 
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -10,11 +11,18 @@ use serde::{Deserialize, Serialize};
 use crate::error::WorkerError;
 
 /// Configuration for the AI worker.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (not derived) so `hf_token` and `grpc_auth_token`
+/// never land in logs via `info!("Configuration: {:?}", config)`.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkerConfig {
     /// Optional human-readable worker identifier.
     pub worker_id: Option<String>,
+
+    /// Bind interface for the gRPC server. Default `127.0.0.1` (loopback,
+    /// secure by default); pair a non-loopback value with `grpc_auth_token`.
+    pub grpc_bind_host: String,
 
     /// Port for the gRPC inference server.
     pub grpc_port: u16,
@@ -55,38 +63,59 @@ pub struct WorkerConfig {
     /// from the registry overrides this.
     pub llamacpp_default_n_gpu_layers: i32,
 
-    /// Whether this node lends its local GPU(s) to a distributed model's
-    /// "lead" node as a ggml-RPC peer (Level 2, `distributed_role=rpc_server`
-    /// metadata). Default `false` — no `worker.toml` edits needed on nodes
-    /// that never act as an RPC peer.
+    /// Whether this node lends its GPU(s) to a distributed model's lead node
+    /// as a ggml-RPC peer (`distributed_role=rpc_server` metadata).
     pub rpc_server_enabled: bool,
 
     /// Base TCP port this node's `rpc-server` process(es) bind to when
     /// `rpc_server_enabled=true`. One GPU per port, starting here.
     pub rpc_server_port: u16,
 
-    /// Bind interface for the `rpc-server` process(es). `None` defaults to
-    /// the loopback/LAN interface the (future) subprocess supervisor picks.
-    /// ggml-RPC has no auth — never bind this to a public interface
-    /// (trusted-LAN only).
+    /// Bind interface for the `rpc-server` process(es). ggml-RPC has no
+    /// auth — never bind this to a public interface.
     pub rpc_server_bind_host: Option<String>,
 
-    /// Path to the `llama-server` binary the worker spawns for models with
-    /// `engine = "llamaserver"` metadata (Plan 13). NOT built by cargo — install
-    /// llama.cpp's `llama-server` on the host. Env `LLAMASERVER_BINARY_PATH`
-    /// wins over this value. Default `"llama-server"` (resolved on `PATH`).
+    /// Path to the `llama-server` binary the worker spawns for
+    /// `engine = "llamaserver"` models. Not built by cargo — install
+    /// llama.cpp's `llama-server` separately. `LLAMASERVER_BINARY_PATH` wins.
     pub llamaserver_binary_path: String,
 
-    /// Bind interface passed to `llama-server --host`. Default `"0.0.0.0"` so
-    /// the coordinator can reach it across the trusted LAN — firewall the
-    /// llamaserver ports to the LAN (there is no built-in auth on that port).
+    /// Bind interface passed to `llama-server --host`. Default `"127.0.0.1"`
+    /// (loopback, secure by default) — that port has no built-in auth of its
+    /// own. See docs/configuration.md.
     pub llamaserver_bind_host: String,
+
+    /// Expose `llama-server`'s `/slots` endpoint. Default `false` — it returns
+    /// per-slot state including cached prompt text. See docs/configuration.md.
+    pub llamaserver_enable_slots_endpoint: bool,
+
+    /// Inclusive allowed range for `llamaserver.port` metadata. Defaults
+    /// (1024-65535) exclude privileged ports.
+    pub llamaserver_port_min: u16,
+    pub llamaserver_port_max: u16,
+
+    /// Maximum number of models kept resident at once. `0` (default) means
+    /// unlimited. Above the limit, the oldest-loaded model(s) are evicted
+    /// first. Set to `1` for one-model-at-a-time on memory-constrained hosts.
+    pub max_loaded_models: usize,
+
+    /// Ceiling applied to any caller-supplied per-slot `n_ctx` before it
+    /// sizes a KV-cache reservation or reaches `llama-server -c`. Does not
+    /// raise a model's own trained context ceiling. See docs/configuration.md.
+    pub max_n_ctx: u32,
+
+    /// Shared-secret token gRPC clients must present (metadata key
+    /// `x-worker-token`) for every RPC. `None` (default) leaves the server
+    /// open — only safe while `grpc_bind_host` stays loopback.
+    /// `WORKER_GRPC_AUTH_TOKEN` wins over this value.
+    pub grpc_auth_token: Option<String>,
 }
 
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             worker_id: None,
+            grpc_bind_host: "127.0.0.1".to_string(),
             grpc_port: 50051,
             metrics_port: 9091,
             gpu_ids: vec![0],
@@ -103,16 +132,63 @@ impl Default for WorkerConfig {
             rpc_server_port: 50151,
             rpc_server_bind_host: None,
             llamaserver_binary_path: "llama-server".to_string(),
-            llamaserver_bind_host: "0.0.0.0".to_string(),
+            llamaserver_bind_host: "127.0.0.1".to_string(),
+            llamaserver_enable_slots_endpoint: false,
+            llamaserver_port_min: 1024,
+            llamaserver_port_max: 65535,
+            max_loaded_models: 0,
+            max_n_ctx: 262_144,
+            grpc_auth_token: None,
         }
     }
 }
 
+impl fmt::Debug for WorkerConfig {
+    /// Hand-written: `hf_token`/`grpc_auth_token` are redacted so startup
+    /// logging never leaks a secret.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkerConfig")
+            .field("worker_id", &self.worker_id)
+            .field("grpc_bind_host", &self.grpc_bind_host)
+            .field("grpc_port", &self.grpc_port)
+            .field("metrics_port", &self.metrics_port)
+            .field("gpu_ids", &self.gpu_ids)
+            .field("model_cache_dir", &self.model_cache_dir)
+            .field("download_dir", &self.download_dir)
+            .field("max_concurrent_loads", &self.max_concurrent_loads)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
+            .field("hf_token", &self.hf_token.as_ref().map(|_| "<redacted>"))
+            .field("hf_cache_dir", &self.hf_cache_dir)
+            .field("llamacpp_n_threads", &self.llamacpp_n_threads)
+            .field(
+                "llamacpp_default_n_gpu_layers",
+                &self.llamacpp_default_n_gpu_layers,
+            )
+            .field("rpc_server_enabled", &self.rpc_server_enabled)
+            .field("rpc_server_port", &self.rpc_server_port)
+            .field("rpc_server_bind_host", &self.rpc_server_bind_host)
+            .field("llamaserver_binary_path", &self.llamaserver_binary_path)
+            .field("llamaserver_bind_host", &self.llamaserver_bind_host)
+            .field(
+                "llamaserver_enable_slots_endpoint",
+                &self.llamaserver_enable_slots_endpoint,
+            )
+            .field("llamaserver_port_min", &self.llamaserver_port_min)
+            .field("llamaserver_port_max", &self.llamaserver_port_max)
+            .field("max_loaded_models", &self.max_loaded_models)
+            .field("max_n_ctx", &self.max_n_ctx)
+            .field(
+                "grpc_auth_token",
+                &self.grpc_auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 impl WorkerConfig {
-    /// Load configuration from a TOML file.
-    ///
-    /// Falls back to [`Default`] values for any missing keys.  If the file
-    /// does not exist, a warning is logged and pure defaults are returned.
+    /// Load configuration from a TOML file, falling back to [`Default`] for
+    /// missing keys. Logs a warning and returns defaults if the file is absent.
     pub fn from_file(path: &str) -> Result<Self, WorkerError> {
         let path = PathBuf::from(path);
 
@@ -169,6 +245,11 @@ mod tests {
         // 600 differs from the removed default on purpose — proves parsing works.
         assert_eq!(config.request_timeout_secs, 120);
         assert_eq!(config.grpc_port, 50051);
+        // The shipped file must NOT widen the binds; containers open them up
+        // through WORKER_GRPC_BIND_HOST / LLAMASERVER_BIND_HOST instead, so a
+        // bare-metal run stays on loopback.
+        assert_eq!(config.grpc_bind_host, "127.0.0.1");
+        assert_eq!(config.llamaserver_bind_host, "127.0.0.1");
     }
 
     #[test]
@@ -216,7 +297,45 @@ mod tests {
     fn test_llamaserver_defaults() {
         let config = WorkerConfig::default();
         assert_eq!(config.llamaserver_binary_path, "llama-server");
-        assert_eq!(config.llamaserver_bind_host, "0.0.0.0");
+        // Loopback-only by default — opt in to 0.0.0.0 explicitly.
+        assert_eq!(config.llamaserver_bind_host, "127.0.0.1");
+        assert!(!config.llamaserver_enable_slots_endpoint);
+    }
+
+    #[test]
+    fn test_grpc_bind_host_defaults_to_loopback() {
+        // Secure by default — no gRPC exposure without an explicit opt-in.
+        let config = WorkerConfig::default();
+        assert_eq!(config.grpc_bind_host, "127.0.0.1");
+        assert_eq!(config.grpc_auth_token, None);
+    }
+
+    #[test]
+    fn test_grpc_bind_host_parses_from_flat_toml() {
+        let toml_str = "grpc_bind_host = \"0.0.0.0\"\ngrpc_auth_token = \"secret\"\n";
+        let config: WorkerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.grpc_bind_host, "0.0.0.0");
+        assert_eq!(config.grpc_auth_token, Some("secret".to_string()));
+    }
+
+    #[test]
+    fn test_max_n_ctx_default_and_parses() {
+        let config = WorkerConfig::default();
+        assert_eq!(config.max_n_ctx, 262_144);
+        let toml_str = "max_n_ctx = 8192\n";
+        let config: WorkerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.max_n_ctx, 8192);
+    }
+
+    #[test]
+    fn test_debug_redacts_secrets() {
+        let mut config = WorkerConfig::default();
+        config.hf_token = Some("hf_supersecret".to_string());
+        config.grpc_auth_token = Some("worker-shared-secret".to_string());
+        let rendered = format!("{:?}", config);
+        assert!(!rendered.contains("hf_supersecret"));
+        assert!(!rendered.contains("worker-shared-secret"));
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]
@@ -229,5 +348,26 @@ mod tests {
             "/opt/llama.cpp/llama-server"
         );
         assert_eq!(config.llamaserver_bind_host, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_max_loaded_models_default_unlimited() {
+        let config = WorkerConfig::default();
+        assert_eq!(config.max_loaded_models, 0);
+    }
+
+    #[test]
+    fn test_max_loaded_models_parses_from_flat_toml() {
+        let toml_str = "max_loaded_models = 1\n";
+        let config: WorkerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.max_loaded_models, 1);
+    }
+
+    #[test]
+    fn test_shipped_config_parses_with_max_loaded_models_one() {
+        // The shipped worker.toml targets a DGX Spark and pins one resident model.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../config/worker.toml");
+        let config = WorkerConfig::from_file(path).unwrap();
+        assert_eq!(config.max_loaded_models, 1);
     }
 }

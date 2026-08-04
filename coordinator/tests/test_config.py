@@ -100,6 +100,14 @@ def test_settings_ignores_unknown_dotenv_keys(tmp_path: Path) -> None:
     assert s.port == 8123
 
 
+def test_cors_origins_default_is_empty_not_wildcard() -> None:
+    """Secure by default: no explicit cross-origin allowance out of the box.
+    main.py's always-on loopback regex is a separate allowance, covered by
+    test_main.py."""
+    s = make_settings()
+    assert s.cors_origins == []
+
+
 def test_cors_origins_star_from_env(tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text("COORDINATOR_CORS_ORIGINS=*\n")
@@ -165,7 +173,7 @@ def test_context_compression_techniques_accepts_comma_string() -> None:
 
 
 def test_llamaserver_autoload_default_on() -> None:
-    """Plan 13 Task 5 gate defaults to on (auto-load unloaded llamaserver models)."""
+    """Auto-load gate for unloaded llamaserver models defaults to on."""
     assert make_settings().llamaserver_autoload is True
 
 
@@ -174,6 +182,24 @@ def test_llamaserver_autoload_env_override(tmp_path: Path) -> None:
     env_file.write_text("COORDINATOR_LLAMASERVER_AUTOLOAD=false\n")
     s = Settings(_env_file=str(env_file))
     assert s.llamaserver_autoload is False
+
+
+def test_model_load_timeout_default_covers_large_gguf_downloads() -> None:
+    """The LoadModel deadline must cover a multi-GB download, not just the load.
+
+    Regression guard for the previously hardcoded 300s, which capped
+    API-loadable models at roughly 3 GB on a 10 MB/s link and made every
+    DGX-Spark-tier model (22-73 GB) impossible to load through the API.
+    """
+    s = make_settings()
+    assert s.model_load_timeout >= 1800
+
+
+def test_model_load_timeout_is_overridable(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("COORDINATOR_MODEL_LOAD_TIMEOUT=7200\n")
+    s = Settings(_env_file=str(env_file))
+    assert s.model_load_timeout == 7200
 
 
 def test_dead_settings_fields_removed() -> None:

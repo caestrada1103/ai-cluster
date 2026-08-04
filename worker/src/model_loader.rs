@@ -35,7 +35,87 @@ use half::f16;
 use hf_hub::{api::tokio::Api, Repo, RepoType};
 use safetensors::SafeTensors;
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+/// Resolve a model's attention `head_dim`: an explicit `config.json` value
+/// wins; otherwise `hidden_size / num_attention_heads`. Returns an `Err`
+/// instead of dividing by zero when a corrupt/hostile `config.json` sets
+/// `num_attention_heads` to 0. See docs/configuration.md.
+fn resolve_head_dim(config: &ModelConfig) -> Result<usize, WorkerError> {
+    if let Some(head_dim) = config.head_dim {
+        return Ok(head_dim);
+    }
+    if config.num_attention_heads == 0 {
+        return Err(WorkerError::ModelLoad(
+            "config.json reports num_attention_heads = 0 (and no explicit head_dim) — cannot \
+             compute head_dim; this repo's config.json is invalid or was tampered with"
+                .to_string(),
+        ));
+    }
+    Ok(config.hidden_size / config.num_attention_heads)
+}
+
+/// RAII guard releasing GPU memory reservations tracked via [`Self::track`]
+/// if dropped without [`Self::commit`] first — covers early returns AND
+/// panics. `Drop` can't be `async`, so release runs on a spawned task.
+struct ReservationGuard {
+    gpu_manager: Arc<GPUManager>,
+    gpu_ids: Vec<usize>,
+    tag: String,
+    committed: bool,
+}
+
+impl ReservationGuard {
+    fn new(gpu_manager: Arc<GPUManager>, tag: &str) -> Self {
+        Self {
+            gpu_manager,
+            gpu_ids: Vec::new(),
+            tag: tag.to_string(),
+            committed: false,
+        }
+    }
+
+    /// Record that `gpu_id` now holds a reservation under this guard's tag.
+    fn track(&mut self, gpu_id: usize) {
+        self.gpu_ids.push(gpu_id);
+    }
+
+    /// The tracked reservation(s) now belong to something else (a
+    /// successfully loaded model) — do not release them on drop.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if self.committed || self.gpu_ids.is_empty() {
+            return;
+        }
+        let gpu_manager = self.gpu_manager.clone();
+        let gpu_ids = std::mem::take(&mut self.gpu_ids);
+        let tag = std::mem::take(&mut self.tag);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    for gpu_id in gpu_ids {
+                        gpu_manager.free_memory(gpu_id, &tag).await;
+                    }
+                });
+            }
+            Err(_) => {
+                // No runtime available (e.g. dropped during process
+                // shutdown) — nothing more can be done; log loudly rather
+                // than silently leaking.
+                error!(
+                    "ReservationGuard for '{}' dropped with no tokio runtime available — \
+                     GPU reservation(s) on device(s) {:?} were NOT released",
+                    tag, gpu_ids
+                );
+            }
+        }
+    }
+}
 
 /// Model loader configuration
 #[derive(Debug, Clone)]
@@ -59,6 +139,20 @@ pub struct ModelLoaderConfig {
     /// Seconds to poll `llama-server`'s `/health` before declaring the load
     /// failed — reuses the worker's `request_timeout_secs`.
     pub llamaserver_health_timeout_secs: u64,
+    /// Maximum number of models kept resident at once (0 = unlimited). See
+    /// `WorkerConfig::max_loaded_models` in config/worker.toml.
+    pub max_loaded_models: usize,
+    /// Ceiling for any caller-supplied per-slot `n_ctx`. See `WorkerConfig::max_n_ctx`.
+    pub max_n_ctx: u32,
+    /// Worker's `max_concurrent_requests` — sizes the in-process `llamacpp`
+    /// engine's KV-cache reservation.
+    pub max_concurrent_requests: usize,
+    /// Whether spawned `llama-server` children expose `/slots`. See
+    /// `WorkerConfig::llamaserver_enable_slots_endpoint`.
+    pub llamaserver_enable_slots_endpoint: bool,
+    /// Allowed `llamaserver.port` range, inclusive.
+    pub llamaserver_port_min: u16,
+    pub llamaserver_port_max: u16,
 }
 
 impl Default for ModelLoaderConfig {
@@ -72,8 +166,14 @@ impl Default for ModelLoaderConfig {
             llamacpp_n_threads: 0,
             llamacpp_default_n_gpu_layers: -1,
             llamaserver_binary_path: "llama-server".to_string(),
-            llamaserver_bind_host: "0.0.0.0".to_string(),
+            llamaserver_bind_host: "127.0.0.1".to_string(),
             llamaserver_health_timeout_secs: 120,
+            max_loaded_models: 0,
+            max_n_ctx: 262_144,
+            max_concurrent_requests: 32,
+            llamaserver_enable_slots_endpoint: false,
+            llamaserver_port_min: 1024,
+            llamaserver_port_max: 65535,
         }
     }
 }
@@ -95,12 +195,34 @@ pub struct ModelLoader {
     /// separate from `loaded_models` because the child handle (not a
     /// `TextGeneration`) must be reachable for kill-on-unload and liveness.
     llamaserver_processes: Arc<DashMap<String, Arc<tokio::sync::Mutex<LlamaServerProcess>>>>,
+    /// Models evicted internally by `max_loaded_models`, awaiting pickup by
+    /// `worker.rs` (which keeps its own `loaded_models` copy). Drained by
+    /// [`ModelLoader::take_evicted`].
+    evicted_pending: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Path to the `llama-server` binary (env/config resolved).
     llamaserver_binary_path: String,
     /// `--host` bind interface for spawned `llama-server` processes.
     llamaserver_bind_host: String,
     /// `/health` poll timeout (seconds) for a spawned `llama-server`.
     llamaserver_health_timeout_secs: u64,
+    /// Maximum number of models kept resident at once (0 = unlimited). When a
+    /// load would exceed this, `load_model` evicts the oldest-loaded model(s)
+    /// first via `unload`.
+    max_loaded_models: usize,
+    /// Loader-wide lock serializing evict+insert across concurrent loads of
+    /// different model names. See [`Self::evict_to_fit_and_insert`].
+    eviction_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Ceiling applied to any caller-supplied per-slot `n_ctx`.
+    max_n_ctx: u32,
+    /// Slots for the in-process `llamacpp` engine's KV-cache reservation —
+    /// it builds one full-`n_ctx` context per concurrent request.
+    #[allow(dead_code)] // read only when built with --features llamacpp
+    max_concurrent_requests: usize,
+    /// Whether spawned `llama-server` children expose `/slots`.
+    llamaserver_enable_slots_endpoint: bool,
+    /// Allowed `llamaserver.port` range, inclusive.
+    llamaserver_port_min: u16,
+    llamaserver_port_max: u16,
 }
 
 impl ModelLoader {
@@ -139,10 +261,57 @@ impl ModelLoader {
             llamacpp_n_threads: config.llamacpp_n_threads,
             llamacpp_default_n_gpu_layers: config.llamacpp_default_n_gpu_layers,
             llamaserver_processes: Arc::new(DashMap::new()),
+            evicted_pending: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             llamaserver_binary_path: config.llamaserver_binary_path,
             llamaserver_bind_host: config.llamaserver_bind_host,
             llamaserver_health_timeout_secs: config.llamaserver_health_timeout_secs,
+            max_loaded_models: config.max_loaded_models,
+            eviction_lock: Arc::new(tokio::sync::Mutex::new(())),
+            max_n_ctx: config.max_n_ctx,
+            max_concurrent_requests: config.max_concurrent_requests,
+            llamaserver_enable_slots_endpoint: config.llamaserver_enable_slots_endpoint,
+            llamaserver_port_min: config.llamaserver_port_min,
+            llamaserver_port_max: config.llamaserver_port_max,
         })
+    }
+
+    /// Evict the oldest-loaded model(s) (excluding `exclude`) until under
+    /// `max_loaded_models` (0 = unlimited). Callers must hold `eviction_lock`.
+    async fn evict_to_fit(&self, exclude: &str) {
+        while self.max_loaded_models > 0 && self.loaded_models.len() >= self.max_loaded_models {
+            // Clone the victim's name and drop the DashMap iterator before
+            // awaiting `unload` — holding it across an `.await` can deadlock.
+            let victim = self
+                .loaded_models
+                .iter()
+                .filter(|entry| entry.key() != exclude)
+                .min_by_key(|entry| entry.value().loaded_at())
+                .map(|entry| entry.key().clone());
+
+            let Some(victim) = victim else {
+                // No eviction candidate (e.g. every remaining entry is the
+                // target itself) — break rather than spinning forever.
+                break;
+            };
+
+            info!(
+                "Evicting {} (max_loaded_models = {}) to make room for {}",
+                victim, self.max_loaded_models, exclude
+            );
+            self.unload(&victim).await;
+            // Hand the name to the gRPC layer so it drops its own copy too.
+            self.evicted_pending.lock().await.push(victim);
+        }
+    }
+
+    /// Atomically make room for (if needed) and register `instance`. The
+    /// authoritative `max_loaded_models` enforcement — re-checks the cap
+    /// under one `eviction_lock` acquisition so concurrent loads can't both
+    /// evict the same victim and both insert.
+    async fn evict_to_fit_and_insert(&self, model_name: &str, instance: ModelInstance) {
+        let _evict_guard = self.eviction_lock.lock().await;
+        self.evict_to_fit(model_name).await;
+        self.loaded_models.insert(model_name.to_string(), instance);
     }
 
     /// Load a model
@@ -186,18 +355,23 @@ impl ModelLoader {
             return Ok(entry.value().clone());
         }
 
+        // Resident-model cap: evict the oldest-loaded model(s) to make room
+        // before starting this load (no-op when max_loaded_models == 0).
+        // Frees GPU memory early so this load's own allocation can fit; the
+        // authoritative, race-proof check re-runs in evict_to_fit_and_insert.
+        {
+            let _evict_guard = self.eviction_lock.lock().await;
+            self.evict_to_fit(model_name).await;
+        }
+
         let _permit =
             self.load_semaphore.acquire().await.map_err(|e| {
                 WorkerError::Resource(format!("Failed to acquire load permit: {}", e))
             })?;
 
-        // Level-2 distributed routing: an rpc_server peer reserves VRAM for
-        // a lead elsewhere and holds no directly-servable model — checked
-        // BEFORE gguf/Burn routing so a peer's metadata never has to carry a
-        // (fake) GGUF source. STUB this increment: no subprocess/real
-        // ggml-RPC yet (Task 8 in pending-work/11-distributed-multi-node-inference.md).
-        // A "lead" spec falls through to the normal routing below unchanged
-        // this increment (Task 9 wires the real proxy engine).
+        // rpc_server peers reserve VRAM for a lead elsewhere and hold no
+        // servable model — checked before gguf/Burn routing. Still a stub
+        // (no real ggml-RPC subprocess); see pending-work/11-distributed-multi-node-inference.md.
         if let Some(dist_spec) = distributed_spec_from_metadata(model_config.map(|c| &c.metadata))?
         {
             if dist_spec.role == DistributedRole::RpcServer {
@@ -207,11 +381,13 @@ impl ModelLoader {
             }
         }
 
-        // Engine routing: `llamaserver` models supervise a `llama-server`
-        // child process (Plan 13). Checked BEFORE the gguf branch below —
-        // `gguf_spec_from_metadata` errors on an unknown engine string like
-        // "llamaserver", so this must intercept it first.
-        if let Some(spec) = llamaserver_spec_from_metadata(model_config.map(|c| &c.metadata))? {
+        // `llamaserver` models supervise a `llama-server` child process.
+        // Checked before the gguf branch, which errors on an unknown engine
+        // string like "llamaserver".
+        if let Some(spec) = llamaserver_spec_from_metadata(
+            model_config.map(|c| &c.metadata),
+            self.llamacpp_default_n_gpu_layers,
+        )? {
             return self
                 .load_llamaserver_model(model_name, spec, gpu_ids, quantization, parallelism)
                 .await;
@@ -220,10 +396,13 @@ impl ModelLoader {
         // Engine routing: GGUF/llama.cpp models bypass the entire
         // safetensors + config.json path below (GGUF repos often ship no
         // config.json; llama.cpp reads architecture from GGUF metadata).
-        if let Some(spec) = gguf_spec_from_metadata(
+        if let Some(mut spec) = gguf_spec_from_metadata(
             model_config.map(|c| &c.metadata),
             self.llamacpp_default_n_gpu_layers,
         )? {
+            // Clamp any caller-supplied n_ctx before it sizes the KV-cache
+            // reservation or reaches the loaded context.
+            spec.n_ctx = spec.n_ctx.map(|n| n.min(self.max_n_ctx));
             return self
                 .load_llamacpp_model(model_name, spec, gpu_ids, quantization, parallelism)
                 .await;
@@ -236,22 +415,15 @@ impl ModelLoader {
             .await?;
 
         let memory_used = self.calculate_memory_usage(&config);
-        let mut reserved_gpus: Vec<usize> = Vec::new();
+        // ReservationGuard releases every reservation tracked so far on an
+        // early return OR a panic in the build path below (e.g. a Burn
+        // tensor shape mismatch), not just the `?` path.
+        let mut reservation = ReservationGuard::new(self.gpu_manager.clone(), model_name);
         for &gpu_id in gpu_ids {
-            match self
-                .gpu_manager
+            self.gpu_manager
                 .allocate_memory(gpu_id as usize, memory_used as u64, model_name)
-                .await
-            {
-                Ok(()) => reserved_gpus.push(gpu_id as usize),
-                Err(e) => {
-                    // Roll back reservations made so far — no leak on partial failure.
-                    for &g in &reserved_gpus {
-                        self.gpu_manager.free_memory(g, model_name).await;
-                    }
-                    return Err(e);
-                }
-            }
+                .await?;
+            reservation.track(gpu_id as usize);
         }
 
         let build_result: Result<Arc<Mutex<dyn TextGeneration + Send>>, WorkerError> = async {
@@ -289,9 +461,7 @@ impl ModelLoader {
                         num_layers: config.num_layers,
                         num_attention_heads: config.num_attention_heads,
                         num_kv_heads: config.num_kv_heads,
-                        head_dim: config
-                            .head_dim
-                            .unwrap_or(config.hidden_size / config.num_attention_heads),
+                        head_dim: resolve_head_dim(&config)?,
                         intermediate_size: config.intermediate_size,
                         vocab_size: config.vocab_size,
                         max_seq_len: config.max_seq_len,
@@ -313,9 +483,7 @@ impl ModelLoader {
                         num_layers: config.num_layers,
                         num_attention_heads: config.num_attention_heads,
                         num_kv_heads: config.num_kv_heads,
-                        head_dim: config
-                            .head_dim
-                            .unwrap_or(config.hidden_size / config.num_attention_heads),
+                        head_dim: resolve_head_dim(&config)?,
                         intermediate_size: config.intermediate_size,
                         vocab_size: config.vocab_size,
                         max_seq_len: config.max_seq_len,
@@ -332,9 +500,7 @@ impl ModelLoader {
                     Arc::new(Mutex::new(model))
                 }
                 "deepseek" => {
-                    let head_dim = config
-                        .head_dim
-                        .unwrap_or(config.hidden_size / config.num_attention_heads);
+                    let head_dim = resolve_head_dim(&config)?;
                     let has_expert_weights =
                         weights.contains_key("model.layers.0.mlp.experts.0.gate_proj.weight");
 
@@ -392,15 +558,8 @@ impl ModelLoader {
         }
         .await;
 
-        let model = match build_result {
-            Ok(m) => m,
-            Err(e) => {
-                for &g in &reserved_gpus {
-                    self.gpu_manager.free_memory(g, model_name).await;
-                }
-                return Err(e);
-            }
-        };
+        // `reservation`'s `Drop` cleans up on this `?`'s `Err` path.
+        let model = build_result?;
 
         let instance = ModelInstance::new(
             model_name.to_string(),
@@ -410,26 +569,20 @@ impl ModelLoader {
             parallelism as i32,
             Some(model),
         );
+        // Ownership of the reservation transfers to the now-loaded instance
+        // — do not release it on drop.
+        reservation.commit();
 
-        self.loaded_models
-            .insert(model_name.to_string(), instance.clone());
+        self.evict_to_fit_and_insert(model_name, instance.clone())
+            .await;
         info!("Model {} loaded successfully", model_name);
 
         Ok(instance)
     }
 
     /// Register this node as an `rpc_server` peer for a distributed model —
-    /// STUB (Task 5 of pending-work/11-distributed-multi-node-inference.md).
-    ///
-    /// An rpc_server peer lends its whole local GPU(s) to a lead node
-    /// elsewhere, so this reserves everything currently free on each
-    /// requested device (an honest "this GPU is spoken for" signal even
-    /// though no real `rpc-server` process is running yet) and inserts a
-    /// [`ModelInstance`] with no attached model — the existing "no model
-    /// attached" placeholder also used elsewhere. No subprocess, no real
-    /// ggml-RPC this increment; Task 8 replaces this with the real
-    /// `rpc-server` supervisor + a synthetic allocation sized to what that
-    /// process actually consumes.
+    /// stub: reserves everything free on each GPU and inserts a model-less
+    /// instance, no subprocess yet. See pending-work/11-distributed-multi-node-inference.md.
     async fn load_rpc_server_stub(
         &self,
         model_name: &str,
@@ -478,8 +631,8 @@ impl ModelLoader {
             None,
         );
 
-        self.loaded_models
-            .insert(model_name.to_string(), instance.clone());
+        self.evict_to_fit_and_insert(model_name, instance.clone())
+            .await;
         info!(
             "rpc_server peer stub {} registered ({} bytes reserved across {} GPU(s))",
             model_name,
@@ -489,74 +642,159 @@ impl ModelLoader {
         Ok(instance)
     }
 
-    /// Supervise a `llama-server` child process for a `engine = "llamaserver"`
-    /// model (Plan 13). Pure process management — no in-process weights, no
-    /// `TextGeneration`; agentic inference is proxied to the child over HTTP by
-    /// the coordinator, so the [`ModelInstance`] carries `model: None`.
-    ///
-    /// Flow: resolve/download the GGUF (same hf-hub path as llama.cpp) → reserve
-    /// its file size as an honest VRAM estimate → spawn `llama-server` → poll
-    /// `/health` until 200 or the load timeout. Any failure kills the child and
-    /// rolls back the GPU reservations.
+    /// Reserve `bytes` on every id in `gpu_ids`, appending each success to
+    /// `reserved`. Does not roll back its own partial work on failure — lets
+    /// callers chain multiple phases and unwind them all together.
+    async fn reserve_on_gpus(
+        &self,
+        gpu_ids: &[u32],
+        bytes: u64,
+        model_name: &str,
+        reserved: &mut Vec<usize>,
+    ) -> Result<(), WorkerError> {
+        for &gpu_id in gpu_ids {
+            self.gpu_manager
+                .allocate_memory(gpu_id as usize, bytes, model_name)
+                .await?;
+            reserved.push(gpu_id as usize);
+        }
+        Ok(())
+    }
+
+    /// Roll back every reservation in `reserved` for `model_name`.
+    async fn rollback_reservations(&self, reserved: &[usize], model_name: &str) {
+        for &g in reserved {
+            self.gpu_manager.free_memory(g, model_name).await;
+        }
+    }
+
+    /// Supervise a `llama-server` child process for an `engine =
+    /// "llamaserver"` model. Pure process management — inference is proxied
+    /// to the child over HTTP by the coordinator, so [`ModelInstance`]
+    /// carries `model: None`. Flow: download GGUF → reserve its size as VRAM
+    /// → spawn → poll `/health`. Any failure kills the child and rolls back.
     async fn load_llamaserver_model(
         &self,
         model_name: &str,
-        spec: crate::llamaserver_process::LlamaServerSpec,
+        mut spec: crate::llamaserver_process::LlamaServerSpec,
         gpu_ids: &[u32],
         quantization: crate::cluster::Quantization,
         parallelism: crate::cluster::ParallelismStrategy,
     ) -> Result<ModelInstance, WorkerError> {
+        // Constrain the assigned port to the configured range and clamp any
+        // caller-supplied per-slot n_ctx before any download/spawn work.
+        crate::llamaserver_process::validate_llamaserver_port(
+            spec.port,
+            self.llamaserver_port_min,
+            self.llamaserver_port_max,
+        )?;
+        spec.n_ctx = spec.n_ctx.map(|n| n.min(self.max_n_ctx));
+
         info!(
             "Loading model {} via llama-server (port {}, {}/{})",
             model_name, spec.port, spec.repo_id, spec.file
         );
 
-        // Resolve/download the GGUF — identical hf-hub pattern to llama.cpp.
+        // Resolve/download the GGUF (plus any sibling shards) — identical
+        // hf-hub pattern to llama.cpp.
         let api = self
             .hf_api
             .as_ref()
             .ok_or_else(|| WorkerError::ModelLoad("HF API not initialized".to_string()))?;
         let repo = api.repo(Repo::new(spec.repo_id.clone(), RepoType::Model));
-        let gguf_path = repo.get(&spec.file).await.map_err(|e| {
-            WorkerError::ModelLoad(format!(
-                "Failed to download GGUF {}/{}: {}",
-                spec.repo_id, spec.file, e
-            ))
-        })?;
+        let (gguf_path, file_size) = download_gguf(&repo, &spec.file).await?;
 
-        // Honest VRAM estimate: the GGUF file size (llama-server holds the real
-        // weights in its own process; this is bookkeeping for placement).
-        let file_size = tokio::fs::metadata(&gguf_path)
-            .await
-            .map_err(|e| WorkerError::ModelLoad(format!("Failed to stat GGUF: {}", e)))?
-            .len();
-        let mut reserved_gpus: Vec<usize> = Vec::new();
-        for &gpu_id in gpu_ids {
-            match self
-                .gpu_manager
-                .allocate_memory(gpu_id as usize, file_size, model_name)
-                .await
-            {
-                Ok(()) => reserved_gpus.push(gpu_id as usize),
-                Err(e) => {
-                    for &g in &reserved_gpus {
-                        self.gpu_manager.free_memory(g, model_name).await;
-                    }
-                    return Err(e);
-                }
-            }
+        // Log the effective per-slot / total context before spawning, so a
+        // misconfiguration is loud even if `/props` verification below is
+        // inconclusive. llama-server divides its own `-c` evenly across
+        // `--parallel` slots — see docs/configuration.md.
+        match spec.total_ctx()? {
+            Some(total) => info!(
+                "llama-server {}: n_ctx={} tokens/slot x parallel={} slots = {} total context (-c)",
+                model_name,
+                spec.n_ctx.unwrap_or_default(),
+                spec.parallel,
+                total
+            ),
+            None => info!(
+                "llama-server {}: no n_ctx configured — using llama-server's own default context \
+                 (per-slot value cannot be verified from config alone)",
+                model_name
+            ),
         }
 
+        // Phase 1 — reserve the weights (the downloaded GGUF's total size).
+        let mut reserved_gpus: Vec<usize> = Vec::new();
+        if let Err(e) = self
+            .reserve_on_gpus(gpu_ids, file_size, model_name, &mut reserved_gpus)
+            .await
+        {
+            self.rollback_reservations(&reserved_gpus, model_name).await;
+            return Err(e);
+        }
+
+        // Phase 2 — reserve KV + compute buffers for `spec.parallel`
+        // concurrent slots (reads just the GGUF header, no full load).
+        // Refuses and rolls back phase 1 rather than overcommitting memory.
+        let arch = {
+            let path = gguf_path.clone();
+            tokio::task::spawn_blocking(move || crate::gguf_meta::read_arch_meta(&path))
+                .await
+                .map_err(|e| WorkerError::Internal(format!("spawn_blocking join error: {e}")))
+        };
+        let arch = match arch {
+            Ok(Ok(arch)) => arch,
+            Ok(Err(e)) | Err(e) => {
+                self.rollback_reservations(&reserved_gpus, model_name).await;
+                return Err(e);
+            }
+        };
+        let n_ctx = u64::from(spec.n_ctx.unwrap_or(crate::kv_estimate::DEFAULT_N_CTX));
+        // is_hybrid is unknown without a full llama.cpp load; omitting the
+        // discount over-reserves for hybrid models rather than under-counting.
+        let kv_compute_bytes = crate::kv_estimate::kv_cache_bytes_raw(
+            n_ctx,
+            arch.n_layer,
+            arch.n_head_kv,
+            arch.head_dim(),
+            false,
+            spec.cache_type_k.as_deref(),
+            spec.cache_type_v.as_deref(),
+            spec.parallel,
+        );
+        if let Err(e) = self
+            .reserve_on_gpus(gpu_ids, kv_compute_bytes, model_name, &mut reserved_gpus)
+            .await
+        {
+            self.rollback_reservations(&reserved_gpus, model_name).await;
+            return Err(e);
+        }
+        info!(
+            "llama-server {} reserved {:.2} GiB weights + {:.2} GiB KV/compute for {} instance(s)",
+            model_name,
+            file_size as f64 / (1024.0 * 1024.0 * 1024.0),
+            kv_compute_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            spec.parallel,
+        );
+
         // Build argv + spawn. On failure roll back the reservations.
-        let args = spec.build_args(&gguf_path, &self.llamaserver_bind_host);
+        let args = match spec.build_args(
+            &gguf_path,
+            &self.llamaserver_bind_host,
+            self.llamaserver_enable_slots_endpoint,
+        ) {
+            Ok(args) => args,
+            Err(e) => {
+                self.rollback_reservations(&reserved_gpus, model_name).await;
+                return Err(e);
+            }
+        };
         let spawn_res =
             LlamaServerProcess::spawn(model_name, spec.port, &self.llamaserver_binary_path, &args);
         let mut process = match spawn_res {
             Ok(p) => p,
             Err(e) => {
-                for &g in &reserved_gpus {
-                    self.gpu_manager.free_memory(g, model_name).await;
-                }
+                self.rollback_reservations(&reserved_gpus, model_name).await;
                 return Err(e);
             }
         };
@@ -566,11 +804,12 @@ impl ModelLoader {
         let health_timeout = std::time::Duration::from_secs(self.llamaserver_health_timeout_secs);
         if let Err(e) = process.wait_until_healthy(health_timeout).await {
             let _ = process.start_kill();
-            for &g in &reserved_gpus {
-                self.gpu_manager.free_memory(g, model_name).await;
-            }
+            self.rollback_reservations(&reserved_gpus, model_name).await;
             return Err(e);
         }
+
+        // Best-effort cross-check against what llama-server actually started with.
+        process.verify_props(spec.total_ctx()?).await;
 
         // Register the supervised child + a model-less instance (inference goes
         // through the coordinator HTTP proxy, not this worker's gRPC Infer).
@@ -586,8 +825,8 @@ impl ModelLoader {
             parallelism as i32,
             None,
         );
-        self.loaded_models
-            .insert(model_name.to_string(), instance.clone());
+        self.evict_to_fit_and_insert(model_name, instance.clone())
+            .await;
         info!(
             "Model {} loaded via llama-server on port {}",
             model_name, spec.port
@@ -601,11 +840,16 @@ impl ModelLoader {
         self.llamaserver_processes.contains_key(model_name)
     }
 
-    /// Reap `llama-server` children that exited on their own: kill nothing (they
-    /// are already gone), drop them from both the process map and
-    /// `loaded_models`, and free their GPU reservations. Returns the reaped
-    /// model names so callers can prune their own view too. Keeps status honest
-    /// ("report as not loaded" once the child dies) without a background task.
+    /// Drain the names evicted by the `max_loaded_models` policy since the
+    /// last call, so `worker.rs` can remove each from its own copy of
+    /// `loaded_models` and clear the model's metrics.
+    pub async fn take_evicted(&self) -> Vec<String> {
+        std::mem::take(&mut *self.evicted_pending.lock().await)
+    }
+
+    /// Reap `llama-server` children that exited on their own: drop them from
+    /// the process map and `loaded_models`, free their GPU reservations, and
+    /// return the reaped names so callers can prune their own view too.
     pub async fn reap_exited_llamaservers(&self) -> Vec<String> {
         let names: Vec<String> = self
             .llamaserver_processes
@@ -838,20 +1082,41 @@ impl ModelLoader {
     }
 
     /// Honest accounting: every weight is loaded as FP32 today (4 bytes/param),
-    /// and MoE models replicate the FFN per expert.
+    /// and MoE models replicate the FFN per expert. Runs in `u128` and
+    /// saturates to `usize::MAX` instead of wrapping, so a hostile
+    /// `config.json` fails the subsequent `allocate_memory` call loudly
+    /// rather than silently under-reserving. See docs/configuration.md.
     fn calculate_memory_usage(&self, config: &ModelConfig) -> usize {
-        let embed = config.vocab_size * config.hidden_size;
-        let attn = config.num_layers * 4 * config.hidden_size * config.hidden_size;
+        let vocab_size = config.vocab_size as u128;
+        let hidden_size = config.hidden_size as u128;
+        let num_layers = config.num_layers as u128;
+        let intermediate_size = config.intermediate_size as u128;
         let expert_factor = if config.is_moe {
-            config.num_experts.unwrap_or(1).max(1)
+            config.num_experts.unwrap_or(1).max(1) as u128
         } else {
-            1
+            1u128
         };
-        let ffn =
-            config.num_layers * 3 * config.hidden_size * config.intermediate_size * expert_factor;
-        let norm = (config.num_layers * 2 + 1) * config.hidden_size;
-        let params = embed + attn + ffn + norm;
-        params * 4
+
+        let embed = vocab_size.saturating_mul(hidden_size);
+        let attn = num_layers
+            .saturating_mul(4)
+            .saturating_mul(hidden_size)
+            .saturating_mul(hidden_size);
+        let ffn = num_layers
+            .saturating_mul(3)
+            .saturating_mul(hidden_size)
+            .saturating_mul(intermediate_size)
+            .saturating_mul(expert_factor);
+        let norm = num_layers
+            .saturating_mul(2)
+            .saturating_add(1)
+            .saturating_mul(hidden_size);
+        let params = embed
+            .saturating_add(attn)
+            .saturating_add(ffn)
+            .saturating_add(norm);
+
+        params.saturating_mul(4).min(usize::MAX as u128) as usize
     }
 
     /// Load a GGUF model via the llama.cpp engine (feature `llamacpp`).
@@ -871,33 +1136,25 @@ impl ModelLoader {
             model_name, spec.repo_id, spec.file
         );
 
-        // Download the GGUF with the same hf-hub API pattern as safetensors.
         let api = self
             .hf_api
             .as_ref()
             .ok_or_else(|| WorkerError::ModelLoad("HF API not initialized".to_string()))?;
         let repo = api.repo(Repo::new(spec.repo_id.clone(), RepoType::Model));
-        let gguf_path = repo.get(&spec.file).await.map_err(|e| {
-            WorkerError::ModelLoad(format!(
-                "Failed to download GGUF {}/{}: {}",
-                spec.repo_id, spec.file, e
-            ))
-        })?;
+        let (gguf_path, file_size) = download_gguf(&repo, &spec.file).await?;
 
-        // Honest VRAM estimate: the GGUF file size. llama.cpp uses the
-        // quantized weights as-is; the per-request KV cache is not counted.
-        let file_size = tokio::fs::metadata(&gguf_path)
+        // Phase 1 — reserve the weights. The KV cache needs dimensions only
+        // known once the model is loaded, so it's reserved in phase 2.
+        let mut reserved_gpus: Vec<usize> = Vec::new();
+        if let Err(e) = self
+            .reserve_on_gpus(gpu_ids, file_size, model_name, &mut reserved_gpus)
             .await
-            .map_err(|e| WorkerError::ModelLoad(format!("Failed to stat GGUF: {}", e)))?
-            .len();
-        for &gpu_id in gpu_ids {
-            self.gpu_manager
-                .allocate_memory(gpu_id as usize, file_size, model_name)
-                .await?;
+        {
+            self.rollback_reservations(&reserved_gpus, model_name).await;
+            return Err(e);
         }
 
-        // Model load is blocking (mmap + optional GPU upload) — one
-        // spawn_blocking, same as the safetensors dtype-conversion path.
+        // Model load is blocking (mmap + optional GPU upload).
         let n_gpu_layers = spec.n_gpu_layers;
         let n_ctx = spec.n_ctx;
         let n_threads = self.llamacpp_n_threads;
@@ -915,7 +1172,34 @@ impl ModelLoader {
             )
         })
         .await
-        .map_err(|e| WorkerError::Internal(format!("spawn_blocking join error: {e}")))??;
+        .map_err(|e| WorkerError::Internal(format!("spawn_blocking join error: {e}")));
+
+        // Release the phase-1 weight reservation if the load itself fails.
+        let engine = match engine {
+            Ok(Ok(engine)) => engine,
+            Ok(Err(e)) | Err(e) => {
+                self.rollback_reservations(&reserved_gpus, model_name).await;
+                return Err(e);
+            }
+        };
+
+        // Phase 2 — reserve the KV cache now dimensions are known. The
+        // in-process engine builds a fresh full-n_ctx context per request,
+        // up to `max_concurrent_requests` in flight, so cover all of them.
+        let kv_bytes = engine.kv_cache_bytes(self.max_concurrent_requests as u32);
+        if let Err(e) = self
+            .reserve_on_gpus(gpu_ids, kv_bytes, model_name, &mut reserved_gpus)
+            .await
+        {
+            self.rollback_reservations(&reserved_gpus, model_name).await;
+            return Err(e);
+        }
+        info!(
+            "GGUF {} reserved {:.2} GiB weights + {:.2} GiB KV cache",
+            model_name,
+            file_size as f64 / (1024.0 * 1024.0 * 1024.0),
+            kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
 
         // Explicit trait-object coercion, same style as the Burn branches above.
         let model: Arc<Mutex<dyn TextGeneration + Send>> = Arc::new(Mutex::new(engine));
@@ -931,8 +1215,8 @@ impl ModelLoader {
             Some(model),
         );
 
-        self.loaded_models
-            .insert(model_name.to_string(), instance.clone());
+        self.evict_to_fit_and_insert(model_name, instance.clone())
+            .await;
         info!(
             "GGUF model {} loaded successfully via llama.cpp",
             model_name
@@ -958,14 +1242,123 @@ impl ModelLoader {
     }
 }
 
-// ---------------------------------------------------------------------------
-// llama.cpp engine routing (always compiled — the parse layer has no
-// llama.cpp dependency; only the loader in `load_llamacpp_model` is gated)
-// ---------------------------------------------------------------------------
+// Multi-shard GGUF download: HuggingFace splits very large GGUFs across
+// several files (`<prefix>-%05d-of-%05d.gguf`); llama.cpp auto-loads every
+// sibling given the first shard's path, but only if all shards are already
+// on disk, so this resolves and downloads every shard first.
+
+/// Reject a GGUF filename (or derived shard name) that could escape the HF
+/// cache directory — `hf-hub` does not sanitize `..`/absolute paths itself.
+/// See docs/configuration.md. Forward-slash directory prefixes are allowed.
+fn is_safe_gguf_relative_path(name: &str) -> bool {
+    if name.is_empty() || name.starts_with('/') || name.starts_with('\\') {
+        return false;
+    }
+    if name.as_bytes().get(1) == Some(&b':') {
+        return false; // e.g. "C:\..." — hf-hub is cross-platform even if this worker targets Linux today
+    }
+    name.split(['/', '\\'])
+        .all(|part| part != "." && part != "..")
+}
+
+/// Parse the `<prefix>-<NNNNN>-of-<MMMMM>.gguf` shard-naming convention.
+/// Returns `(prefix, shard_index, total_shards, digit_width)`, requiring
+/// equal zero-padded width and `1 <= shard_index <= total_shards` to avoid
+/// false positives like "release-2024-of-3.gguf".
+fn parse_shard_suffix(file: &str) -> Option<(&str, u32, u32, usize)> {
+    let stem = file.strip_suffix(".gguf")?;
+    // rsplitn(4, '-') yields, from the right: [total, "of", index, prefix]
+    // (the 4th item absorbs everything else, so a prefix containing '-' is
+    // preserved verbatim).
+    let mut parts = stem.rsplitn(4, '-');
+    let total_str = parts.next()?;
+    let of_str = parts.next()?;
+    let index_str = parts.next()?;
+    let prefix = parts.next()?;
+    if of_str != "of" {
+        return None;
+    }
+    let digit_width = index_str.len();
+    if digit_width == 0
+        || total_str.len() != digit_width
+        || !index_str.bytes().all(|b| b.is_ascii_digit())
+        || !total_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let index: u32 = index_str.parse().ok()?;
+    let total: u32 = total_str.parse().ok()?;
+    if index == 0 || total == 0 || index > total {
+        return None;
+    }
+    Some((prefix, index, total, digit_width))
+}
+
+/// Every shard filename a configured GGUF `file` needs, in order. Returns
+/// `vec![file.to_string()]` unchanged for an ordinary single-file GGUF.
+fn gguf_shard_filenames(file: &str) -> Vec<String> {
+    match parse_shard_suffix(file) {
+        Some((prefix, _index, total, width)) => (1..=total)
+            .map(|i| format!("{prefix}-{i:0width$}-of-{total:0width$}.gguf"))
+            .collect(),
+        None => vec![file.to_string()],
+    }
+}
+
+/// Download `file` and, if it is part of a multi-shard GGUF, every sibling
+/// shard too. Returns `file`'s local path (handed to llama.cpp as `-m`) and
+/// the total size across every shard, for GPU-memory reservation/logging.
+async fn download_gguf(
+    repo: &hf_hub::api::tokio::ApiRepo,
+    file: &str,
+) -> Result<(PathBuf, u64), WorkerError> {
+    // Validate before any shard derivation or network/filesystem action.
+    if !is_safe_gguf_relative_path(file) {
+        return Err(WorkerError::Configuration(format!(
+            "invalid GGUF filename '{file}': must be a relative path with no '.'/'..' components"
+        )));
+    }
+    let shards = gguf_shard_filenames(file);
+    if shards.len() > 1 {
+        info!(
+            "GGUF '{}' is a {}-shard model — fetching all shards before loading",
+            file,
+            shards.len()
+        );
+    }
+    let mut primary: Option<PathBuf> = None;
+    let mut total_bytes: u64 = 0;
+    for shard in &shards {
+        // Defense in depth: every derived shard name is re-checked too.
+        if !is_safe_gguf_relative_path(shard) {
+            return Err(WorkerError::Configuration(format!(
+                "invalid derived GGUF shard name '{shard}': must be a relative path with no '.'/'..' components"
+            )));
+        }
+        let path = repo.get(shard).await.map_err(|e| {
+            WorkerError::ModelLoad(format!("Failed to download GGUF shard '{shard}': {e}"))
+        })?;
+        let size = tokio::fs::metadata(&path)
+            .await
+            .map_err(|e| {
+                WorkerError::ModelLoad(format!("Failed to stat GGUF shard '{shard}': {e}"))
+            })?
+            .len();
+        total_bytes += size;
+        if shard == file {
+            primary = Some(path);
+        }
+    }
+    let primary = primary.ok_or_else(|| {
+        WorkerError::ModelLoad(format!(
+            "internal error: shard list for '{file}' did not include the file itself"
+        ))
+    })?;
+    Ok((primary, total_bytes))
+}
 
 /// GGUF model source parsed from the `ModelConfig.metadata` map the
-/// coordinator sends in `LoadModelRequest` (see coordinator/models.py
-/// `ModelConfig.grpc_metadata`).
+/// coordinator sends in `LoadModelRequest`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GgufLoadSpec {
     /// HuggingFace repo containing the GGUF file, e.g. "Qwen/Qwen2.5-0.5B-Instruct-GGUF".
@@ -976,33 +1369,24 @@ pub struct GgufLoadSpec {
     pub n_gpu_layers: i32,
     /// Optional per-model context window override.
     pub n_ctx: Option<u32>,
-    /// Level-1 (local multi-GPU) split weights for THIS node's own
-    /// `gpu_ids`, in order — len == len(gpu_ids) when present. Parsed from
-    /// the comma-separated `tensor_split` metadata key (see the metadata key
-    /// contract in pending-work/11-distributed-multi-node-inference.md).
+    /// Local multi-GPU split weights for this node's own `gpu_ids`, in
+    /// order. See pending-work/11-distributed-multi-node-inference.md.
     #[allow(dead_code)]
-    // consumed by the Level-1 load() wiring in a later increment (Task 0-gated)
+    // consumed by a later increment's load() wiring
     pub tensor_split: Option<Vec<f32>>,
-    /// KV-cache quantization type for K, e.g. "q8_0"/"q4_0" (Task 2b). `None`
-    /// leaves llama.cpp's own default (f16) — byte-for-byte today's behavior.
-    /// Validated against [`ALLOWED_KV_CACHE_TYPES`] at parse time; the
-    /// string→`KvCacheType` mapping itself lives in `llamacpp_engine.rs`
-    /// (feature `llamacpp`) since the crate enum isn't available here.
+    /// KV-cache quantization type for K, e.g. "q8_0"/"q4_0". `None` leaves
+    /// llama.cpp's own default (f16). Validated against
+    /// [`ALLOWED_KV_CACHE_TYPES`] at parse time.
     pub cache_type_k: Option<String>,
     /// KV-cache quantization type for V. See `cache_type_k`.
     pub cache_type_v: Option<String>,
 }
 
-/// ggml type names accepted for `cache_type_k`/`cache_type_v` metadata (Task
-/// 2b metadata contract). `f16` is llama.cpp's own default — accepted
-/// explicitly too so a config can be self-documenting.
+/// ggml type names accepted for `cache_type_k`/`cache_type_v` metadata.
 const ALLOWED_KV_CACHE_TYPES: &[&str] = &["f16", "q8_0", "q4_0", "q5_0", "q5_1", "q4_1"];
 
-/// Parse one KV-cache-type metadata key, validating it against
-/// [`ALLOWED_KV_CACHE_TYPES`]. `Ok(None)` when the key is absent.
-///
-/// `pub(crate)` so the `llamaserver` engine ([`crate::llamaserver_process`])
-/// validates the SAME `cache_type_k`/`cache_type_v` keys identically.
+/// Parse one KV-cache-type metadata key against [`ALLOWED_KV_CACHE_TYPES`].
+/// `pub(crate)` so [`crate::llamaserver_process`] validates the same keys.
 pub(crate) fn parse_cache_type(
     metadata: &HashMap<String, String>,
     key: &str,
@@ -1034,12 +1418,9 @@ fn parse_tensor_split(metadata: &HashMap<String, String>) -> Result<Option<Vec<f
     }
 }
 
-/// Parse engine-routing metadata.
-///
-/// * `Ok(None)` — no metadata, no `engine` key, or `engine == "burn"`: use the
-///   default Burn path (fully backwards compatible).
-/// * `Ok(Some(spec))` — `engine == "llamacpp"` with a complete GGUF source.
-/// * `Err(..)` — unknown engine name or an incomplete/invalid GGUF spec.
+/// Parse engine-routing metadata: `None` for no metadata / no `engine` key /
+/// `engine == "burn"` (default Burn path); `Some(spec)` for a complete
+/// `engine == "llamacpp"` GGUF source; `Err` for anything invalid.
 pub fn gguf_spec_from_metadata(
     metadata: Option<&HashMap<String, String>>,
     default_n_gpu_layers: i32,
@@ -1099,38 +1480,29 @@ pub fn gguf_spec_from_metadata(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Distributed (Level-2, cross-node ggml-RPC) metadata routing — always
-// compiled, no llama.cpp dependency. See the metadata key contract in
-// pending-work/11-distributed-multi-node-inference.md. `Ok(None)` when the
-// `distributed_role` key is absent means byte-for-byte today's single-node
-// behavior; only the STUB `rpc_server` role is wired into a load path this
-// increment (Task 5) — the real `lead` engine ships in Task 9.
-// ---------------------------------------------------------------------------
+// Distributed (cross-node ggml-RPC) metadata routing. See the metadata key
+// contract in pending-work/11-distributed-multi-node-inference.md. Only the
+// `rpc_server` role stub is wired into a load path today.
 
-/// Which side of a Level-2 (cross-node) ggml-RPC split this node plays for
-/// one distributed model.
+/// Which side of a cross-node ggml-RPC split this node plays for one
+/// distributed model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistributedRole {
-    /// Owns the real llama.cpp context for the model and dials out to
-    /// `rpc_peers` (Task 9 — not implemented this increment).
+    /// Owns the real llama.cpp context and dials out to `rpc_peers` (not
+    /// yet implemented).
     Lead,
-    /// Lends this node's local GPU(s) compute+VRAM to a lead; holds no
-    /// directly-servable model (Task 5 STUB, this increment).
+    /// Lends this node's local GPU(s) to a lead; holds no directly-servable
+    /// model (stub).
     RpcServer,
 }
 
-/// Level-2 distributed-load metadata parsed from `ModelConfig.metadata`.
+/// Distributed-load metadata parsed from `ModelConfig.metadata`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DistributedSpec {
     /// This node's role for the distributed model.
     pub role: DistributedRole,
-    /// Lead only: comma-separated "host:port" peers, GPU-granular.
-    ///
-    /// Ordering invariant (do not break without updating both sides):
-    /// `rpc_peers[i]` and `tensor_split[len(lead_gpu_ids) + i]` refer to the
-    /// SAME (node, GPU) — the peer-portion of `tensor_split` must be laid out
-    /// in the exact same order as `rpc_peers`.
+    /// Lead only: comma-separated "host:port" peers, GPU-granular. Must stay
+    /// index-aligned with the peer portion of `tensor_split`.
     pub rpc_peers: Vec<String>,
     /// rpc_server only: base port its `rpc-server` process(es) bind to.
     pub rpc_bind_port: Option<u16>,
@@ -1139,12 +1511,9 @@ pub struct DistributedSpec {
     pub tensor_split: Option<Vec<f32>>,
 }
 
-/// Parse Level-2 distributed-role metadata.
-///
-/// * `Ok(None)` — no metadata or no `distributed_role` key: today's
-///   single-node path, fully backwards compatible.
-/// * `Ok(Some(spec))` — `distributed_role` is `"lead"` or `"rpc_server"`.
-/// * `Err(..)` — unknown role, or a malformed `rpc_bind_port`/`tensor_split`.
+/// Parse distributed-role metadata: `None` for no metadata / no
+/// `distributed_role` key (today's single-node path); `Some(spec)` for
+/// `"lead"`/`"rpc_server"`; `Err` for anything invalid.
 pub fn distributed_spec_from_metadata(
     metadata: Option<&HashMap<String, String>>,
 ) -> Result<Option<DistributedSpec>, WorkerError> {
@@ -1193,6 +1562,132 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    // --- path-traversal validation ----------------------------------------
+
+    #[test]
+    fn safe_path_accepts_plain_and_directory_prefixed_names() {
+        assert!(is_safe_gguf_relative_path("model-q4_k_m.gguf"));
+        assert!(is_safe_gguf_relative_path(
+            "Q4_K_M/GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf"
+        ));
+        // A component that merely STARTS with ".." but isn't exactly ".." is
+        // a legitimate (if unusual) filename, not a traversal.
+        assert!(is_safe_gguf_relative_path("..hidden-00001-of-00002.gguf"));
+    }
+
+    #[test]
+    fn safe_path_rejects_traversal_and_absolute_paths() {
+        assert!(!is_safe_gguf_relative_path(""));
+        assert!(!is_safe_gguf_relative_path("../../../../etc/passwd"));
+        assert!(!is_safe_gguf_relative_path("a/../../b.gguf"));
+        assert!(!is_safe_gguf_relative_path("./model.gguf"));
+        assert!(!is_safe_gguf_relative_path("/etc/passwd"));
+        assert!(!is_safe_gguf_relative_path("\\Windows\\System32\\evil"));
+        assert!(!is_safe_gguf_relative_path("C:\\evil.gguf"));
+    }
+
+    #[test]
+    fn download_gguf_rejects_traversal_before_any_shard_expansion() {
+        // A crafted multi-shard-looking traversal filename must never even
+        // reach shard expansion/download.
+        assert!(!is_safe_gguf_relative_path(
+            "../../../../etc/cron.d/evil-00001-of-00002.gguf"
+        ));
+    }
+
+    // --- multi-shard GGUF filename detection/generation --------------------
+
+    #[test]
+    fn shard_pattern_single_file_unchanged() {
+        assert_eq!(
+            gguf_shard_filenames("qwen2.5-0.5b-instruct-q4_k_m.gguf"),
+            vec!["qwen2.5-0.5b-instruct-q4_k_m.gguf".to_string()]
+        );
+    }
+
+    #[test]
+    fn shard_pattern_detects_and_generates_all_siblings() {
+        let shards = gguf_shard_filenames("Qwen3-Coder-Next-00001-of-00004.gguf");
+        assert_eq!(
+            shards,
+            vec![
+                "Qwen3-Coder-Next-00001-of-00004.gguf".to_string(),
+                "Qwen3-Coder-Next-00002-of-00004.gguf".to_string(),
+                "Qwen3-Coder-Next-00003-of-00004.gguf".to_string(),
+                "Qwen3-Coder-Next-00004-of-00004.gguf".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shard_pattern_works_from_any_starting_shard() {
+        // The configured `file` need not be shard 1 — the sibling list is
+        // always the full 1..=total set regardless of which one was given.
+        let shards = gguf_shard_filenames("gpt-oss-120b-mxfp4-00003-of-00003.gguf");
+        assert_eq!(
+            shards,
+            vec![
+                "gpt-oss-120b-mxfp4-00001-of-00003.gguf".to_string(),
+                "gpt-oss-120b-mxfp4-00002-of-00003.gguf".to_string(),
+                "gpt-oss-120b-mxfp4-00003-of-00003.gguf".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shard_pattern_preserves_directory_prefix() {
+        let shards =
+            gguf_shard_filenames("Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-00001-of-00004.gguf");
+        assert_eq!(shards.len(), 4);
+        assert_eq!(
+            shards[3],
+            "Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-00004-of-00004.gguf"
+        );
+    }
+
+    #[test]
+    fn shard_pattern_two_way_split_with_directory() {
+        let shards = gguf_shard_filenames("Q4_K_M/GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf");
+        assert_eq!(
+            shards,
+            vec![
+                "Q4_K_M/GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf".to_string(),
+                "Q4_K_M/GLM-4.5-Air-Q4_K_M-00002-of-00002.gguf".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shard_pattern_rejects_malformed_or_non_shard_names() {
+        // No ".gguf" suffix at all.
+        assert_eq!(
+            gguf_shard_filenames("model-00001-of-00004"),
+            vec!["model-00001-of-00004".to_string()]
+        );
+        // Mismatched zero-padding width between the two numeric groups.
+        assert_eq!(
+            gguf_shard_filenames("model-1-of-00004.gguf"),
+            vec!["model-1-of-00004.gguf".to_string()]
+        );
+        // Shard index 0 (1-based convention) is not a valid shard set.
+        assert_eq!(
+            gguf_shard_filenames("model-00000-of-00004.gguf"),
+            vec!["model-00000-of-00004.gguf".to_string()]
+        );
+        // Shard index beyond the declared total.
+        assert_eq!(
+            gguf_shard_filenames("model-00005-of-00004.gguf"),
+            vec!["model-00005-of-00004.gguf".to_string()]
+        );
+        // A filename that merely CONTAINS "-of-" text but isn't the shard
+        // pattern (non-digit segment where the index should be) must fall
+        // through unchanged rather than false-positive.
+        assert_eq!(
+            gguf_shard_filenames("best-of-3-results.gguf"),
+            vec!["best-of-3-results.gguf".to_string()]
+        );
     }
 
     #[test]
@@ -1409,12 +1904,8 @@ mod tests {
         assert!(distributed_spec_from_metadata(Some(&bad_split)).is_err());
     }
 
-    // -----------------------------------------------------------------
-    // rpc_server STUB role (Task 5): exercised through the real
-    // `ModelLoader::load_model` entrypoint — the same path the worker.rs
-    // `LoadModel` gRPC handler calls — so these double as an integration
-    // check of the routing order, without needing a live gRPC harness.
-    // -----------------------------------------------------------------
+    // rpc_server stub role, exercised through the real `ModelLoader::load_model`
+    // entrypoint so these double as a routing-order integration check.
 
     fn test_loader(gpu_manager: Arc<GPUManager>) -> (ModelLoader, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -1425,6 +1916,97 @@ mod tests {
         };
         let loader = ModelLoader::new(loader_config, gpu_manager).unwrap();
         (loader, dir)
+    }
+
+    // reserve_on_gpus/rollback_reservations are the exact primitives the
+    // llamaserver/llamacpp loaders use — proves refuse-and-roll-back without
+    // a network download or a real llama-server binary.
+
+    #[tokio::test]
+    async fn reserve_on_gpus_refuses_and_rollback_restores_capacity() {
+        let gpu_manager = Arc::new(GPUManager::test_with_capacity(1_000));
+        let (loader, _dir) = test_loader(gpu_manager.clone());
+
+        let mut reserved: Vec<usize> = Vec::new();
+        loader
+            .reserve_on_gpus(&[0], 600, "m", &mut reserved)
+            .await
+            .unwrap();
+        assert_eq!(gpu_manager.get_available_memory(0).await, 400);
+
+        let err = loader
+            .reserve_on_gpus(&[0], 500, "m", &mut reserved)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkerError::OutOfMemory { .. }));
+
+        // The caller-visible contract: rolling back `reserved` (which still
+        // holds the successful phase-1 reservation) must restore capacity —
+        // a refused second phase must never leave a partial reservation.
+        loader.rollback_reservations(&reserved, "m").await;
+        assert_eq!(gpu_manager.get_available_memory(0).await, 1_000);
+    }
+
+    #[tokio::test]
+    async fn llamaserver_more_instances_needs_more_memory_and_can_be_refused() {
+        // Same architecture numbers a real GGUF header would yield.
+        let arch = crate::gguf_meta::GgufArchMeta {
+            n_layer: 48,
+            n_head: 8,
+            n_head_kv: 8,
+            n_embd: 1024,
+        };
+        let n_ctx = 4_096u64;
+        let per_instance = crate::kv_estimate::kv_cache_bytes_raw(
+            n_ctx,
+            arch.n_layer,
+            arch.n_head_kv,
+            arch.head_dim(),
+            false,
+            None,
+            None,
+            1,
+        );
+        let sixty_four_instances = crate::kv_estimate::kv_cache_bytes_raw(
+            n_ctx,
+            arch.n_layer,
+            arch.n_head_kv,
+            arch.head_dim(),
+            false,
+            None,
+            None,
+            64,
+        );
+        assert!(sixty_four_instances > per_instance * 32); // scales with instances
+
+        // Budget fits 1 instance's KV/compute comfortably but not 64.
+        let gpu_manager = Arc::new(GPUManager::test_with_capacity(per_instance * 4));
+        let (loader, _dir) = test_loader(gpu_manager.clone());
+
+        let mut reserved: Vec<usize> = Vec::new();
+        loader
+            .reserve_on_gpus(&[0], per_instance, "one-instance", &mut reserved)
+            .await
+            .unwrap();
+        loader
+            .rollback_reservations(&reserved, "one-instance")
+            .await;
+
+        let mut reserved64: Vec<usize> = Vec::new();
+        let err = loader
+            .reserve_on_gpus(
+                &[0],
+                sixty_four_instances,
+                "many-instances",
+                &mut reserved64,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkerError::OutOfMemory { .. }));
+        loader
+            .rollback_reservations(&reserved64, "many-instances")
+            .await;
+        assert_eq!(gpu_manager.get_available_memory(0).await, per_instance * 4);
     }
 
     #[tokio::test]
@@ -1468,11 +2050,8 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_server_role_routes_before_gguf_metadata_is_consulted() {
-        // Ordering invariant: the distributed rpc_server branch must run
-        // BEFORE the gguf/Burn routing. Prove it by attaching `engine`/
-        // `gguf_repo_id`/`gguf_file` metadata that would trigger a network
-        // download if the gguf branch ran first — the stub must short-circuit
-        // before ever looking at those keys.
+        // The rpc_server branch must run before gguf/Burn routing — attach
+        // gguf metadata that would trigger a download if it ran first.
         let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
         let (loader, _dir) = test_loader(gpu_manager.clone());
 
@@ -1501,6 +2080,184 @@ mod tests {
             .unwrap();
         assert_eq!(instance.gpu_ids(), &[0]);
     }
+
+    // resolve_head_dim (div-by-zero guard) and ReservationGuard (release-on-unwind).
+
+    fn base_model_config() -> ModelConfig {
+        ModelConfig {
+            architecture: "llama".to_string(),
+            num_layers: 2,
+            hidden_size: 64,
+            num_attention_heads: 8,
+            num_kv_heads: 8,
+            vocab_size: 100,
+            max_seq_len: 128,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            head_dim: None,
+            attention_bias: false,
+            is_moe: false,
+            num_experts: None,
+            num_experts_per_tok: None,
+        }
+    }
+
+    #[test]
+    fn resolve_head_dim_divides_when_absent() {
+        let config = base_model_config();
+        assert_eq!(resolve_head_dim(&config).unwrap(), 8); // 64 / 8
+    }
+
+    #[test]
+    fn resolve_head_dim_prefers_explicit_value_without_dividing() {
+        let mut config = base_model_config();
+        config.num_attention_heads = 0; // would panic on division if this were used
+        config.head_dim = Some(16);
+        assert_eq!(resolve_head_dim(&config).unwrap(), 16);
+    }
+
+    #[test]
+    fn resolve_head_dim_errors_instead_of_panicking_on_zero_heads() {
+        // A corrupt config.json with num_attention_heads = 0 and no
+        // explicit head_dim must return an Err, never panic.
+        let mut config = base_model_config();
+        config.num_attention_heads = 0;
+        config.head_dim = None;
+        let err = resolve_head_dim(&config).unwrap_err();
+        assert!(err.to_string().contains("num_attention_heads"));
+    }
+
+    #[tokio::test]
+    async fn reservation_guard_releases_memory_on_drop_without_commit() {
+        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        let before = gpu_manager.get_available_memory(0).await;
+
+        {
+            let mut guard = ReservationGuard::new(gpu_manager.clone(), "leak-test");
+            gpu_manager
+                .allocate_memory(0, 1_000, "leak-test")
+                .await
+                .unwrap();
+            guard.track(0);
+            assert_eq!(gpu_manager.get_available_memory(0).await, before - 1_000);
+            // Dropped here WITHOUT calling commit() — simulates an early
+            // return or panic between reservation and a successful load.
+        }
+
+        // Drop spawns the release onto the runtime rather than blocking;
+        // give it a chance to run.
+        for _ in 0..50 {
+            if gpu_manager.get_available_memory(0).await == before {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            gpu_manager.get_available_memory(0).await,
+            before,
+            "ReservationGuard must release its tracked reservation on drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn reservation_guard_commit_prevents_release_on_drop() {
+        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        let before = gpu_manager.get_available_memory(0).await;
+
+        gpu_manager
+            .allocate_memory(0, 1_000, "committed-test")
+            .await
+            .unwrap();
+        let mut guard = ReservationGuard::new(gpu_manager.clone(), "committed-test");
+        guard.track(0);
+        guard.commit(); // ownership transferred — must NOT free on drop
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            gpu_manager.get_available_memory(0).await,
+            before - 1_000,
+            "commit() must prevent the guard from releasing the reservation"
+        );
+        // Clean up for hygiene (not asserted).
+        gpu_manager.free_memory(0, "committed-test").await;
+    }
+
+    // max_loaded_models eviction race: two concurrent loads racing through
+    // evict_to_fit_and_insert must never both succeed in exceeding the cap.
+
+    fn dummy_instance(name: &str) -> ModelInstance {
+        ModelInstance::new(name.to_string(), 0, vec![0], 0, 0, None)
+    }
+
+    #[tokio::test]
+    async fn evict_to_fit_and_insert_never_exceeds_cap_under_concurrency() {
+        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let loader_config = ModelLoaderConfig {
+            cache_dir: dir.path().join("models"),
+            download_dir: dir.path().join("downloads"),
+            max_loaded_models: 1,
+            ..ModelLoaderConfig::default()
+        };
+        let loader = Arc::new(ModelLoader::new(loader_config, gpu_manager).unwrap());
+
+        // Model "a" is already loaded; "b" and "c" load concurrently against
+        // a cap of 1 — only one can end up resident.
+        loader
+            .loaded_models
+            .insert("a".to_string(), dummy_instance("a"));
+
+        let loader_b = loader.clone();
+        let loader_c = loader.clone();
+        let (_, _) = tokio::join!(
+            loader_b.evict_to_fit_and_insert("b", dummy_instance("b")),
+            loader_c.evict_to_fit_and_insert("c", dummy_instance("c")),
+        );
+
+        assert_eq!(
+            loader.loaded_models.len(),
+            1,
+            "max_loaded_models=1 must never be exceeded, even under concurrent loads \
+             of different model names"
+        );
+    }
+
+    // calculate_memory_usage must saturate, never overflow/wrap, on a
+    // maximally-hostile config.json.
+
+    #[tokio::test]
+    async fn calculate_memory_usage_saturates_instead_of_overflowing() {
+        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        let (loader, _dir) = test_loader(gpu_manager);
+        let mut config = base_model_config();
+        // Every field maxed out — the worst case an attacker-controlled
+        // `config.json` (`as_u64().unwrap_or(0) as usize`) could supply.
+        config.vocab_size = usize::MAX;
+        config.hidden_size = usize::MAX;
+        config.num_layers = usize::MAX;
+        config.intermediate_size = usize::MAX;
+        config.is_moe = true;
+        config.num_experts = Some(usize::MAX);
+        let usage = loader.calculate_memory_usage(&config);
+        assert_eq!(usage, usize::MAX, "must saturate, not wrap, on overflow");
+    }
+
+    #[tokio::test]
+    async fn calculate_memory_usage_matches_hand_computation_for_sane_config() {
+        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        let (loader, _dir) = test_loader(gpu_manager);
+        let config = base_model_config(); // hidden=64, layers=2, heads=8, vocab=100, ffn=128
+        let usage = loader.calculate_memory_usage(&config);
+        let embed = 100 * 64;
+        let attn = 2 * 4 * 64 * 64;
+        let ffn = 2 * 3 * 64 * 128;
+        let norm = (2 * 2 + 1) * 64;
+        let expected = (embed + attn + ffn + norm) * 4;
+        assert_eq!(usage, expected);
+    }
 }
 
 /// Helper to transpose Linear weights (HF [out, in] -> Burn [in, out])
@@ -1516,10 +2273,7 @@ fn load_linear(
         .remove(&w_name)
         .ok_or(WorkerError::ModelLoad(format!("Missing {}", w_name)))?;
 
-    // HF: [out, in]
-    // Burn expects: [in, out]
-    // So we reshape to HF shape, transpose, then into Burn shape.
-    // Actually, simply reshaping to [out, in] and transposing gives [in, out].
+    // HF layout is [out, in]; Burn expects [in, out].
     let w = w_flat.reshape([out_features, in_features]).transpose();
 
     let b = if bias {
@@ -1896,8 +2650,6 @@ fn create_llama_record(
             false,
         )?;
 
-        // LlamaAttentionRecord
-        // Attention has q,k,v,o
         let attention = LlamaAttentionRecord {
             q_proj: q,
             k_proj: k,

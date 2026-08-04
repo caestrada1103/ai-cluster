@@ -24,10 +24,16 @@ curl http://localhost:8000/health
 |---|---|---|---|
 | Universal (default) | `docker build -f docker/Dockerfile.worker .` | `wgpu` (Vulkan) | ubuntu:24.04 |
 | AMD native | `--build-arg BACKEND=rocm --build-arg BUILDER_IMAGE=rocm/dev-ubuntu-24.04:6.2.1 --build-arg RUNTIME_IMAGE=rocm/dev-ubuntu-24.04:6.2.1 --build-arg BUILDER_EXTRA_PKGS="" --build-arg RUNTIME_EXTRA_PKGS=""` | `rocm` | rocm/dev-ubuntu-24.04 |
-| NVIDIA native | `--build-arg BACKEND=cuda --build-arg BUILDER_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu24.04 --build-arg RUNTIME_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04 --build-arg BUILDER_EXTRA_PKGS="" --build-arg RUNTIME_EXTRA_PKGS="libcublas-12-6"` | `cuda` | nvidia/cuda 12.6.3 |
+| NVIDIA native | `--build-arg BACKEND=cuda --build-arg BUILDER_IMAGE=nvidia/cuda:13.0.3-devel-ubuntu24.04 --build-arg RUNTIME_IMAGE=nvidia/cuda:13.0.3-runtime-ubuntu24.04 --build-arg BUILDER_EXTRA_PKGS="" --build-arg RUNTIME_EXTRA_PKGS="libcublas-13-0"` | `cuda` | nvidia/cuda 13.0.3 |
 
 There is no `GPU_BACKEND` arg and no `hip` feature — the arg is `BACKEND`
 and the AMD feature is `rocm`.
+
+> CUDA 13.0.3 (bumped from 12.6.3) — 12.6's nvcc predates Blackwell/`sm_121`,
+> so it cannot build for GB10 (DGX Spark). Both `13.0.3-devel-ubuntu24.04` and
+> `13.0.3-runtime-ubuntu24.04` publish `linux/amd64` **and** `linux/arm64`
+> manifests. Note the runtime package name tracks the version:
+> `libcublas-13-0`, not `libcublas-12-6`.
 
 All three variants also bake in a `llama-server` binary (Vulkan, from a pinned
 llama.cpp tag via `--build-arg LLAMASERVER_TAG=`) at `/usr/local/bin/llama-server`
@@ -35,6 +41,12 @@ with `LLAMASERVER_BINARY_PATH` preset, for `engine = "llamaserver"` agentic
 models. Opt out (skip the llama.cpp compile) with
 `--build-arg LLAMASERVER_SRC=llamaserver-none`. See
 docs/deployment.md "llama-server for agentic serving".
+
+> That stage needs **Node 20+** (copied in from `node:22-bookworm-slim`).
+> llama.cpp's `tools/CMakeLists.txt` adds the embedded Web UI unconditionally
+> whenever `LLAMA_BUILD_SERVER=ON` and links it into `llama-server`, so
+> `-DLLAMA_BUILD_UI=OFF` does NOT skip it; building the UI needs npm because
+> its `vite` pin requires Node 20.19+/22.12+. Do not remove the Node stage.
 
 ## GPU passthrough
 

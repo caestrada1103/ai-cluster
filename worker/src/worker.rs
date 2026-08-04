@@ -100,7 +100,10 @@ impl Drop for ActiveGuard {
 impl Worker for WorkerService {
     type InferStream = Pin<Box<dyn Stream<Item = Result<InferenceResponse, Status>> + Send>>;
 
-    #[instrument(skip(self))]
+    // `skip(self, request)`: logging the whole Request would dump gRPC
+    // metadata/headers and (elsewhere in this file) prompt text into logs.
+    // Only the reviewed, non-sensitive `model_name` field is recorded.
+    #[instrument(skip(self, request), fields(model_name = %request.get_ref().model_name))]
     async fn load_model(
         &self,
         request: Request<LoadModelRequest>,
@@ -161,6 +164,15 @@ impl Worker for WorkerService {
                 let load_time = load_start.elapsed();
                 let memory_used = model_instance.memory_used();
 
+                // Drop our copies of anything the loader evicted to honor
+                // `max_loaded_models` — otherwise this map would keep a stale
+                // "loaded" entry and hold the last Arc, leaking the weights.
+                for evicted in self.model_loader.take_evicted().await {
+                    self.loaded_models.write().await.remove(&evicted);
+                    self.metrics.remove_model_metrics(&evicted);
+                    info!("Dropped evicted model {} from the service map", evicted);
+                }
+
                 // Store model
                 self.loaded_models
                     .write()
@@ -196,7 +208,8 @@ impl Worker for WorkerService {
         }
     }
 
-    #[instrument(skip(self))]
+    // See `load_model`'s note — the prompt text lives in the request body.
+    #[instrument(skip(self, request), fields(model_name = %request.get_ref().model_name))]
     async fn infer(
         &self,
         request: Request<InferenceRequest>,
@@ -215,10 +228,8 @@ impl Worker for WorkerService {
             req.prompt.len()
         );
 
-        // llamaserver-engine models are served over the coordinator's HTTP
-        // proxy (agentic tool-calling / streaming), never through this gRPC
-        // data plane. Reject clearly instead of falling into the generic
-        // "no runnable model" path — and before consuming a concurrency permit.
+        // llamaserver-engine models are served via the coordinator's HTTP
+        // proxy, never this gRPC data plane — reject before taking a permit.
         if self.model_loader.is_llamaserver(&req.model_name) {
             return Err(Status::failed_precondition(format!(
                 "model '{}' uses the llamaserver engine; send agentic inference to the \
@@ -399,12 +410,13 @@ impl Worker for WorkerService {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    #[instrument(skip(self))]
+    // Skip `_request` too — its gRPC metadata (headers) might be sensitive.
+    #[instrument(skip(self, _request))]
     async fn get_status(&self, _request: Request<Empty>) -> Result<Response<WorkerStatus>, Status> {
         debug!("Status request received - waiting for locks");
 
         // Reap any llama-server children that exited on their own so status
-        // reports them as unloaded (Plan 13 contract: process exit => unloaded).
+        // reports them as unloaded (process exit implies unloaded).
         let reaped = self.model_loader.reap_exited_llamaservers().await;
         if !reaped.is_empty() {
             let mut models = self.loaded_models.write().await;
@@ -456,7 +468,8 @@ impl Worker for WorkerService {
         }))
     }
 
-    #[instrument(skip(self))]
+    // See `load_model`'s note.
+    #[instrument(skip(self, request), fields(model_name = %request.get_ref().model_name))]
     async fn unload_model(
         &self,
         request: Request<UnloadModelRequest>,
@@ -486,7 +499,8 @@ impl Worker for WorkerService {
         }
     }
 
-    #[instrument(skip(self))]
+    // See `get_status`'s note.
+    #[instrument(skip(self, _request))]
     async fn health_check(
         &self,
         _request: Request<Empty>,

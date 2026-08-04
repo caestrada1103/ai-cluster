@@ -1,7 +1,6 @@
 """Compression pipeline orchestrator: budget check, no-op fast path, and the
-technique dispatch loop (skeletonize here; summarize/llmlingua register their
-handlers into `_TECHNIQUE_HANDLERS` in Tasks 9 and 10 without touching this
-file's control flow).
+technique dispatch loop (skeletonize here; summarize/llmlingua register
+their handlers into `_TECHNIQUE_HANDLERS`).
 """
 from __future__ import annotations
 

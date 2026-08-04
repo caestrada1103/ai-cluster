@@ -24,8 +24,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          # runner.arch is included because "Linux" alone (runner.os) is
+          # shared by both this x86_64 runner and the aarch64 job below —
+          # without it they'd collide on the same cache key and corrupt each
+          # other's (architecture-incompatible) target/ artifacts.
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -44,6 +48,29 @@ jobs:
       - name: cargo check (llamacpp feature)
         run: cargo check -p ai-worker --features llamacpp
 
+      # Exercises the `cuda` feature's Rust code paths and worker/build.rs's
+      # CUDA_PATH/nccl-detection logic (the exact logic that regressed with a
+      # hardcoded `-lnccl` and broke every single-GPU CUDA host — see
+      # worker/build.rs). This runner has NO CUDA toolkit installed, and that
+      # is fine for `cargo check`: burn's `cuda` feature pulls in `cudarc`
+      # configured with `dynamic-loading` + `cuda-version-from-build-system` +
+      # `fallback-latest` (see cubecl-cuda's Cargo.toml) — it dlopens the CUDA
+      # driver at RUNTIME rather than linking at build time, and falls back to
+      # assuming the latest known CUDA version when `nvcc` isn't found instead
+      # of failing the build. worker/build.rs's own link directives are gated
+      # on `CUDA_PATH`/`/usr/local/cuda` existing, so they simply no-op here
+      # too. Verified empirically (2026-08-03) on a real CUDA 13.0 / aarch64
+      # DGX Spark host: `cargo check --features cuda` compiles cudarc cleanly
+      # and worker/build.rs correctly emits the graceful "libnccl not found"
+      # warning instead of a hard link failure.
+      #   Residual gap: this does NOT cover an actual CUDA *link* (full
+      #   `cargo build`), which needs a host with the real CUDA toolkit and
+      #   ideally an NVIDIA GPU — no such GitHub-hosted runner exists as of
+      #   this writing. That step remains manual (documented in
+      #   docs/deployment.md) or would need a self-hosted GPU runner.
+      - name: cargo check (cuda feature build.rs / nccl-detection logic)
+        run: cargo check -p ai-worker --features cuda
+
       - name: cargo fmt --check
         run: cargo fmt -p ai-worker -- --check
 
@@ -52,6 +79,51 @@ jobs:
 
       - name: cargo test
         run: cargo test -p ai-worker --features wgpu
+
+  rust-arm64:
+    name: Rust (aarch64)
+    # Covers the architecture class that broke silently before (DGX Spark /
+    # Grace-Blackwell and other aarch64 NVIDIA hosts): a hardcoded `-lnccl` in
+    # worker/build.rs previously broke every single-GPU CUDA host without CI
+    # ever noticing, because CI never built anything but x86_64. This does not
+    # need to duplicate formatting/lint checks from the `rust` job above
+    # (those are architecture-independent) — just the feature-gated builds
+    # that could plausibly diverge per-arch, kept minimal to keep total CI
+    # time reasonable.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # protobuf-compiler: tonic codegen in build.rs. libclang-dev: bindgen for
+      # the llamacpp feature. cmake: llama-cpp-sys-2's from-source build.
+      - name: Install build dependencies
+        run: sudo apt-get install -y --no-install-recommends protobuf-compiler cmake libclang-dev
+
+      - name: cargo check (wgpu feature)
+        run: cargo check -p ai-worker --features wgpu
+
+      - name: cargo check (llamacpp feature)
+        run: cargo check -p ai-worker --features llamacpp
+
+      # See the matching x86_64 step above for why this is safe without a
+      # real CUDA toolkit on the runner; doubly relevant here since aarch64 +
+      # CUDA (DGX Spark/Grace-Blackwell, sm_121) is the exact combination that
+      # motivated the CUDA base image bump in docker/Dockerfile.worker.
+      - name: cargo check (cuda feature build.rs / nccl-detection logic)
+        run: cargo check -p ai-worker --features cuda
 
   python:
     name: Python

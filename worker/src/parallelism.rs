@@ -1,54 +1,10 @@
-//! Model parallelism strategies
-//!
-//! Implements three parallelism modes for Llama-family models:
-//!
-//! * **Tensor parallelism** (Megatron-LM style) — column/row-parallel projections
+//! Tensor/pipeline/expert parallelism for Llama-family models (Burn engine).
+//! Algorithm details and diagrams: docs/architecture.md#parallelism-strategies.
+//! All shards currently simulate on one device — no real multi-GPU transfer.
 
 #![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::needless_range_loop)]
-//!   with KV-cache-aware autoregressive generation.
-//! * **Pipeline parallelism** — layer partitioning across stages with sequential
-//!   activation passing.
-//! * **Expert parallelism** (MoE) — stub for future Mixture-of-Experts routing.
-//!
-//! ## Tensor parallelism overview
-//!
-//! Each transformer layer contains two kinds of linear projections:
-//!
-//! * **Column-parallel** (Q, K, V, gate, up): the weight matrix is split along
-//!   its *output* dimension.  Shard *i* stores `W[:, i·s : (i+1)·s]` and
-//!   produces a partial output that is later concatenated (attention context) or
-//!   summed (row-parallel step) with the other shards' outputs.
-//!
-//! * **Row-parallel** (O, down): the weight matrix is split along its *input*
-//!   dimension.  Shard *i* stores `W[i·s : (i+1)·s, :]` and contributes a
-//!   partial `[batch, seq, hidden]` tensor.  An **all-reduce** (element-wise
-//!   sum across shards) gives the correct result because matrix–vector products
-//!   distribute over addition:
-//!
-//!   ```text
-//!   [x₀, x₁] · [W₀; W₁] = x₀·W₀ + x₁·W₁
-//!   ```
-//!
-//! When `num_shards == 1` the implementation is mathematically identical to
-//! `Llama::forward_pass`.  With `num_shards > 1` each shard would ideally run
-//! on a separate GPU; the all-reduce would use NCCL or a custom wgpu compute
-//! shader.  The current code simulates all shards on the same device so the
-//! result is numerically exact while demonstrating the correct data-flow.
-//!
-//! ## GQA constraint
-//!
-//! Grouped-Query Attention requires `num_shards` to evenly divide `num_kv_heads`
-//! so that each shard carries the same KV-head / Q-head ratio.  If the requested
-//! shard count is not a divisor, it is silently clamped down to the nearest
-//! valid value.
-//!
-//! ## All-reduce abstraction
-//!
-//! The [`AllReduce`] trait provides a pluggable summation backend.  The default
-//! [`LocalAllReduce`] sums partials on the same device.  A real multi-GPU
-//! deployment would implement an `NcclAllReduce` or `WgpuAllReduce` variant.
 
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
@@ -197,14 +153,9 @@ fn tp_mlp_forward<B: Backend>(
 // tensor_parallel_llama_forward (prompt / multi-token, NO KV cache)
 // ---------------------------------------------------------------------------
 
-/// Megatron-style tensor-parallel forward pass for Llama-family models.
-///
-/// This function runs a full forward pass over the input sequence without
-/// maintaining a KV cache.  For autoregressive generation with a KV cache,
-/// use [`tensor_parallel_llama_prefill`] followed by repeated calls to
+/// Megatron-style tensor-parallel forward pass, no KV cache. For
+/// autoregressive generation use [`tensor_parallel_llama_prefill`] then
 /// [`tensor_parallel_llama_decode_step`].
-///
-/// See module-level documentation for the algorithm details.
 pub fn tensor_parallel_llama_forward<B: Backend>(
     model: &Llama<B>,
     input_ids: Tensor<B, 2>,
@@ -321,14 +272,8 @@ pub fn tensor_parallel_llama_forward<B: Backend>(
 // tensor_parallel_llama_prefill (WITH KV cache capture)
 // ---------------------------------------------------------------------------
 
-/// TP prefill: run a full-sequence forward pass and populate a [`TpKvCache`].
-///
-/// Each shard stores its own `[1, kv_per_shard, seq, head_dim]` K/V pair
-/// *before* GQA expansion, keeping memory proportional to `n_kv_heads` rather
-/// than `n_heads`.
-///
-/// Returns `(logits_vec, tp_kv_cache)` where `logits_vec` is the last-position
-/// logit vector already on CPU.
+/// TP prefill: run a full-sequence forward pass and populate a [`TpKvCache`]
+/// (pre-GQA-expansion K/V per shard). Returns `(last_position_logits, cache)`.
 pub fn tensor_parallel_llama_prefill<B: Backend>(
     model: &Llama<B>,
     input_ids: Tensor<B, 2>,
@@ -457,12 +402,9 @@ pub fn tensor_parallel_llama_prefill<B: Backend>(
 // tensor_parallel_llama_decode_step (single token, uses TpKvCache)
 // ---------------------------------------------------------------------------
 
-/// TP decode step: process a single new token using the distributed KV cache.
-///
-/// Each shard extends its own `[1, kv_per_shard, seq+1, head_dim]` K/V pair,
-/// then the attention outputs and MLP outputs are all-reduced across shards.
-///
-/// Returns the logit vector for the new position (already on CPU).
+/// TP decode step: process one new token against the distributed KV cache,
+/// all-reducing attention/MLP outputs across shards. Returns the new
+/// position's logit vector.
 pub fn tensor_parallel_llama_decode_step<B: Backend>(
     model: &Llama<B>,
     token_id: u32,
@@ -591,22 +533,9 @@ pub fn tensor_parallel_llama_decode_step<B: Backend>(
 // pipeline_parallel_llama_forward
 // ---------------------------------------------------------------------------
 
-/// Pipeline-parallel forward pass for Llama-family models.
-///
-/// Partitions the transformer layers into `num_stages` sequential stages.
-/// Each stage processes its subset of layers, then passes the activation
-/// tensor to the next stage.
-///
-/// On a real multi-GPU system, each stage would run on a separate device and
-/// the activation tensor would be transferred via PCIe/NVLink between stages.
-/// The current implementation runs all stages on the same device.
-///
-/// # Micro-batching (future)
-///
-/// Pipeline parallelism achieves high utilization through micro-batching:
-/// while stage *i* processes micro-batch *k*, stage *i-1* processes
-/// micro-batch *k+1*.  This overlap is not yet implemented; all stages
-/// run sequentially on the full batch.
+/// Pipeline-parallel forward pass: partitions layers into `num_stages`
+/// sequential stages. Runs all stages on one device today; a real deployment
+/// would transfer activations between devices and micro-batch for overlap.
 pub fn pipeline_parallel_llama_forward<B: Backend>(
     model: &Llama<B>,
     input_ids: Tensor<B, 2>,

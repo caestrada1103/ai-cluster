@@ -15,49 +15,137 @@ git clone https://github.com/caestrada1103/ai-cluster.git
 cd ai-cluster
 cp .env.example .env
 # REQUIRED: set GRAFANA_ADMIN_PASSWORD in .env (compose refuses to start Grafana without it)
+# REQUIRED: set COORDINATOR_API_KEYS in .env (a comma-separated secret list, e.g.
+#   `openssl rand -hex 32`) — the coordinator's REST API port (8000) IS published to
+#   the host by this compose file, and the coordinator now REFUSES TO START with a
+#   non-loopback bind and no keys configured (secure-by-default; see coordinator/main.py).
+# REQUIRED: set COMPOSE_PROFILES in .env to match your GPU (see "GPU variants" below) —
+#   with no profile set, `docker compose up` starts everything EXCEPT a worker.
 # Set HF_TOKEN for gated models (Llama 3, ...)
 docker compose up -d --build
-curl http://localhost:8000/health
+curl -H "Authorization: Bearer <your COORDINATOR_API_KEYS value>" http://localhost:8000/health
 ```
 
-Services and host ports:
+Services and host ports (default — nothing else is published; see "Exposing
+worker/Open-WebUI ports" below for the opt-in override):
 
 | Service | Port | Notes |
 |---|---|---|
-| coordinator | 8000 | REST API + `/metrics` (Prometheus scrapes 8000 — there is no :9090 coordinator port) |
-| worker | 50051 (gRPC), 9091 (`/metrics`, `/health`, `/live`) | replica N listens on base+N |
+| coordinator | 8000 | REST API + `/metrics`, gated by `COORDINATOR_API_KEYS` (Prometheus scrapes 8000 — there is no :9090 coordinator port) |
+| worker | none by default | gRPC (50051)/metrics (9091)/llama-server (8081/8082) are reachable by the coordinator CONTAINER over the private compose network, but not published to the host |
 | prometheus | 9099 → container 9090 | |
 | grafana | 3000 | admin / $GRAFANA_ADMIN_PASSWORD |
-| open-webui | 8080 | chat UI against the coordinator |
+| open-webui | none by default | chat UI against the coordinator; not published to the host |
+
+### Exposing worker/Open-WebUI ports (opt in)
+
+The base `docker-compose.yml` is secure-by-default: no worker port or
+Open-WebUI's port is published to the host. That is correct for the common single-host case (coordinator and
+worker(s) only need to reach each other over the private compose network).
+Layer `docker-compose.expose-ports.yml` when something OUTSIDE this compose
+project needs to reach one of these directly — e.g. a LAN cluster where the
+coordinator runs on a different host (section 3), or you want to browse to
+Open-WebUI from another machine:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.expose-ports.yml \
+  --profile cuda-native up -d
+```
+
+Every worker service in `docker-compose.yml` already sets
+`WORKER_GRPC_BIND_HOST=${WORKER_GRPC_BIND_HOST:-0.0.0.0}` and
+`LLAMASERVER_BIND_HOST=${LLAMASERVER_BIND_HOST:-0.0.0.0}` — that's what lets
+the coordinator container reach a worker container over the private network
+even before this overlay publishes anything to the host; layering
+`docker-compose.expose-ports.yml` only changes what's reachable from OUTSIDE
+docker. Set `WORKER_GRPC_AUTH_TOKEN` in `.env` before doing this beyond a
+trusted LAN behind a firewall/VPN — the worker gRPC port has no other
+authentication (see `worker/src/grpc_auth.rs`).
 
 ### GPU variants
 
-One parameterized `docker/Dockerfile.worker`:
+One parameterized `docker/Dockerfile.worker` builds five worker profiles in
+`docker-compose.yml` — no vendor is assumed by default, so pick the one
+profile matching your hardware via `COMPOSE_PROFILES` in `.env` (or
+`--profile <name>` on the CLI). Whichever one is active, it joins the compose
+network as both its own service name and the `worker` alias, so
+`COORDINATOR_STATIC_WORKERS=["worker:50051"]` keeps working unchanged. Only
+activate **one** single-GPU profile at a time (see "Multi-GPU hosts" below
+for running several workers at once).
 
-- **Universal wgpu/Vulkan** (default): AMD passthrough — `/dev/kfd` + `/dev/dri`,
-  `group_add: [video, render]`; NVIDIA — Container Toolkit injects the Vulkan ICD;
-  Intel — works out of the box (Mesa ANV).
-- **AMD native ROCm**: build arg `BACKEND=rocm` with the `rocm/dev-ubuntu-24.04:6.2.1` images.
-- **NVIDIA native CUDA**: build arg `BACKEND=cuda` with the `nvidia/cuda:12.6.3-*-ubuntu24.04` images.
+| Profile | Service | `BACKEND` | Vendor | GPU passthrough | Perf |
+|---|---|---|---|---|---|
+| `amd-vulkan` | `worker-amd-vulkan` | `wgpu` (default) | AMD | `/dev/kfd` + `/dev/dri`, `group_add: [video, render]` | good |
+| `nvidia-vulkan` | `worker-nvidia-vulkan` | `wgpu` (default) | NVIDIA | NVIDIA Container Toolkit (`deploy.resources.reservations.devices`) | good |
+| `intel-vulkan` | `worker-intel-vulkan` | `wgpu` (default) | Intel | `/dev/dri`, `group_add: [video, render]` (Mesa ANV — works out of the box) | good |
+| `rocm-native` | `worker-rocm-native` | `rocm` | AMD | `/dev/kfd` + `/dev/dri`, `group_add: [video, render]` | best |
+| `cuda-native` | `worker-cuda-native` | `cuda` | NVIDIA (incl. DGX Spark, sm_121) | NVIDIA Container Toolkit | best |
 
-See the commented blocks in `docker-compose.yml` for copy-paste service definitions.
-Cargo features are `wgpu` (default) / `rocm` / `cuda` — there is no `hip` feature.
+The three `*-vulkan` profiles all build the exact same universal wgpu/Vulkan
+image — Vulkan auto-detects the vendor at runtime — and differ only in which
+device nodes get passed through. `rocm-native`/`cuda-native` build the
+vendor's native Burn backend instead (`BACKEND=rocm|cuda`) for the best
+per-vendor performance. Cargo features are `wgpu` (default) / `rocm` / `cuda`
+— there is no `hip` feature.
+
+`cuda-native` builds on `nvidia/cuda:13.0.3-devel-ubuntu24.04` /
+`13.0.3-runtime-ubuntu24.04` (bumped 2026-08 from 12.6.3, whose nvcc predates
+sm_121/Grace-Blackwell support) — both amd64 and arm64 manifests are
+published for these tags, so the same block builds on an RTX 3080 desktop
+(x86_64) or a DGX Spark (aarch64). `worker/build.rs` links NCCL (a
+multi-GPU collective-comm library) only when it's found on the link-search
+path — linking it unconditionally broke single-GPU CUDA hosts, notably DGX
+Spark, whose CUDA 13 toolkit ships `cudart`/`cublas` but no `libnccl`,
+failing only at final link after a long build.
+
+A worker's `max_loaded_models = 1` (see `config/worker.toml`) is meant for
+hosts with unified CPU+GPU memory like DGX Spark, where the operator wants
+only one model resident at a time — loading a new one evicts the
+oldest-loaded first. `0` (the default) is unlimited, for deployments with
+headroom to keep several models warm.
+
+#### Per-GPU quick start
+
+```bash
+# RTX 3080 (NVIDIA, universal Vulkan image — good perf, simplest path)
+echo "COMPOSE_PROFILES=nvidia-vulkan" >> .env
+docker compose up -d --build
+
+# RTX 3080 (NVIDIA, native CUDA build — best perf)
+echo "COMPOSE_PROFILES=cuda-native" >> .env
+docker compose up -d --build
+
+# RX 9060XT (AMD, universal Vulkan image — good perf, simplest path)
+echo "COMPOSE_PROFILES=amd-vulkan" >> .env
+docker compose up -d --build
+
+# RX 9060XT (AMD, native ROCm build — best perf)
+echo "COMPOSE_PROFILES=rocm-native" >> .env
+docker compose up -d --build
+
+# DGX Spark (Grace-Blackwell, aarch64, sm_121) — native CUDA build recommended
+echo "COMPOSE_PROFILES=cuda-native" >> .env
+docker compose up -d --build
+# or, as a vendor-neutral fallback (also multi-arch, builds fine on aarch64):
+echo "COMPOSE_PROFILES=nvidia-vulkan" >> .env
+docker compose up -d --build
+```
 
 #### Enabling the llama.cpp/GGUF engine (recommended for consumer GPUs)
 
 The default image builds the Burn/wgpu path only. To also compile the
 llama.cpp engine — the one that actually loads quantized GGUF models — add
-the `WORKER_FEATURES` build arg:
+the `WORKER_FEATURES` build arg to whichever worker service matches your
+profile (e.g. `worker-nvidia-vulkan:` for `COMPOSE_PROFILES=nvidia-vulkan`):
 
 ```yaml
-# docker-compose.yml worker service, build.args:
+# docker-compose.yml, e.g. under the worker-nvidia-vulkan: service, build.args:
 build:
   context: .
   dockerfile: docker/Dockerfile.worker
   args:
     WORKER_FEATURES: "llamacpp,llamacpp-vulkan"   # Vulkan offload, NVIDIA or AMD
-    # or, on a CUDA base image:
-    # BACKEND: cuda
+    # or, under worker-cuda-native: (already BACKEND: cuda), just add:
     # WORKER_FEATURES: "llamacpp,llamacpp-cuda"
 ```
 
@@ -68,20 +156,32 @@ a GGUF file once the worker is built this way.
 
 ### Multi-GPU hosts
 
-Run one worker service per GPU (see the `worker-gpu-N` commented blocks):
-set `GPU_INDEX=N` per service (ports become 50051+N / 9091+N), give each its own
-GPU passthrough block, add each address to `COORDINATOR_STATIC_WORKERS`, and add
-each metrics target to `config/prometheus.yml`.
+Run one worker service per GPU (see the `worker-gpu-N` commented blocks,
+`profiles: ["multi-gpu"]`, brought up with
+`COMPOSE_PROFILES=multi-gpu docker compose up -d`): set `GPU_INDEX=N` per
+service (ports become 50051+N / 9091+N), give each its own GPU passthrough
+block (base it on whichever single-GPU profile above matches that card's
+vendor — mixed-vendor rigs just combine blocks of different `BACKEND`s), add
+each address to `COORDINATOR_STATIC_WORKERS`, and add each metrics target to
+`config/prometheus.yml`. Don't also activate one of the single-GPU profiles
+in the same project — both would fight over the shared `worker` network
+alias and the default GRPC/metrics ports.
 
 ## 2. Native (no Docker)
 
 Prerequisites: Python 3.10+, Rust 1.70+, `protobuf-compiler`, GPU drivers
-(ROCm 6.0+ / CUDA 12.1+ / any Vulkan driver for wgpu).
+(ROCm 6.0+ / CUDA 12.1+, or 13.0+ for sm_121 / Grace-Blackwell hosts like DGX
+Spark / any Vulkan driver for wgpu).
 
 ```bash
 # Coordinator — run from the REPO ROOT (module path matters)
 python3 -m venv venv && source venv/bin/activate
 pip install -r coordinator/requirements.txt
+# Loopback-only, single-machine (secure by default — no COORDINATOR_API_KEYS needed):
+uvicorn coordinator.main:app --host 127.0.0.1 --port 8000
+# Reachable from elsewhere on your LAN — the coordinator refuses to start with
+# a non-loopback --host and no COORDINATOR_API_KEYS configured:
+export COORDINATOR_API_KEYS=$(openssl rand -hex 32)   # or set it in .env
 uvicorn coordinator.main:app --host 0.0.0.0 --port 8000
 
 # Worker (second terminal)
@@ -91,7 +191,14 @@ cargo build --release --features wgpu     # Burn engine only (default; FP32, no 
 cargo build --release --features wgpu,llamacpp                  # llama.cpp on CPU
 cargo build --release --features wgpu,llamacpp,llamacpp-vulkan  # llama.cpp Vulkan offload (NVIDIA or AMD)
 cargo build --release --features cuda,llamacpp,llamacpp-cuda    # llama.cpp CUDA offload (NVIDIA)
+# Loopback-only bind is the worker binary's default too (grpc_bind_host in
+# worker.toml, or the built-in default when no config file is present).
 ./target/release/ai-worker --port 50051 --gpu-ids 0
+# Coordinator on a DIFFERENT host: set grpc_bind_host = "0.0.0.0" (and
+# llamaserver_bind_host, for engine="llamaserver" models) in worker.toml —
+# or export WORKER_GRPC_BIND_HOST=0.0.0.0 / LLAMASERVER_BIND_HOST=0.0.0.0,
+# which win over the file — and set WORKER_GRPC_AUTH_TOKEN, since the worker
+# gRPC port has no other authentication.
 ```
 
 `wgpu` is the default Burn backend feature (`rocm`/`cuda` are the native
@@ -146,6 +253,10 @@ Build `llama-server` once from the same pinned tag, then point the worker at it:
 sudo apt-get install -y build-essential cmake git libvulkan-dev glslc spirv-headers libcurl4-openssl-dev
 # Runtime deps (Vulkan loader + AMD/Intel Mesa drivers):
 sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+# Node.js 20.19+/22.12+ (NOT Ubuntu 24.04's apt nodejs, which is 18.x — too
+# old) — required by `-DLLAMA_BUILD_SERVER=ON` below, see the note underneath:
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
 
 git clone --depth 1 --branch b9941 https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
@@ -155,6 +266,18 @@ cmake --build build --target llama-server -j
 # Point the worker at the in-tree binary (simplest — keeps its shared libs):
 export LLAMASERVER_BINARY_PATH="$PWD/build/bin/llama-server"
 ```
+
+> **Node.js is required, not optional.** `-DLLAMA_BUILD_SERVER=ON` pulls in
+> llama.cpp's embedded Web UI unconditionally (`tools/CMakeLists.txt` does
+> `add_subdirectory(ui)` whenever `LLAMA_BUILD_SERVER=ON` — it does **not**
+> gate on `-DLLAMA_BUILD_UI`, and `tools/server/CMakeLists.txt` links the
+> resulting `llama-ui` static lib into the `llama-server` binary). The UI's
+> `package.json` pins vite 7, which needs Node 20.19+/22.12+. Without a
+> working npm, CMake falls through to downloading prebuilt UI assets from a
+> Hugging Face bucket instead — a network-dependent fallback with its own
+> failure modes — so installing Node as above is the reliable path. This is
+> exactly what `docker/Dockerfile.worker`'s Stage 2 does (copies a Node 22
+> binary in via multi-stage `COPY`) for the same reason.
 
 - NVIDIA hosts can build with `-DGGML_CUDA=ON` instead for CUDA offload; the
   Vulkan build above already covers AMD, NVIDIA, and Intel.
@@ -173,22 +296,32 @@ export LLAMASERVER_BINARY_PATH="$PWD/build/bin/llama-server"
 ### Port reachability (coordinator → worker)
 
 Each llamaserver model listens on its own coordinator-assigned `llamaserver_port`
-(`config/models.toml`: **8081** Devstral, **8082** Qwen3-Coder). The worker binds
-`--host 0.0.0.0` (`llamaserver_bind_host`), and the coordinator proxies to
-`http://<worker_host>:<port>`. Those TCP ports must therefore be **reachable from
-the coordinator host** across the LAN:
+(`config/models.toml`: **8081** Devstral, **8082** Qwen3-Coder). The worker's
+`llamaserver_bind_host` defaults to **`127.0.0.1`**, secure by default —
+`/slots` can leak another slot's prompt text, and this port has no auth at all.
+The coordinator proxies to `http://<worker_host>:<port>`; those TCP ports must
+therefore be **reachable from the coordinator host**:
 
-- **Docker:** publish them on the worker container — already done in
-  `docker-compose.yml` (`- "8081:8081"` / `- "8082:8082"`); copy the same lines
-  if you swap in a different worker service block. Within one compose network the
-  coordinator reaches the worker as `worker:8081` without publishing.
-- **Bare metal:** open the ports in the worker host's firewall to the coordinator.
-- **Trusted-LAN only:** that proxy hop is plaintext and unauthenticated — never
-  expose the llamaserver ports to an untrusted network (see Plan 15).
+- **Same-host Docker Compose (the default, no action needed):** the shipped
+  `config/worker.toml` sets `llamaserver_bind_host = "0.0.0.0"` explicitly
+  (documented there) because the worker and coordinator are separate
+  containers on the private compose network — that is NOT the same as LAN
+  exposure, since `docker-compose.yml` no longer publishes 8081/8082 to the
+  host by default.
+- **LAN cluster (coordinator on a DIFFERENT host):** publish the ports by
+  layering `docker-compose.expose-ports.yml`
+  (`docker compose -f docker-compose.yml -f docker-compose.expose-ports.yml
+  --profile <name> up -d`) — see section 1 — and set `WORKER_GRPC_AUTH_TOKEN`.
+- **Bare metal:** set `llamaserver_bind_host = "0.0.0.0"` in `worker.toml`
+  and open the ports in the worker host's firewall to the coordinator only.
+- **Trusted-LAN only:** that proxy hop is still plaintext and unauthenticated
+  at the HTTP layer — never expose the llamaserver ports to an untrusted
+  network. Also disable `/slots` unless you specifically need it
+  (`llamaserver_enable_slots_endpoint = false` is the default).
 
 ### Windows
 
-Windows `llama-server` provisioning is deferred to **Plan 17**.
+Windows `llama-server` provisioning is not yet supported.
 
 ## 5. Health checks
 

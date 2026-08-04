@@ -23,8 +23,13 @@ docker compose down
 ```bash
 # Run from the REPO ROOT — `cd coordinator && uvicorn main:app` breaks package imports.
 pip install -r coordinator/requirements-dev.txt   # runtime+lint+test (runtime only: requirements.txt)
-uvicorn coordinator.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn coordinator.main:app --reload --host 127.0.0.1 --port 8000
 ```
+> Security note: the coordinator refuses to start with a non-loopback `--host`
+> (e.g. `0.0.0.0`) unless `COORDINATOR_API_KEYS` is set — secure by default.
+> For a LAN-reachable coordinator, set `COORDINATOR_API_KEYS` first
+> (comma-separated secrets, e.g. `openssl rand -hex 32`) and pass
+> `--host 0.0.0.0`. See `.env.example` and `docs/deployment.md`.
 
 ### Worker (Rust)
 `wgpu` (Burn engine, FP32) is the **default** cargo feature; add `llamacpp` for the **recommended** GGUF/quantized-inference engine on consumer GPUs.
@@ -138,7 +143,11 @@ Client (REST) → Coordinator (FastAPI) → Workers (Rust: llama.cpp + Burn) →
 | `RUST_LOG` | info | Worker log level (wins over `LOG_LEVEL`) |
 | `LOG_LEVEL` / `LOG_JSON` | info / off | clap-level log settings |
 | `RUST_BACKTRACE` | 1 | Rust panic backtrace (set to `full` for verbose) |
-| `GPU_VRAM_GB` | 8 (binary) / 6 (compose default) | VRAM hint when vendor tools can't report |
+| `GPU_VRAM_GB` | — | Explicit memory override; wins over vendor detection |
+| `GPU_MEMORY_HEADROOM_PERCENT` | 15 | Share of system RAM held back on unified-memory adapters |
+| `WORKER_GRPC_BIND_HOST` | 127.0.0.1 | gRPC bind interface; compose sets `0.0.0.0` |
+| `LLAMASERVER_BIND_HOST` | 127.0.0.1 | `llama-server --host`; compose sets `0.0.0.0` |
+| `WORKER_GRPC_AUTH_TOKEN` | — | Shared secret required on every gRPC call when set |
 | `WORKER_ID` | — | Unique worker identifier (auto-assigned if empty) |
 | `GRPC_PORT` / `METRICS_PORT` | 50051 / 9091 | Explicit ports the binary reads (CLI/env > worker.toml > default) |
 | `GRPC_BASE_PORT` / `METRICS_BASE_PORT` | 50051 / 9091 | Docker entrypoint only: replica port = base + GPU_INDEX (the bare binary ignores BASE vars) |

@@ -3,31 +3,33 @@
 # Precedence for worker_id / grpc_port / metrics_port / gpu_ids:
 #   CLI flag or env var  >  this file  >  built-in default
 
-# llama.cpp engine defaults (only used when the worker binary is built with
-# `--features llamacpp`). NOTE: WorkerConfig parses flat top-level keys, so
-# these MUST stay above the first [section] header in this file.
+# llama.cpp engine defaults, shared by the in-process `llamacpp` engine and
+# the `llamaserver` child-process engine. Must stay above the first [section]
+# header (WorkerConfig parses flat top-level keys). See docs/configuration.md.
 llamacpp_n_threads = 0              # 0 = llama.cpp auto-detects thread count
-llamacpp_default_n_gpu_layers = -1  # -1 = offload all layers to the GPU
+llamacpp_default_n_gpu_layers = -1  # -1 = offload all layers to the GPU (both engines)
 
-# ggml-RPC peer ("rpc_server") role for distributed (Level 2, cross-node)
-# GGUF splits — see pending-work/11-distributed-multi-node-inference.md.
-# Defaulted off: leave commented on every node that never lends a GPU to a
-# distributed model's lead. Trusted-LAN only — ggml-RPC has no auth/encryption;
-# never set rpc_server_bind_host to a public interface.
+# ggml-RPC peer ("rpc_server") role for distributed cross-node GGUF splits.
+# Off by default; trusted-LAN only (ggml-RPC has no auth/encryption).
 # rpc_server_enabled = false        # true on nodes that lend local GPU(s) as an RPC peer
 # rpc_server_port = 50151           # base port; one rpc-server process per lent GPU, port+i
 # rpc_server_bind_host = "0.0.0.0"  # bind interface for the rpc-server process(es)
 
-# llama-server engine (Plan 13, engine="llamaserver" models). The worker spawns
-# and supervises a `llama-server` child per such model; the coordinator proxies
-# agentic HTTP inference (OpenAI/Anthropic tool calling, streaming) to it. The
-# binary is NOT built by cargo — install llama.cpp's `llama-server` on the host.
-# Env LLAMASERVER_BINARY_PATH wins over llamaserver_binary_path. Trusted-LAN
-# only: firewall the llamaserver ports (0.0.0.0 lets the coordinator reach them).
+# llama-server engine (engine="llamaserver" models): the worker spawns and
+# supervises a `llama-server` child per such model. Binary not built by
+# cargo — install llama.cpp's `llama-server` on the host.
 # llamaserver_binary_path = "llama-server"  # PATH lookup by default; or an absolute path
-# llamaserver_bind_host = "0.0.0.0"         # --host for llama-server (LAN-reachable)
+#
+# Both bind hosts default to 127.0.0.1. Containers open them up via
+# LLAMASERVER_BIND_HOST / WORKER_GRPC_BIND_HOST. See docs/deployment.md.
+# llamaserver_bind_host = "127.0.0.1"
+# llamaserver_enable_slots_endpoint = false  # default; leave off unless something needs /slots
 
 # worker_id = "my-worker"        # optional; auto-generated when absent everywhere
+# grpc_bind_host = "127.0.0.1"
+# grpc_auth_token wires to env WORKER_GRPC_AUTH_TOKEN (wins over this value).
+# See docs/deployment.md.
+# grpc_auth_token = "change-me"
 grpc_port = 50051
 metrics_port = 9091
 gpu_ids = [0]
@@ -46,3 +48,7 @@ request_timeout_secs = 120
 # HuggingFace Hub (HF_TOKEN env var wins when both are set)
 # hf_token = "hf_..."
 # hf_cache_dir = "/app/models/hf-cache"
+
+# Resident-model cap: 1 evicts the oldest-loaded model on a new load;
+# 0 = unlimited. See docs/deployment.md (DGX Spark unified-memory sizing).
+max_loaded_models = 1

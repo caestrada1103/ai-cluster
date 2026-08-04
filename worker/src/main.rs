@@ -22,7 +22,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 pub mod backend;
 mod config;
 mod error;
+mod gguf_meta;
 mod gpu_manager;
+mod grpc_auth;
+mod kv_estimate;
 #[cfg(feature = "llamacpp")]
 mod llamacpp_engine;
 mod llamaserver_process;
@@ -42,6 +45,7 @@ pub mod cluster {
 use crate::cluster::worker_server::WorkerServer;
 use crate::config::WorkerConfig;
 use crate::error::WorkerError;
+use crate::grpc_auth::TokenInterceptor;
 use crate::metrics::MetricsServer;
 use crate::model_loader::{ModelLoader, ModelLoaderConfig};
 use crate::worker::WorkerService;
@@ -181,14 +185,8 @@ async fn async_main(
     #[cfg(feature = "wgpu")]
     {
         use burn::backend::wgpu::WgpuDevice;
-        // WgpuDevice::default() picks the best available adapter automatically:
-        //   Windows  → DX12 (prefers discrete GPU, e.g. RTX 3050)
-        //   Linux    → Vulkan (requires a hardware Vulkan ICD from the driver)
-        //   macOS    → Metal
-        // NOTE: in Docker Desktop on Windows (WSL2), NVIDIA's driver only exposes CUDA—
-        // no Vulkan ICD is injected—so wgpu falls back to Mesa llvmpipe (CPU).
-        // On a native Linux host with NVIDIA Container Toolkit + graphics capability,
-        // the NVIDIA Vulkan ICD is injected and the real GPU is selected.
+        // Auto-selects the best available adapter (DX12/Vulkan/Metal). See
+        // docs/troubleshooting.md for the Docker Desktop/WSL2 CPU-fallback gotcha.
         let device = WgpuDevice::default();
         info!("Selected WGPU Device: {:?}", device);
     }
@@ -213,9 +211,21 @@ async fn async_main(
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| config.llamaserver_binary_path.clone()),
-        llamaserver_bind_host: config.llamaserver_bind_host.clone(),
+        // env LLAMASERVER_BIND_HOST wins over the config file. Containers set
+        // it to 0.0.0.0 so the coordinator can reach the child across the
+        // Compose network; bare-metal keeps the loopback default.
+        llamaserver_bind_host: std::env::var("LLAMASERVER_BIND_HOST")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| config.llamaserver_bind_host.clone()),
         // Reuse the worker's single load/inference timeout for /health polling.
         llamaserver_health_timeout_secs: config.request_timeout_secs,
+        max_loaded_models: config.max_loaded_models,
+        max_n_ctx: config.max_n_ctx,
+        max_concurrent_requests: config.max_concurrent_requests,
+        llamaserver_enable_slots_endpoint: config.llamaserver_enable_slots_endpoint,
+        llamaserver_port_min: config.llamaserver_port_min,
+        llamaserver_port_max: config.llamaserver_port_max,
     };
     let model_loader = Arc::new(ModelLoader::new(loader_config, gpu_manager.clone())?);
 
@@ -226,6 +236,26 @@ async fn async_main(
         .worker_id
         .or_else(|| config.worker_id.clone())
         .unwrap_or_else(|| format!("worker-{}", gpu_ids[0]));
+
+    // Bind interface defaults to loopback; non-loopback is an explicit opt-in.
+    // env WORKER_GRPC_BIND_HOST wins over the config file so containers can
+    // open up without the bare-metal default changing. Computed before
+    // `config` moves into `WorkerService::new` below.
+    let grpc_bind_host = std::env::var("WORKER_GRPC_BIND_HOST")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| config.grpc_bind_host.clone());
+    let bind_ip: std::net::IpAddr = grpc_bind_host.parse().map_err(|e| {
+        WorkerError::Configuration(format!("invalid grpc_bind_host '{grpc_bind_host}': {e}"))
+    })?;
+    let addr = SocketAddr::from((bind_ip, grpc_port));
+
+    // WORKER_GRPC_AUTH_TOKEN wins over worker.toml's grpc_auth_token.
+    // Empty/unset leaves the server open (fine for loopback-only deployments).
+    let grpc_auth_token = std::env::var("WORKER_GRPC_AUTH_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| config.grpc_auth_token.clone());
 
     // Create worker service
     let worker_service = WorkerService::new(worker_id, gpu_manager.clone(), model_loader, config);
@@ -238,9 +268,16 @@ async fn async_main(
         }
     });
     info!("Metrics server listening on port {}", metrics_port);
-
-    // Build gRPC server
-    let addr = SocketAddr::from(([0, 0, 0, 0], grpc_port));
+    if grpc_auth_token.is_none() && !bind_ip.is_loopback() {
+        warn!(
+            "gRPC server binding to non-loopback address {} with NO grpc_auth_token/\
+             WORKER_GRPC_AUTH_TOKEN configured — every gRPC RPC (LoadModel, Infer, ...) \
+             is reachable by anyone who can route to this address. Set \
+             WORKER_GRPC_AUTH_TOKEN (or worker.toml's grpc_auth_token) before exposing \
+             this port beyond a container-internal network you already trust.",
+            addr
+        );
+    }
     info!("gRPC server listening on {}", addr);
 
     // Health service
@@ -249,9 +286,13 @@ async fn async_main(
         .set_serving::<WorkerServer<WorkerService>>()
         .await;
 
+    let interceptor = TokenInterceptor::new(grpc_auth_token);
+
     Server::builder()
+        // Health-check service is left unauthenticated — load balancers
+        // need to reach it without a credential, and it exposes nothing.
         .add_service(health_service)
-        .add_service(WorkerServer::new(worker_service))
+        .add_service(WorkerServer::with_interceptor(worker_service, interceptor))
         .serve(addr)
         .await
         .map_err(|e| WorkerError::Grpc(format!("Server error: {}", e)))?;

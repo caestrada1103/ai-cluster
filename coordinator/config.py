@@ -67,18 +67,74 @@ class Settings(BaseSettings):
     models_config: Path = Field(
         Path("config/models.toml"), description="Path to models configuration"
     )
+    model_load_timeout: int = Field(
+        3600,
+        description=(
+            "LoadModel gRPC deadline (seconds). Must exceed the worker's "
+            "GGUF download time (weight_size / link_speed)."
+        ),
+        ge=1,
+    )
 
-    # CORS
-    # NoDecode: pydantic-settings otherwise JSON-decodes any complex-typed env
-    # value before our validator runs, which rejects non-JSON strings like "*".
+    # CORS: defaults to no explicit origins, but main.py always applies a
+    # loopback allow_origin_regex, so local browser calls work with zero
+    # config while any other origin needs an explicit opt-in. See
+    # docs/configuration.md.
+    # NoDecode: pydantic-settings would otherwise JSON-decode this before our
+    # validator runs, rejecting non-JSON strings like "*".
     cors_origins: Annotated[List[str], NoDecode] = Field(
-        default_factory=lambda: ["*"],
-        description="Allowed CORS origins. Use specific origins in production.",
+        default_factory=list,
+        description=(
+            "Allowed CORS origins beyond the always-on loopback default. "
+            "Empty by default; set to '*' or specific origins to widen."
+        ),
     )
 
     # Per-worker concurrency limit
     max_concurrent_requests_per_worker: int = Field(
         10, description="Maximum concurrent requests per worker", ge=1
+    )
+
+    # Disabled by default: a maliciously registered "worker" here can be
+    # routed real traffic or used for SSRF. See docs/configuration.md.
+    allow_manual_worker_registration: bool = Field(
+        False,
+        description=(
+            "Enable POST /v1/workers/manual (env "
+            "COORDINATOR_ALLOW_MANUAL_WORKER_REGISTRATION). Off by default; the route "
+            "also independently requires a valid COORDINATOR_API_KEYS credential "
+            "regardless of whether global auth is enabled, and addresses are "
+            "shape-validated and capped."
+        ),
+    )
+    manual_worker_allowed_hosts: Annotated[List[str], NoDecode] = Field(
+        default_factory=list,
+        description=(
+            "Optional allowlist of hosts/CIDRs POST /v1/workers/manual may register "
+            "(comma-separated). Empty (default) means any well-formed host:port is "
+            "accepted once the feature is enabled and authenticated."
+        ),
+    )
+
+    # Off by default: an unregistered model_name would otherwise become an
+    # arbitrary HuggingFace repo pull.
+    allow_unregistered_model_pull: bool = Field(
+        False,
+        description=(
+            "Allow POST /v1/models/load for a model_name absent from the registry "
+            "(env COORDINATOR_ALLOW_UNREGISTERED_MODEL_PULL) — the worker treats it "
+            "as an arbitrary HuggingFace repo id to download. Off by default."
+        ),
+    )
+
+    # 25 MB is generous for a real chat/agentic request while still
+    # bounding worst-case memory use. See coordinator/body_limit.py.
+    max_request_body_bytes: int = Field(
+        25_000_000,
+        description=(
+            "Maximum HTTP request body size in bytes (env COORDINATOR_MAX_REQUEST_BODY_BYTES)"
+        ),
+        ge=1,
     )
 
     # Request routing (consumed by coordinator.router.RequestRouter)
@@ -98,11 +154,8 @@ class Settings(BaseSettings):
         600.0, description="How long a session sticks to a worker (affinity strategy)", gt=0
     )
 
-    # llama-server auto-load-on-demand (Plan 13 Task 5). When True (default), a
-    # proxied request for an `engine="llamaserver"` model that no worker reports
-    # loaded triggers the standard load path on a healthy worker (single-flight
-    # per model) before proxying. When False the coordinator preserves Phase-1
-    # behavior — it 404s and the client must POST /models/load first.
+    # When True (default), a proxied request for an unloaded llamaserver
+    # model triggers a load first. When False it 404s instead.
     llamaserver_autoload: bool = Field(
         True,
         description=(
@@ -111,12 +164,9 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Context compression middleware (coordinator/context_compression/) — see
-    # pending-work/12-context-compression-pipeline.md. Off by default: a
-    # request is only ever touched when (a) this is True or the request sets
-    # `compress_context: true`, AND (b) its estimated prompt tokens exceed
-    # context_compression_token_budget. Tune the budget per deployment —
-    # roughly `n_ctx - max_tokens - 512` for whatever model you route to.
+    # Context compression middleware (coordinator/context_compression/). Off
+    # by default; only applies when estimated prompt tokens exceed the
+    # budget. Tune the budget to roughly `n_ctx - max_tokens - 512`.
     context_compression_enabled: bool = Field(
         False, description="Server-wide default: compress oversized prompts before forwarding"
     )
@@ -174,6 +224,14 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             # Parse comma-separated list
             return [addr.strip() for addr in v.split(",") if addr.strip()]
+        return v
+
+    @field_validator("manual_worker_allowed_hosts", mode="before")
+    @classmethod
+    def validate_manual_worker_allowed_hosts(cls, v: Union[str, List[str]]) -> List[str]:
+        """Accept a comma-separated env-var string or a list."""
+        if isinstance(v, str):
+            return [h.strip() for h in v.split(",") if h.strip()]
         return v
 
     @field_validator("context_compression_techniques", mode="before")

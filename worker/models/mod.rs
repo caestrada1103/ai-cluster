@@ -72,11 +72,7 @@ pub struct ModelConfig {
 }
 
 /// A loaded model instance with metadata for lifecycle management.
-///
-/// This is backend-agnostic — it stores metadata only. The actual model
-/// (which is parameterized by `B: Backend`) lives behind an `Arc<dyn Model<B>>`
-/// inside worker internals. `ModelInstance` is used for observation and
-/// lifecycle tracking without needing to know the concrete backend.
+/// Backend-agnostic — stores metadata only, not the concrete model.
 use futures::Stream;
 use std::pin::Pin;
 

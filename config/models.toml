@@ -1,16 +1,6 @@
 # Model Configuration Registry
 # ============================
 
-# REFRESH (2026-07-10, pending-work/13-agentic-serving-llama-server.md Task 4):
-# added the 16GB-AMD-fleet `engine = "llamaserver"` entries (Devstral Small 2
-# 24B, Qwen3-Coder-30B-A3B-Instruct) and a commented-out "DGX Spark tier"
-# block — see the "llama-server (agentic serving, Plan 13)" section below,
-# placed after the existing GGUF/llama.cpp section. Also corrected the stale
-# `[models."qwen2.5-coder-32b-gguf".distributed]` comment (it read as if that
-# dense Qwen2.5 entry were still "the flagship"; Plan 11 retargeted the real
-# flagship to Qwen3-Coder-30B-A3B-Instruct). All pre-existing entries below
-# are otherwise unchanged — other configs/tests reference them as-is.
-
 # Default settings applied to all models
 [defaults]
 quantization = "none"
@@ -25,23 +15,13 @@ warm_up_prompts = [
 
 # GGUF / llama.cpp (PRIMARY — quantized, consumer NVIDIA+AMD)
 # =============================================================
-# AICluster's actual goal is running LLM inference on consumer GPUs (gaming-PC
-# cards, ~8-16 GB VRAM each, including idle ones) across BOTH NVIDIA and AMD —
-# a quantized model that fits in limited VRAM and/or one model split across
-# several consumer GPUs. The llama.cpp/GGUF engine is what makes that
-# possible: native quantization (Q4_K_M/Q5_K_M/Q8_0/...) instead of the Burn
-# engine's FP32-only loader. Served by the worker's llama.cpp engine (worker
-# built with `--features llamacpp` [+ `llamacpp-vulkan` | `llamacpp-cuda`]);
-# runs on NVIDIA via CUDA/Vulkan and AMD via ROCm/Vulkan. Architecture
-# parameters come from GGUF metadata, so no [.architecture] block is needed
-# here. `engine` defaults to "burn" for every other model in this file — these
-# entries opt in with `engine = "llamacpp"`.
-#
-# NOTE: llama.cpp is an opt-in cargo feature, not the default build (the
-# default cargo build still compiles the Burn/wgpu path only).
-#
-# NOTE: exact GGUF filenames below should be confirmed against the HF repo
-# before download — quant naming/casing varies by uploader.
+# Native quantization (Q4_K_M/Q5_K_M/Q8_0/...) for consumer GPUs; architecture
+# is read from GGUF metadata, so no [.architecture] block is needed. `engine`
+# defaults to "burn" elsewhere in this file — these entries opt in with
+# `engine = "llamacpp"`. Requires the worker's `llamacpp` cargo feature (not
+# built by default). See docs/configuration.md for engine selection rationale.
+# Confirm exact GGUF filenames against the HF repo before download — quant
+# naming/casing varies by uploader.
 
 [models."qwen2.5-0.5b-gguf"]
 family = "qwen"
@@ -118,10 +98,8 @@ file = "qwen2.5-14b-instruct-q4_k_m.gguf"
 n_gpu_layers = -1  # -1 = offload all layers to the GPU
 n_ctx = 8192
 
-# The "split a quantized model across two consumer GPUs" showcase. Multi-GPU
-# tensor/layer split for the llama.cpp engine is the upcoming worker feature
-# (today the worker loads one GGUF model per worker process); recommended_gpus
-# / max_gpus describe the target deployment shape once that lands.
+# recommended_gpus/max_gpus describe a future multi-GPU tensor/layer split
+# for the llama.cpp engine (not yet implemented — one GGUF model per worker today).
 [models."qwen2.5-coder-32b-gguf"]
 family = "qwen"
 description = "Qwen2.5-Coder 32B Instruct — Q4_K_M GGUF, split across 2 consumer GPUs"
@@ -136,30 +114,13 @@ repo_id = "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF"
 file = "qwen2.5-coder-32b-instruct-q4_k_m.gguf"
 n_gpu_layers = -1  # -1 = offload all layers to the GPU
 n_ctx = 8192
-# KV-cache quantization (Plan 11 Task 2b / Appendix D): q8_0 halves the
-# KV-cache VRAM footprint vs the fp16 default, so a much larger n_ctx fits in
-# the same VRAM budget on this, the biggest/flagship model in this file —
-# exactly the long-context/large-codebase case this knob targets.
+# q8_0 KV cache roughly halves VRAM vs the fp16 default, fitting a larger n_ctx.
 cache_type_k = "q8_0"
 cache_type_v = "q8_0"
 
-# Level 2 — distributed (cross-node ggml-RPC) reference-schema entry, kept on
-# this dense Qwen2.5-Coder-32B model purely to demonstrate the `.distributed`
-# TOML shape — NOT "the flagship" (a stale claim caught in the Plan 11 review,
-# pending-work/REQUIREMENTS-REVIEW-2026-07-10.md: this comment used to imply
-# qwen2.5-coder-32b-gguf was the flagship "split across 3 AMD nodes" showcase
-# from pending-work/11; it was superseded there by the MoE
-# `Qwen3-Coder-30B-A3B-Instruct` model — see the `qwen3-coder-30b-a3b-instruct-gguf`
-# entry in the "llama-server (agentic serving, Plan 13)" section below). That
-# Qwen3 entry is NOT wired into a `.distributed` block itself: it runs
-# `engine = "llamaserver"` single-node on the 16 GB AMD fleet, and
-# `coordinator/models.py` requires `engine = "llamacpp"` for `distributed`
-# models — porting Level 2 to the Qwen3 MoE flagship is separate, un-started
-# follow-up work, not part of this refresh. Independent of any of that, this
-# block is NOT usable until Phase 2 either way: it needs the worker's
-# `llamacpp-rpc` feature built and a running `rpc-server` process on each peer
-# node (amd-node-2/3). Until then this block is inert config-only schema
-# (coordinator Task 6, which reads it, is not implemented yet either).
+# Level 2 distributed (cross-node ggml-RPC) reference schema — demonstrates the
+# `.distributed` TOML shape. Not yet wired end-to-end (needs the worker's
+# `llamacpp-rpc` feature and a peer `rpc-server` per node). See docs/configuration.md.
 [models."qwen2.5-coder-32b-gguf".distributed]
 enabled = true
 lead = "amd-node-1"
@@ -172,36 +133,19 @@ amd-node-1 = [0]
 amd-node-2 = [0]
 amd-node-3 = [0]
 
-# llama-server (agentic serving, Plan 13) — added 2026-07-10
-# ============================================================
-# `engine = "llamaserver"` (pending-work/13-agentic-serving-llama-server.md):
-# a per-model `llama-server` child process supervised by the worker, proxied
-# to over HTTP by the coordinator, instead of the in-process `llama-cpp-2`
-# binding used by `engine = "llamacpp"` above. This is what gets real OpenAI/
-# Anthropic tool calling (native chat templates, GBNF grammars, streaming
-# tool-call parsing) — the in-process engine cannot do this (see Plan 13
-# "Why"). Same `[models.X.gguf]` sub-table/fields as the llamacpp engine
-# (`repo_id`, `file`, `n_ctx`, `cache_type_k`/`cache_type_v`); `n_gpu_layers`
-# is omitted below because the llamaserver worker spawn always passes a fixed
-# `-ngl 999` (full GPU offload — see the Contract in pending-work/13), unlike
-# the in-process llamacpp engine above which honors `gguf.n_gpu_layers`.
-#
-# New fields consumed by the worker's llama-server spawn, added in this same
-# Plan 13 increment by a parallel task (`coordinator/models.py` /
-# `worker/src/llamaserver_process.rs`) — this TOML is written against that
-# contract; a `[models.X.llamaserver]` sub-table (mirroring the `.gguf`
-# sub-table pattern already used above) with:
-#   port        (int, REQUIRED)  -> --port <N>, coordinator-assigned, unique per model
-#   parallel    (int, optional)  -> --parallel <N>, default 4 if omitted
-#   extra_args  (string, optional) -> whitespace-split, appended verbatim to the
-#                                     llama-server command line (e.g. MoE CPU-offload flags)
-# NOTE: engine = "llamaserver" and the `[models.X.llamaserver]` table will not
-# validate until the parallel `coordinator/models.py` change lands (it is the
-# one that adds the "llamaserver" engine value and the llamaserver_* fields)
-# — until then `ModelRegistry.load_from_dict()` logs
-# "Unknown engine 'llamaserver'" and skips these entries; the worker-side
-# `llamaserver.*` metadata keys and process supervision are separate,
-# concurrent Plan 13 tasks too. This is expected — see Task 4's own report.
+# llama-server (agentic serving)
+# ================================
+# engine = "llamaserver": a per-model llama-server child process supervised by
+# the worker, HTTP-proxied by the coordinator — needed for real tool calling
+# (chat templates, GBNF grammars, streaming tool calls), which the in-process
+# llamacpp engine can't do. Same [.gguf] fields as above (repo_id, file, n_ctx,
+# cache_type_k/v, n_gpu_layers, n_cpu_moe), plus a [models.X.llamaserver] table:
+#   port        (int, required)  -> --port <N>, unique per model
+#   instances   (int, optional)  -> --parallel <N> conversation slots, default 1
+#                                     (alias: parallel; overridable per-load)
+#   extra_args  (string, optional) -> whitespace-split, appended to the argv
+# n_ctx is PER SLOT — the worker multiplies it by `parallel` before invoking
+# llama-server. Full rationale and sizing math: docs/configuration.md.
 
 # --- 16 GB AMD fleet (ACTIVE today) ------------------------------------
 
@@ -215,41 +159,17 @@ max_gpus = 1
 engine = "llamaserver"
 
 [models."devstral-small-2-24b-instruct-gguf".gguf]
-# Verified 2026-07-10 against https://huggingface.co/unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF
-# (file listing + https://huggingface.co/unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF/blob/main/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf).
-# bartowski/mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF and
-# ggml-org/Devstral-Small-2-24B-Instruct-2512-GGUF also carry equivalent
-# Q4_K_M quantizations if this mirror ever disappears.
+# Verified against unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF (14.3 GiB, Q4_K_M).
 repo_id = "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF"
-file = "Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"  # single file, 14.3 GiB (not ~14.5 GiB — corrected against the verified HF listing)
-n_ctx = 16384
-# VRAM math (16 GB card; llamaserver worker spawn always uses -ngl 999, i.e.
-# full GPU offload — there is no partial-offload knob on this engine path
-# today):
-#   Q4_K_M weights                    ~14.3 GB
-#   remaining for KV cache + compute   ~1.0-1.7 GB  <- razor thin
-# cache_type_k/v = "q8_0" halves the fp16-default KV footprint, which is what
-# makes 16384 tokens of KV cache fit in that ~1 GB at all; going further
-# (q4_0) is possible (see _ALLOWED_KV_CACHE_TYPES in coordinator/models.py)
-# but trades noticeable quality for a model already this VRAM-starved, so
-# q8_0 is the honest floor here, not q4_0.
-# To raise n_ctx beyond 16384 without a bigger card: (a) add a partial-CPU-
-# offload knob to the llamaserver engine (not built yet — `-ngl 999` is
-# currently hardcoded per the Plan 13 Contract) so some layers move to system
-# RAM, trading tokens/sec for headroom; or (b) move this model to a 24 GB+
-# card. There is no free lunch left in KV quantization alone at this weight
-# size.
+file = "Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"  # single file, 14.3 GiB
+n_ctx = 16384  # per conversation/slot; worker passes -c (n_ctx * parallel) to llama-server
+# q8_0 KV cache; VRAM is razor-thin on this 16 GB card. See docs/configuration.md for the sizing math.
 cache_type_k = "q8_0"
 cache_type_v = "q8_0"
 
 [models."devstral-small-2-24b-instruct-gguf".llamaserver]
 port = 8081
-# parallel = 1: the ~1 GB KV-cache budget above is computed for ONE
-# 16384-token sequence. llama-server splits `-c` (n_ctx) evenly across
-# `--parallel` slots, so raising this would shrink per-request context
-# further on a card with no headroom to spare — leave at 1 until a bigger
-# card is available.
-parallel = 1
+parallel = 1  # KV budget above is sized for one slot; see docs/configuration.md before raising this
 
 [models."qwen3-coder-30b-a3b-instruct-gguf"]
 family = "qwen"
@@ -261,62 +181,88 @@ max_gpus = 1
 engine = "llamaserver"
 
 [models."qwen3-coder-30b-a3b-instruct-gguf".gguf]
-# Verified 2026-07-10 against https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF
-# (file listing + blob page for the Q4_K_M file, 18.6 GiB — matches the size
-# already cited for this exact model/quant in pending-work/11 Appendix B).
-# ggml-org/Qwen3-Coder-30B-A3B-Instruct-Q8_0-GGUF (llama.cpp's own org) is the
-# llama.cpp-authoritative source for other quant levels if needed.
+# Verified against unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF (18.6 GiB, Q4_K_M).
 repo_id = "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF"
 file = "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"  # single file, 18.6 GiB
-n_ctx = 32768
+n_ctx = 32768  # per conversation/slot; worker passes -c (n_ctx * parallel) to llama-server
 cache_type_k = "q8_0"
 cache_type_v = "q8_0"
+n_cpu_moe = 40  # keeps the first 40 layers' MoE experts on CPU so the model fits a 16 GB card
 
 [models."qwen3-coder-30b-a3b-instruct-gguf".llamaserver]
 port = 8082
-parallel = 2
-# 18.6 GB of Q4_K_M weights alone does not fit a 16 GB card even before KV
-# cache, so MoE expert tensors must be partially offloaded to system RAM.
-# `--n-cpu-moe N` is the current llama-server flag for this (verified
-# 2026-07-10 against ggml-org/llama.cpp's tools/server/README.md: short form
-# `-ncmoe`, env `LLAMA_ARG_N_CPU_MOE`, "keep the Mixture of Experts (MoE)
-# weights of the first N layers in the CPU"; `-ngl 999`, always passed by the
-# llamaserver worker spawn, still puts every non-expert tensor + any
-# non-offloaded experts on GPU). The model has 48 transformer layers; N=40
-# below is a conservative starting point (experts for the last ~8 layers stay
-# on GPU) chosen to comfortably clear the VRAM budget on a first load, NOT a
-# hardware-measured optimum — watch actual VRAM at load time and lower N
-# (more experts on GPU, faster) if headroom allows, following the tuning
-# method at https://huggingface.co/blog/Doctor-Shotgun/llamacpp-moe-offload-guide.
-# If N=40 still OOMs, the safe fallback is the blunter `--cpu-moe` (all
-# experts on CPU — guaranteed to fit, slower).
-extra_args = "--n-cpu-moe 40"
+parallel = 1  # raising this doubles the KV footprint against a razor-thin 16 GB budget
+# n_cpu_moe tuning method and the razor-thin VRAM budget math: docs/configuration.md.
 
-# --- DGX Spark tier (enable on arrival, Plan 16) — commented out --------
-# Each DGX Spark has 128 GB *unified* CPU+GPU memory (NOT a discrete VRAM
-# pool like the cards above), verified 2026-07-10 against
-# https://docs.nvidia.com/dgx/dgx-spark/hardware.html (128 GB LPDDR5x unified
-# RAM, NVLink-C2C, shared CPU+GPU). These three are single-Spark-node sizings
-# — do not compare min_memory_gb here to the 16 GB fleet above. Ports
-# 8083-8085 are pre-reserved (next free llamaserver_port block after 8081/
-# 8082 above). SWE-bench Verified figures below all independently
-# web-verified 2026-07-10 (sources in each entry's comment).
+# --- DGX Spark tier (ACTIVE) --------------------------------------------
+# Runs on a real DGX Spark (GB10, 121.6 GiB unified memory). Single-file GGUF.
+# Full sizing arithmetic (KV scaling, parallel/n_ctx tradeoffs, VRAM budget)
+# and the reasoning-mode note below: docs/configuration.md.
+[models."qwen3.6-35b-a3b-gguf"]
+family = "qwen"
+description = "Qwen3.6-35B-A3B — MoE (35B total / 3B active), Apache 2.0. Same active-parameter class as qwen3-coder-30b-a3b, so comparable generation speed on bandwidth-bound hardware, but a newer and stronger model. Single-file Q4_K_XL (22.36 GB). Source: https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF"
+parameters = "35B-A3B"
+min_memory_gb = 34  # ~22.4 GB weights + ~10.9 GB KV cache at parallel=4
+recommended_gpus = 1
+max_gpus = 1
+engine = "llamaserver"
+
+[models."qwen3.6-35b-a3b-gguf".gguf]
+repo_id = "unsloth/Qwen3.6-35B-A3B-GGUF"
+file = "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+# n_gpu_layers omitted (all layers fit this host's unified memory).
+n_ctx = 262144  # per conversation/slot, the model's full native window
+# q8_0 roughly halves KV vs the f16 default.
+cache_type_k = "q8_0"
+cache_type_v = "q8_0"
+
+[models."qwen3.6-35b-a3b-gguf".llamaserver]
+# Reasoning disabled: with thinking on, content stays empty until the model
+# finishes its (often budget-exhausting) chain-of-thought. See docs/configuration.md.
+extra_args = "--reasoning off"
+port = 8086
+parallel = 4  # sizing math: docs/configuration.md
+
+# --- Dual-Spark tier — needs BOTH Sparks, not runnable yet ---------------
+# Cross-node ggml-RPC is not implemented (worker/src/model_loader.rs registers
+# an rpc_server stub only), so this cannot load today. Uncomment once that
+# lands and the second Spark is cabled. See docs/configuration.md.
 #
-# CAVEAT (uncomment-blocker): all three GGUFs are split into multiple shard
-# files (HF's per-file size limit for models this large). The worker's
-# current GGUF fetch path (`worker/src/model_loader.rs`) downloads exactly
-# ONE `gguf.file` per model via `hf-hub` — it does not yet fetch sibling
-# shards. llama.cpp itself will auto-load the remaining shards once given the
-# first shard's local path, but only if all shard files are already present
-# next to it — so either extend the worker's download path to fetch every
-# shard first, or pre-stage them by hand in the worker's HF cache dir, before
-# uncommenting any of these.
+# LICENSE: MiniMax ships this under non-commercial terms that permit personal
+# self-hosted use. Read the LICENSE at huggingface.co/MiniMaxAI/MiniMax-M2.7
+# before relying on it.
+
+# [models."minimax-m2.7-gguf"]
+# family = "llama"  # no MINIMAX ModelFamily member yet; load_from_dict falls back with a warning
+# description = "MiniMax-M2.7 — MoE (229B total / 10B active), 204800 native ctx. 57.0% Terminal-Bench 2.0, the closest open-weight score to Sonnet 4.6's 59.1%. Non-commercial license. Source: https://huggingface.co/unsloth/MiniMax-M2.7-GGUF"
+# parameters = "229B-A10B"
+# min_memory_gb = 205  # 175.1 GiB weights + ~28 GB KV at one slot
+# recommended_gpus = 2
+# max_gpus = 2
+# engine = "llamaserver"
 #
-# CAVEAT (family field): `gpt-oss` and `GLM` are not in coordinator/models.py's
-# `ModelFamily` enum (DEEPSEEK/LLAMA/MISTRAL/PHI/GEMMA/QWEN only) — the two
-# entries below use `family = "llama"` as a placeholder; `load_from_dict()`
-# already falls back safely to LLAMA + a logged warning for any unknown value,
-# but for an accurate label, add real enum members before uncommening.
+# [models."minimax-m2.7-gguf".gguf]
+# # UD-Q6_K verified 2026-08-04: 5 shards, 175.1 GiB total. Nothing at 4-bit or
+# # above fits a single Spark (UD-IQ4_XS is 101 GiB, leaving no KV headroom).
+# repo_id = "unsloth/MiniMax-M2.7-GGUF"
+# file = "UD-Q6_K/MiniMax-M2.7-UD-Q6_K-00001-of-00005.gguf"
+# n_ctx = 204800  # full native window; rope_scaling is null upstream
+# cache_type_k = "q8_0"
+# cache_type_v = "q8_0"
+#
+# [models."minimax-m2.7-gguf".llamaserver]
+# port = 8087
+# parallel = 1  # full attention on every layer — KV is ~28 GB per slot here
+# extra_args = "--jinja"
+
+# --- DGX Spark tier (enable on arrival) — commented out ------------------
+# Each DGX Spark has 128 GB *unified* CPU+GPU memory (not a discrete VRAM pool
+# like the cards above) — do not compare min_memory_gb here to the 16 GB fleet
+# above. Ports 8083-8085 are pre-reserved for these three entries.
+#
+# `gpt-oss` and `GLM` are not in coordinator/models.py's `ModelFamily` enum;
+# the two entries below use `family = "llama"` as a placeholder until real
+# enum members are added.
 
 # [models."qwen3-coder-next-gguf"]
 # family = "qwen"
@@ -328,12 +274,10 @@ extra_args = "--n-cpu-moe 40"
 # engine = "llamaserver"
 #
 # [models."qwen3-coder-next-gguf".gguf]
-# # Official Qwen org repo. Verified 2026-07-10: Q4_K_M is sharded 4 ways,
-# # 48.4 GiB total, at "Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-00001-of-00004.gguf"
-# # (path relative to repo root; give the worker the first shard's path).
+# # Q4_K_M sharded 4 ways, 48.4 GiB total; give the worker the first shard's path.
 # repo_id = "Qwen/Qwen3-Coder-Next-GGUF"
 # file = "Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-00001-of-00004.gguf"
-# n_ctx = 131072  # half of the 262144 native window; 128 GB unified memory has ample headroom above the 48.4 GB weights -- raise toward native once measured on real hardware
+# n_ctx = 131072  # half of the 262144 native window; raise once measured on real hardware
 # cache_type_k = "q8_0"
 # cache_type_v = "q8_0"
 #
@@ -351,13 +295,11 @@ extra_args = "--n-cpu-moe 40"
 # engine = "llamaserver"
 #
 # [models."gpt-oss-120b-gguf".gguf]
-# # ggml-org (llama.cpp's own HF org) native-MXFP4 quantization -- this is the
-# # format the model was trained in, not a post-hoc GGUF quant. Verified
-# # 2026-07-10: sharded 3 ways, ~63.4 GiB total, first shard
-# # "gpt-oss-120b-mxfp4-00001-of-00003.gguf".
+# # Native MXFP4 quantization (trained format, not a post-hoc quant). Sharded 3
+# # ways, ~63.4 GiB total, first shard "gpt-oss-120b-mxfp4-00001-of-00003.gguf".
 # repo_id = "ggml-org/gpt-oss-120b-GGUF"
 # file = "gpt-oss-120b-mxfp4-00001-of-00003.gguf"
-# n_ctx = 131072  # native context (128K); ample headroom in 128 GB unified memory above the 63.4 GB weights
+# n_ctx = 131072  # native context (128K)
 # cache_type_k = "q8_0"
 # cache_type_v = "q8_0"
 #
@@ -375,12 +317,10 @@ extra_args = "--n-cpu-moe 40"
 # engine = "llamaserver"
 #
 # [models."glm-4.5-air-gguf".gguf]
-# # Verified 2026-07-10: Q4_K_M sharded 2 ways, 73 GiB total (50 GB + 23 GB),
-# # under "Q4_K_M/" in the repo. bartowski/zai-org_GLM-4.5-Air-GGUF is an
-# # equivalent alternative source (single-file Q4_K_M) if this mirror moves.
+# # Q4_K_M sharded 2 ways, 73 GiB total (50 GB + 23 GB), under "Q4_K_M/" in the repo.
 # repo_id = "unsloth/GLM-4.5-Air-GGUF"
 # file = "Q4_K_M/GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf"
-# n_ctx = 65536  # conservative half of the 131072 native window -- this is the largest weight footprint of the three Spark entries, so left more headroom unmeasured; raise toward native once measured on real hardware
+# n_ctx = 65536  # conservative half of the 131072 native window; raise once measured
 # cache_type_k = "q8_0"
 # cache_type_v = "q8_0"
 #
@@ -390,13 +330,9 @@ extra_args = "--n-cpu-moe 40"
 
 # Burn / safetensors Models (experimental — FP32 reference engine)
 # ===================================================================
-# `engine` defaults to "burn" for the models below (worker built with default
-# cargo features, no --features llamacpp required). Burn loads weights as
-# FP32 — it does not quantize (quantization != "none" is rejected) — and runs
-# a model on a single GPU per worker; tensor/pipeline parallelism exists in
-# worker/src/parallelism.rs but is not wired to inference yet. Treat this as
-# the experimental / reference path — the GGUF/llama.cpp section above is the
-# primary, recommended engine for the project's consumer-GPU goal.
+# `engine` defaults to "burn" below (default cargo build, no --features
+# llamacpp). FP32 only (quantization != "none" is rejected), single GPU per
+# worker. Experimental/reference path — GGUF/llama.cpp above is primary.
 
 # DeepSeek Models
 # ===============

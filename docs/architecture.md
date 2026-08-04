@@ -8,7 +8,7 @@
 5. [Parallelism Strategies](#parallelism-strategies)
 6. [Deployment Architecture](#deployment-architecture)
 7. [Performance Considerations](#performance-considerations)
-8. [Security Architecture](#security-architecture-roadmap)
+8. [Security Architecture](#security-architecture)
 9. [Monitoring & Observability](#monitoring--observability)
 10. [Fault Tolerance](#fault-tolerance)
 
@@ -129,7 +129,7 @@ The coordinator is the brain of the cluster, written in Python using FastAPI.
 - **Load Balancing**: Distribute load across workers
 - **Health Monitoring**: Track worker health and availability
 - **Model Registry**: Manage available models and their locations
-- **API request handling** (authentication/rate limiting are planned, not implemented)
+- **API request handling** (API-key auth is implemented, opt-in; rate limiting is still planned)
 - **Metrics Collection**: Expose Prometheus metrics
 
 #### Internal Architecture:
@@ -468,7 +468,11 @@ Micro-batching for efficiency:
 
 ### 2. Tensor Parallelism (Core Implemented — Service Wiring Pending)
 
-Splits individual tensors across multiple GPUs.
+Splits individual tensors across multiple GPUs. `num_shards == 1` is
+mathematically identical to the non-parallel forward pass. GQA requires
+`num_shards` to evenly divide `num_kv_heads`; a non-divisor request is
+silently clamped down to the nearest valid value (`clamp_shards`, which
+logs a warning on clamp).
 
 ```
                     Tensor Parallelism
@@ -694,37 +698,48 @@ spec:
 
 ---
 
-## Security Architecture (Roadmap)
+## Security Architecture
 
-> None of the controls in this section are implemented yet: transport is plaintext gRPC/HTTP, there is no authN/Z, rate limiting, audit logging, or secure erasure. Deploy on trusted networks only.
+> Implemented today: secure-by-default bind hosts, coordinator API-key auth,
+> worker gRPC shared-secret auth. Not implemented: TLS/mTLS (transport is
+> plaintext gRPC/HTTP — deploy on a trusted network or behind your own TLS
+> proxy), rate limiting, audit logging, secure erasure.
 
-### 1. Authentication & Authorization
+### 1. Authentication & Authorization (implemented, opt-in)
+
+- **Coordinator**: `COORDINATOR_API_KEYS` gates the whole HTTP surface except
+  `/health`/`/metrics` (`Authorization: Bearer <key>` or `x-api-key: <key>`).
+  The coordinator refuses to start bound to a non-loopback address with no
+  keys set.
+- **Worker gRPC**: `WORKER_GRPC_AUTH_TOKEN` (or `grpc_auth_token` in
+  `worker.toml`) is a shared secret checked on every gRPC call; the worker
+  logs a warning if it binds non-loopback with no token set.
+- **Bind hosts default to loopback**: worker gRPC (`grpc_bind_host`) and
+  spawned `llama-server` children (`llamaserver_bind_host`) both default to
+  `127.0.0.1`. Containers opt in via `WORKER_GRPC_BIND_HOST` /
+  `LLAMASERVER_BIND_HOST`. See [configuration.md](configuration.md) and
+  [deployment.md](deployment.md).
 
 ```
-┌──────────┐      ┌──────────┐      ┌──────────┐      ┌──────────┐
-│  Client  │─────▶│  API     │─────▶│  Auth    │─────▶│ Worker   │
-│          │      │ Gateway  │      │ Service  │      │          │
-└──────────┘      └──────────┘      └──────────┘      └──────────┘
-     │                 │                 │                 │
-     │ API Key         │ Validate        │                 │
-     │────────────────>│────────────────>│                 │
-     │                 │                 │                 │
-     │                 │ Token           │                 │
-     │                 │<────────────────│                 │
-     │                 │                 │                 │
-     │ Request + Token │                 │ Request + Token │
-     │<────────────────│                 │────────────────>│
-     │                 │                 │                 │
-     │ Response        │                 │ Response        │
-     │────────────────>│                 │<────────────────│
+┌──────────┐      ┌──────────────┐      ┌──────────┐
+│  Client  │─────▶│ Coordinator  │─────▶│ Worker   │
+│          │      │ (API keys)   │      │ (gRPC    │
+│          │      │              │      │  token)  │
+└──────────┘      └──────────────┘      └──────────┘
+     │                 │                     │
+     │ Bearer/x-api-key│                     │
+     │────────────────>│  gRPC + shared      │
+     │                 │  secret metadata    │
+     │                 │────────────────────>│
 ```
 
 ### 2. Network Security
 
-- **TLS Encryption**: All gRPC and HTTP traffic encrypted
-- **mTLS**: Worker-coordinator mutual authentication
-- **Network Policies**: Kubernetes network policies for isolation
-- **API Rate Limiting**: Prevent abuse and DoS attacks
+- **TLS/mTLS**: not implemented — gRPC and HTTP traffic is plaintext.
+  Deploy on a trusted network or terminate TLS with your own reverse proxy.
+- **Network Policies**: Kubernetes network policies are part of the
+  not-yet-shipped Kubernetes manifests.
+- **API Rate Limiting**: planned, not implemented.
 
 ### 3. Data Security
 
@@ -892,8 +907,9 @@ more cards/machines when it doesn't. Honest status, as of this doc:
   on the Burn path); multi-GPU GGUF split is not yet exposed either
 - **Deployment Today**: Docker Compose and native builds; Kubernetes manifests
   are a design sketch, not shipped
-- **Not Production-Hardened**: no auth, no TLS by default — see
-  [Security Architecture](#security-architecture-roadmap)
+- **Secure by Default, Opt-in to Exposure**: loopback binds and API-key/gRPC-token
+  auth ship today; TLS/mTLS and rate limiting do not — see
+  [Security Architecture](#security-architecture)
 
 For more information, see:
 - [API Reference](api_reference.md)

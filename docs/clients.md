@@ -1,4 +1,4 @@
-# Client Setup — Agentic Serving (Plan 13)
+# Client Setup — Agentic Serving
 
 Practical, copy-pasteable configuration for pointing common coding clients at the AI Cluster
 coordinator over your LAN. This assumes the coordinator is already running and at least one
@@ -30,8 +30,9 @@ To sanity-check the server before configuring a client, run
 
 "Needs native tool calling" means the client requires the server to actually execute
 llama.cpp's tool-calling grammar and return `tool_calls` / `tool_use` blocks — only
-`engine = "llamaserver"` models support this (see the Plan 13 Contract in
-`pending-work/13-agentic-serving-llama-server.md`). Clients marked "No" work against any
+`engine = "llamaserver"` models support this (see
+`pending-work/13-agentic-serving-llama-server.md` for the underlying contract).
+Clients marked "No" work against any
 model the coordinator serves, including the in-process `llamacpp`/`burn` engines, because
 they never send a `tools` field.
 
