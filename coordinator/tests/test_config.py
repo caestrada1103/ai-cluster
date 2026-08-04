@@ -100,6 +100,15 @@ def test_settings_ignores_unknown_dotenv_keys(tmp_path: Path) -> None:
     assert s.port == 8123
 
 
+def test_cors_origins_default_is_empty_not_wildcard() -> None:
+    """M3: secure by default — no explicit cross-origin allowance out of the
+    box. main.py additionally applies an always-on loopback regex, but that
+    is a separate, narrower allowance covered by test_main.py, not this
+    field's own default."""
+    s = make_settings()
+    assert s.cors_origins == []
+
+
 def test_cors_origins_star_from_env(tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text("COORDINATOR_CORS_ORIGINS=*\n")
