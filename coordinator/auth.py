@@ -16,12 +16,8 @@ Behavior:
   liveness (``/health``) and Prometheus (``/metrics``) endpoints, which stay
   reachable for infra probes/scrapers that don't carry credentials.
 
-LAN-trust note: this is a single shared-secret gate suitable for a trusted
-LAN deployment behind a firewall/VPN. It does not provide TLS, per-client or
-per-job keys, rotation, or replay protection, and the key travels in plain
-HTTP headers. See ``pending-work/15-*.md`` ("Plan 15") Phase B for TLS
-termination and per-job keys; this module implements Phase A only (folded
-into Plan 13 Task 3).
+A single shared secret over plain HTTP: no TLS, no per-client keys, no rotation
+or replay protection. Deploy behind a firewall or VPN. See docs/configuration.md.
 """
 
 from __future__ import annotations
@@ -84,10 +80,23 @@ def _matches_any(candidate: str, valid_keys: FrozenSet[str]) -> bool:
     to avoid leaking key contents via a timing side channel, and checks
     every key rather than returning on the first match so the match's
     position in the set doesn't leak either.
+
+    L1: ``compare_digest`` requires its ``str`` arguments to be ASCII-only —
+    it raises ``TypeError`` otherwise — but ``candidate`` comes straight from
+    a caller-supplied HTTP header, which can legally carry non-ASCII bytes
+    (ASGI header values are latin-1-decoded, so any byte sequence decodes
+    without error but can land outside the ASCII range). An unhandled
+    ``TypeError`` here previously surfaced as an unstyled 500 instead of the
+    intended 401. Comparing UTF-8-encoded ``bytes`` instead sidesteps the
+    ASCII restriction entirely (bytes-like objects have none) while still
+    comparing every candidate byte-for-byte against every configured key.
     """
+    # UTF-8 can encode any Unicode code point (including the 0x00-0xFF range
+    # ASGI's latin-1 header decoding produces), so this never raises.
+    candidate_bytes = candidate.encode("utf-8")
     matched = False
     for key in valid_keys:
-        if secrets.compare_digest(candidate, key):
+        if secrets.compare_digest(candidate_bytes, key.encode("utf-8")):
             matched = True
     return matched
 
@@ -115,6 +124,23 @@ class APIKeyAuthMiddleware:
             return
 
         if _is_exempt(scope["path"]):
+            await self.app(scope, receive, send)
+            return
+
+        # L2: a CORS preflight (`OPTIONS`) never carries the caller's real
+        # credentials — browsers deliberately send it bare — so gating it
+        # behind the API key just makes it fail with 401 before
+        # ``CORSMiddleware`` ever runs, which the browser then reports as a
+        # CORS failure on the REAL request (its console error points at CORS,
+        # not auth, which is exactly why this was easy to miss). This bypass
+        # is independent of middleware registration order — see
+        # ``main.py``'s comment on why `CORSMiddleware` is also registered to
+        # wrap this middleware, not the other way around, but this makes the
+        # preflight bypass correct even if a future refactor gets the order
+        # wrong again. The actual (non-OPTIONS) request that follows a
+        # preflight is still fully authenticated below, same as any other
+        # method.
+        if scope["method"] == "OPTIONS":
             await self.app(scope, receive, send)
             return
 
