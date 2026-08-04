@@ -181,10 +181,30 @@ amd-node-3 = [0]
 # Anthropic tool calling (native chat templates, GBNF grammars, streaming
 # tool-call parsing) — the in-process engine cannot do this (see Plan 13
 # "Why"). Same `[models.X.gguf]` sub-table/fields as the llamacpp engine
-# (`repo_id`, `file`, `n_ctx`, `cache_type_k`/`cache_type_v`); `n_gpu_layers`
-# is omitted below because the llamaserver worker spawn always passes a fixed
-# `-ngl 999` (full GPU offload — see the Contract in pending-work/13), unlike
-# the in-process llamacpp engine above which honors `gguf.n_gpu_layers`.
+# (`repo_id`, `file`, `n_ctx`, `cache_type_k`/`cache_type_v`, and now also
+# `n_gpu_layers` — see below).
+#
+# CORRECTED 2026-08-03 (hardware verification on the DGX Spark tier below):
+# the llamaserver worker spawn no longer hardcodes `-ngl 999`. It now honors
+# `gguf.n_gpu_layers` exactly like the in-process llamacpp engine (`-1` /
+# omitted = all layers, today's unchanged default) — this is the
+# partial-offload knob AICluster's actual consumer-GPU target (8-16 GB VRAM
+# cards) needs when a model does not fit entirely on-GPU. A first-class
+# `n_cpu_moe` field (-> `--n-cpu-moe <N>`, llama.cpp's MoE-expert CPU-offload
+# knob) also now exists worker-side for the same `[models.X.gguf]` table;
+# `coordinator/models.py` forwards it as the `n_cpu_moe` gRPC metadata key, so
+# it works end-to-end — prefer it over stuffing `--n-cpu-moe N` into the
+# untyped `llamaserver.extra_args` string, which is whitespace-split and
+# appended verbatim to the child process argv without validation.
+#
+# Also CORRECTED 2026-08-03 (see the "HIGHEST PRIORITY" note on the
+# `qwen3.6-35b-a3b-gguf` entry below): `n_ctx` in this table means the
+# **per-conversation/slot** context, not a raw `-c` passthrough — the worker
+# multiplies it by `parallel` before invoking `llama-server`, because
+# `llama-server` itself divides `-c` evenly across `--parallel` slots. Every
+# entry's `n_ctx` below should be read as "what one conversation actually
+# gets", and `min_memory_gb`/KV-cache comments account for `n_ctx * parallel`
+# total context, not just `n_ctx`.
 #
 # New fields consumed by the worker's llama-server spawn, added in this same
 # Plan 13 increment by a parallel task (`coordinator/models.py` /
@@ -222,10 +242,15 @@ engine = "llamaserver"
 # Q4_K_M quantizations if this mirror ever disappears.
 repo_id = "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF"
 file = "Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"  # single file, 14.3 GiB (not ~14.5 GiB — corrected against the verified HF listing)
+# n_ctx is PER CONVERSATION/SLOT (see the section-header note above): the
+# worker passes `-c (n_ctx * parallel)` to llama-server, so with parallel = 1
+# below, 16384 is also the raw `-c` value — unaffected by the fix 1
+# correction (2026-08-03), since parallel was already 1 here.
 n_ctx = 16384
-# VRAM math (16 GB card; llamaserver worker spawn always uses -ngl 999, i.e.
-# full GPU offload — there is no partial-offload knob on this engine path
-# today):
+# VRAM math (16 GB card). `n_gpu_layers` is left unset (defaults to "all",
+# `-ngl 999`) because the full Q4_K_M weight set already fits: partial
+# offload is available on this engine now (`[.gguf] n_gpu_layers`, mirroring
+# the in-process llamacpp engine) but is not needed for THIS model/card pair.
 #   Q4_K_M weights                    ~14.3 GB
 #   remaining for KV cache + compute   ~1.0-1.7 GB  <- razor thin
 # cache_type_k/v = "q8_0" halves the fp16-default KV footprint, which is what
@@ -233,22 +258,22 @@ n_ctx = 16384
 # (q4_0) is possible (see _ALLOWED_KV_CACHE_TYPES in coordinator/models.py)
 # but trades noticeable quality for a model already this VRAM-starved, so
 # q8_0 is the honest floor here, not q4_0.
-# To raise n_ctx beyond 16384 without a bigger card: (a) add a partial-CPU-
-# offload knob to the llamaserver engine (not built yet — `-ngl 999` is
-# currently hardcoded per the Plan 13 Contract) so some layers move to system
-# RAM, trading tokens/sec for headroom; or (b) move this model to a 24 GB+
-# card. There is no free lunch left in KV quantization alone at this weight
-# size.
+# To raise n_ctx beyond 16384 without a bigger card: (a) set `n_gpu_layers`
+# below "all" to move some layers to system RAM, trading tokens/sec for KV
+# headroom (the partial-offload knob fix 2 added); or (b) move this model to
+# a 24 GB+ card. There is no free lunch left in KV quantization alone at this
+# weight size.
 cache_type_k = "q8_0"
 cache_type_v = "q8_0"
 
 [models."devstral-small-2-24b-instruct-gguf".llamaserver]
 port = 8081
-# parallel = 1: the ~1 GB KV-cache budget above is computed for ONE
-# 16384-token sequence. llama-server splits `-c` (n_ctx) evenly across
-# `--parallel` slots, so raising this would shrink per-request context
-# further on a card with no headroom to spare — leave at 1 until a bigger
-# card is available.
+# parallel = 1: the ~1 GB KV-cache budget above is sized for ONE 16384-token
+# conversation. CORRECTED 2026-08-03: the worker now passes
+# `-c (n_ctx * parallel)`, so raising `parallel` no longer shrinks per-slot
+# context the way it silently used to — it costs `parallel` times the KV
+# footprint instead (a second slot would need a second ~1 GB share this card
+# does not have). Leave at 1 until a bigger card is available.
 parallel = 1
 
 [models."qwen3-coder-30b-a3b-instruct-gguf"]
@@ -268,29 +293,174 @@ engine = "llamaserver"
 # llama.cpp-authoritative source for other quant levels if needed.
 repo_id = "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF"
 file = "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"  # single file, 18.6 GiB
+# n_ctx is PER CONVERSATION/SLOT (see the section-header note above). This
+# was previously paired with parallel = 2, which — under the pre-2026-08-03
+# bug where the worker passed `n_ctx` straight through as `-c` — meant
+# llama-server actually divided 32768 into two 16384-token slots, HALF of
+# what this file claimed. Fixed 2026-08-03 by dropping parallel to 1 (below)
+# rather than raising VRAM usage: -c stays 32768 either way, but now ONE
+# conversation gets the full, promised 32768 tokens instead of two
+# conversations silently getting 16384 each.
 n_ctx = 32768
 cache_type_k = "q8_0"
 cache_type_v = "q8_0"
+# MoE expert CPU-offload: keeps the first 40 layers' expert tensors on the
+# CPU so the model fits a 16 GB card. Typed field (validated as an integer at
+# registry load) — replaces the previous `extra_args = "--n-cpu-moe 40"`.
+n_cpu_moe = 40
 
 [models."qwen3-coder-30b-a3b-instruct-gguf".llamaserver]
 port = 8082
-parallel = 2
+# parallel = 1 (CORRECTED 2026-08-03, was 2): with the fix-1 worker
+# (`-c = n_ctx * parallel`), parallel = 2 would need `-c 65536` — DOUBLE the
+# total KV footprint of the razor-thin 16 GB budget below — just to keep the
+# per-slot context this entry already promises. parallel = 1 keeps `-c 32768`
+# (byte-for-byte the same total KV cost as before the fix) while actually
+# delivering the full 32768 tokens to that one conversation, instead of
+# silently splitting it. Raise parallel again only after confirming headroom
+# on real hardware (a bigger card, or a larger --n-cpu-moe N below to free
+# more VRAM for KV).
+parallel = 1
 # 18.6 GB of Q4_K_M weights alone does not fit a 16 GB card even before KV
 # cache, so MoE expert tensors must be partially offloaded to system RAM.
 # `--n-cpu-moe N` is the current llama-server flag for this (verified
 # 2026-07-10 against ggml-org/llama.cpp's tools/server/README.md: short form
 # `-ncmoe`, env `LLAMA_ARG_N_CPU_MOE`, "keep the Mixture of Experts (MoE)
-# weights of the first N layers in the CPU"; `-ngl 999`, always passed by the
-# llamaserver worker spawn, still puts every non-expert tensor + any
-# non-offloaded experts on GPU). The model has 48 transformer layers; N=40
-# below is a conservative starting point (experts for the last ~8 layers stay
-# on GPU) chosen to comfortably clear the VRAM budget on a first load, NOT a
-# hardware-measured optimum — watch actual VRAM at load time and lower N
-# (more experts on GPU, faster) if headroom allows, following the tuning
-# method at https://huggingface.co/blog/Doctor-Shotgun/llamacpp-moe-offload-guide.
+# weights of the first N layers in the CPU"; every non-expert tensor + any
+# non-offloaded experts still go to GPU via `n_gpu_layers`, left unset here =
+# "all"). The model has 48 transformer layers; N=40 below is a conservative
+# starting point (experts for the last ~8 layers stay on GPU) chosen to
+# comfortably clear the VRAM budget on a first load, NOT a hardware-measured
+# optimum — watch actual VRAM at load time and lower N (more experts on GPU,
+# faster) if headroom allows, following the tuning method at
+# https://huggingface.co/blog/Doctor-Shotgun/llamacpp-moe-offload-guide.
 # If N=40 still OOMs, the safe fallback is the blunter `--cpu-moe` (all
 # experts on CPU — guaranteed to fit, slower).
-extra_args = "--n-cpu-moe 40"
+#
+# Moved to the first-class `n_cpu_moe` field in this entry's `[.gguf]` table
+# (see above) now that `coordinator/models.py` forwards it as the `n_cpu_moe`
+# gRPC metadata key. Prefer the typed field over the untyped `extra_args`
+# string: it is validated as an integer at registry-load time instead of being
+# whitespace-split and appended verbatim to the child process argv.
+
+# --- DGX Spark tier (ACTIVE) --------------------------------------------
+# Enabled 2026-08-03 on real hardware (host gx10-ba73, GB10, 121.6 GiB
+# unified). Unlike the three commented-out entries below, this one is a
+# SINGLE-FILE GGUF, so it needs no multi-shard download support — verified
+# against the HF API 2026-08-03: unsloth/Qwen3.6-35B-A3B-GGUF contains
+# "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf" as one 22.36 GB file.
+#
+# Engine is "llamaserver" (worker-supervised child process, proxied over HTTP
+# by the coordinator) rather than the in-process "llamacpp" engine, to get
+# real tool calling / agentic clients — the in-process engine cannot do that
+# (see Plan 13's rationale). A `llama-server` binary (llama.cpp tag b9941,
+# CUDA) is being built in ~/llama.cpp and installed to
+# ~/.local/bin/llama-server on this host (Plan 16 Task 6/7); set
+# `llamaserver_binary_path`/`LLAMASERVER_BINARY_PATH` in worker.toml/env to
+# that path if it is not also placed on PATH.
+#
+# Architecture support verified: the GGUF arch is `qwen35moe`, which the
+# vendored llama.cpp in llama-cpp-sys-2 =0.1.150 knows (alongside `qwen3next`
+# for the Qwen3-Coder-Next entry below).
+[models."qwen3.6-35b-a3b-gguf"]
+family = "qwen"
+description = "Qwen3.6-35B-A3B — MoE (35B total / 3B active), Apache 2.0. Same active-parameter class as qwen3-coder-30b-a3b, so comparable generation speed on bandwidth-bound hardware, but a newer and stronger model. Single-file Q4_K_XL (22.36 GB). Source: https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF"
+parameters = "35B-A3B"
+# 22.4 GB weights + ~10.9 GB KV cache at parallel=4 (see the [.llamaserver]
+# block below for the full arithmetic) = ~33.3 GB.
+min_memory_gb = 34
+recommended_gpus = 1
+max_gpus = 1
+engine = "llamaserver"
+
+[models."qwen3.6-35b-a3b-gguf".gguf]
+repo_id = "unsloth/Qwen3.6-35B-A3B-GGUF"
+file = "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+# n_gpu_layers is omitted here (defaults to "all", `-ngl 999`) — this host's
+# 121 GiB unified memory comfortably fits every layer, so there is no reason
+# to partially offload. The knob exists (mirrors the in-process llamacpp
+# engine's `n_gpu_layers`) for the 8-16 GB consumer-GPU tier, not this one.
+#
+# n_ctx here is the PER-CONVERSATION/SLOT window (see the section-header note
+# above), set to the FULL 262144 native window (n_ctx_train verified 262144
+# from the loaded model) — the user requirement this fix exists for: a
+# model's own trained context is the ceiling, and it should actually be
+# delivered per conversation, not silently divided by `parallel`. Cheap here
+# because Qwen3.6 is hybrid-attention: only ~1 layer in 4 holds a real KV
+# cache, the rest use a fixed ~63 MiB recurrent buffer that does NOT grow
+# with context. Measured: 1360 MiB KV at 131072 TOTAL context; 2720 MiB KV at
+# 262144 TOTAL context (linear, as expected — see the [.llamaserver]
+# `parallel` comment below for the corrected total-context arithmetic this
+# implies once `parallel > 1`).
+n_ctx = 262144
+# q8_0 roughly halves KV vs the f16 default — with 48 layers at 128K context
+# this is the difference between ~13 GB and ~7 GB of cache.
+cache_type_k = "q8_0"
+cache_type_v = "q8_0"
+
+[models."qwen3.6-35b-a3b-gguf".llamaserver]
+# Reasoning DISABLED by default. Qwen3.6 is a reasoning model: with thinking
+# on, llama-server puts the chain-of-thought in `message.reasoning_content`
+# and leaves `message.content` EMPTY until thinking finishes. Measured on this
+# host 2026-08-03: the prompt "Say hello in 3 words" burned all 900 max_tokens
+# on thinking and still returned content="" with finish_reason="length".
+# That breaks every client that reads `content` (which is most of them,
+# including the repo's own scripts/validate_agentic.py checks c and d).
+# With `--reasoning off` the same prompt returns "Hello there, friend!" in 6
+# tokens, finish_reason="stop".
+# To re-enable thinking (better quality on hard coding problems, at the cost
+# of needing a much larger max_tokens and a reasoning_content-aware client),
+# drop this flag or use `--reasoning-budget N` to cap it instead of `off`.
+# Per-request override without a reload: pass
+# {"chat_template_kwargs": {"enable_thinking": true}} in the request body.
+extra_args = "--reasoning off"
+# Next free llamaserver_port: 8081 (devstral-small-2-24b-instruct-gguf) and
+# 8082 (qwen3-coder-30b-a3b-instruct-gguf) are already taken above, and
+# 8083-8085 are pre-reserved by the three commented-out Spark placeholders
+# further down this file — so this is the first genuinely free port.
+port = 8086
+# parallel = 4 sizing arithmetic — CORRECTED 2026-08-03 after hardware
+# verification. Ground truth, measured on this host: `llama-server` divides
+# its OWN `-c` value EVENLY across `--parallel` slots. With the un-fixed
+# worker (raw `n_ctx` passed straight through as `-c 262144`, `parallel 4`),
+# `GET /props` reported `n_ctx: 65536, total_slots: 4` — i.e. 262144/4, so
+# each conversation got only 64K tokens, a QUARTER of what this file
+# appeared to promise. Total KV was measured CONSTANT at 2720 MiB regardless
+# of `parallel` (KV scales with the TOTAL `-c` value, not per-slot) — so the
+# PREVIOUS version of this comment ("worst case each slot allocates a full
+# independent KV cache") was describing the exact opposite of the real
+# mechanism and arrived at ~10.9 GiB by accident, for the wrong reason.
+#
+# Fix: `worker/src/llamaserver_process.rs` `build_args()` now passes
+# `-c (n_ctx * parallel)`, so llama-server's own division reproduces exactly
+# `n_ctx` = 262144 tokens per slot — the registry's `n_ctx` means PER
+# CONVERSATION, honoring "the model's native n_ctx_train is the ceiling AND
+# what gets delivered, never silently shrunk". The worker logs the resolved
+# per-slot/total context at load time and cross-checks it against
+# llama-server's own `/props` after health-check (`LlamaServerProcess::
+# verify_props`), so a future regression here is loud, not silent.
+#
+# Corrected KV arithmetic (linear in TOTAL context, per the two measured data
+# points above: 1360 MiB @ 131072 total, 2720 MiB @ 262144 total):
+#   n_ctx (per slot)                                     262144
+#   parallel                                                  4
+#   total context (-c actually passed)      262144 x 4 = 1048576
+#   KV @ 1048576 total context      2720 MiB x 4  = 10880 MiB (~10.6 GiB)
+#   Q4_K_XL weights                                     ~22.4 GB
+#   ------------------------------------------------------------------
+#   total                                                 ~33 GB
+# against this host's 121 GiB unified memory (GB10 DGX Spark, host
+# gx10-ba73) — under 30%, leaving ~88 GiB of headroom for the OS, coordinator,
+# worker process, Docker, and any other concurrently-loaded model (matches
+# min_memory_gb = 34 above — this arithmetic is what that figure was already
+# computed from). Even parallel = 8 (~21.8 GiB KV, ~44 GB total) would stay
+# comfortably safe on this box. parallel = 4 is chosen to match
+# DEFAULT_PARALLEL (worker/src/llamaserver_process.rs) and the other
+# (currently commented-out) Spark-tier entries below for consistency, not
+# because 4 is a memory ceiling — unlike the 16 GB AMD fleet above, where
+# every KV byte is accounted for against a razor-thin budget, there is no
+# such ceiling here.
+parallel = 4
 
 # --- DGX Spark tier (enable on arrival, Plan 16) — commented out --------
 # Each DGX Spark has 128 GB *unified* CPU+GPU memory (NOT a discrete VRAM
@@ -302,15 +472,16 @@ extra_args = "--n-cpu-moe 40"
 # 8082 above). SWE-bench Verified figures below all independently
 # web-verified 2026-07-10 (sources in each entry's comment).
 #
-# CAVEAT (uncomment-blocker): all three GGUFs are split into multiple shard
-# files (HF's per-file size limit for models this large). The worker's
-# current GGUF fetch path (`worker/src/model_loader.rs`) downloads exactly
-# ONE `gguf.file` per model via `hf-hub` — it does not yet fetch sibling
-# shards. llama.cpp itself will auto-load the remaining shards once given the
-# first shard's local path, but only if all shard files are already present
-# next to it — so either extend the worker's download path to fetch every
-# shard first, or pre-stage them by hand in the worker's HF cache dir, before
-# uncommenting any of these.
+# CAVEAT (uncomment-blocker) — RESOLVED 2026-08-03: all three GGUFs are split
+# into multiple shard files (HF's per-file size limit for models this large).
+# `worker/src/model_loader.rs` now detects the `<prefix>-%05d-of-%05d.gguf`
+# naming convention (`gguf_shard_filenames`/`parse_shard_suffix`) and
+# downloads every sibling shard before handing the first one's local path to
+# llama.cpp — this used to be a hard blocker (the fetch path only ever
+# downloaded the ONE configured `gguf.file`) and no longer is. The remaining
+# blockers before uncommenting any of these are unrelated to downloading:
+# (a) no second real Spark node has been used to verify load+serve yet on
+# actual hardware, and (b) the family-field gap noted below.
 #
 # CAVEAT (family field): `gpt-oss` and `GLM` are not in coordinator/models.py's
 # `ModelFamily` enum (DEEPSEEK/LLAMA/MISTRAL/PHI/GEMMA/QWEN only) — the two
