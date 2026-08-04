@@ -1,4 +1,4 @@
-"""Tests for coordinator.body_limit — H5 request-body size cap."""
+"""Tests for coordinator.body_limit — request-body size cap."""
 
 from typing import List
 

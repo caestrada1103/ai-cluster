@@ -1,12 +1,8 @@
-"""Tests for coordinator.main — CORS defaults (M3) and the C4 insecure-bind
-refusal.
+"""Tests for coordinator.main — CORS defaults and the insecure-bind refusal.
 
-The `_refuse_insecure_bind`/`_is_loopback_host` checks are exercised as pure
-functions here rather than through the app's real `lifespan` (entering that
-would require a live/fake gRPC worker stack); `test_auth.py` already
-documents why this suite's `TestClient` is never entered as a context
-manager, so importing `coordinator.main` here is safe regardless of the host
-in the ambient environment.
+`_refuse_insecure_bind`/`_is_loopback_host` are exercised as pure functions
+rather than through the app's real `lifespan` (see test_auth.py for why
+`TestClient` is never entered as a context manager here).
 """
 
 import pytest
@@ -45,7 +41,7 @@ def test_is_loopback_host_rejects_non_loopback_forms(host: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _refuse_insecure_bind (C4)
+# _refuse_insecure_bind
 # ---------------------------------------------------------------------------
 
 
@@ -69,7 +65,7 @@ def test_allows_loopback_host_with_no_keys(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 # ---------------------------------------------------------------------------
-# M3: CORS defaults to loopback, not "*"
+# CORS defaults to loopback, not "*"
 # ---------------------------------------------------------------------------
 
 
@@ -101,7 +97,7 @@ def test_cors_preflight_allows_loopback_origin_by_default() -> None:
 
 
 # ---------------------------------------------------------------------------
-# H5: request-body size cap is wired into the real app
+# Request-body size cap is wired into the real app
 # ---------------------------------------------------------------------------
 
 

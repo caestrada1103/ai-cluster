@@ -1,19 +1,13 @@
-"""Transparent HTTP proxy to worker-local llama-server instances (Plan 13 Task 2).
+"""Transparent HTTP proxy to worker-local llama-server instances.
 
-Models whose registry ``engine == "llamaserver"`` are served by a ``llama-server``
-child process running next to a worker (supervised over the existing gRPC load
-path — see ``pending-work/13-agentic-serving-llama-server.md``). Rather than
-model every OpenAI/Anthropic field in pydantic, the coordinator forwards the RAW
-request bytes to that llama-server and streams the response back verbatim, so
-``tools``, ``tool_choice``, streaming ``tool_calls``, Anthropic ``thinking``
-blocks and any future field flow through unmodified and stay forward-compatible.
+``engine == "llamaserver"`` models are served by a ``llama-server`` child
+process next to a worker. Request bytes are forwarded raw (never
+re-serialized) so ``tools``, streaming ``tool_calls``, and any other field
+pass through unmodified.
 
-``proxy_request()`` is the single entry point: it returns a
-``BufferedProxyResponse`` for ordinary JSON replies (and for synthesized 502
-connect errors) and a ``StreamingProxyResponse`` — a live async byte iterator
-plus the upstream status/headers the caller needs to build a
-``fastapi.responses.StreamingResponse`` — for Server-Sent Events, which it never
-buffers.
+``proxy_request()`` is the single entry point: a ``BufferedProxyResponse``
+for ordinary JSON replies (or a synthesized 502), or a
+``StreamingProxyResponse`` (unbuffered async byte iterator) for SSE.
 """
 
 from __future__ import annotations
@@ -67,12 +61,10 @@ ProxyResponse = Union[BufferedProxyResponse, StreamingProxyResponse]
 
 
 def _request_timeout(stream: bool) -> httpx.Timeout:
-    """Reuse the coordinator's existing request-timeout setting for the proxy.
+    """Reuse the coordinator's request-timeout setting for the proxy.
 
-    Read at call time (per the Plan 13 contract) so a redeploy that changes
-    ``COORDINATOR_REQUEST_TIMEOUT`` takes effect without touching this module.
-    Streaming replies disable the read timeout: an agentic tool call may idle
-    between SSE tokens far longer than a single unary request would.
+    Streaming replies disable the read timeout: a tool call may idle between
+    SSE tokens far longer than a single unary request would.
     """
     from coordinator.config import Settings
 
@@ -81,23 +73,17 @@ def _request_timeout(stream: bool) -> httpx.Timeout:
     return httpx.Timeout(timeout, read=read)
 
 
-#: M2 — the coordinator's own auth credential (a client's ``Authorization``/
-#: ``x-api-key``, or any session ``Cookie``) must never leave the coordinator.
-#: llama-server has no concept of these — forwarding them upstream just leaks
-#: the caller's credential to a second process for no benefit, and (worse) a
-#: worker-local llama-server is reachable by anyone who can already reach the
-#: worker host, so a leaked credential there is a bigger blast radius than
-#: "unused header".
+#: The coordinator's own auth credential must never leave the coordinator —
+#: llama-server has no concept of it and forwarding it upstream only leaks it.
 _CREDENTIAL_HEADERS: frozenset[str] = frozenset({"authorization", "x-api-key", "cookie"})
 
 
 def filter_request_headers(headers: Mapping[str, str]) -> Dict[str, str]:
     """Build the forward set of REQUEST headers for the upstream llama-server.
 
-    Forwards Content-Type (so llama-server parses the JSON body) and every other
-    client header except hop-by-hop ones, ``host``/``content-length`` (httpx
-    re-derives those for the upstream connection), and credential headers (M2 —
-    see ``_CREDENTIAL_HEADERS``).
+    Forwards Content-Type and every other client header except hop-by-hop
+    ones, ``host``/``content-length`` (httpx re-derives those), and
+    credential headers (see ``_CREDENTIAL_HEADERS``).
     """
     dropped = _HOP_BY_HOP | {"host", "content-length"} | _CREDENTIAL_HEADERS
     return {k: v for k, v in headers.items() if k.lower() not in dropped}

@@ -1,10 +1,6 @@
-"""Route-level test for H4: POST /v1/models/load must 404 an unregistered
-model_name by default instead of letting it fall through to
-ClusterCoordinator._load_model_on_worker's HuggingFace-pull path.
-
-Same fake-coordinator-injected-into-app.state pattern as
-test_workers_manual.py (see that file's module docstring for why entering
-the real lifespan isn't needed/wanted here).
+"""Route-level test: POST /v1/models/load must 404 an unregistered
+model_name by default instead of falling through to the HuggingFace-pull
+path. Same fake-coordinator pattern as test_workers_manual.py.
 """
 
 from types import SimpleNamespace
@@ -52,8 +48,8 @@ def test_load_model_rejects_unregistered_model_by_default() -> None:
 
 
 def test_load_model_unexpected_error_does_not_leak_exception_text() -> None:
-    """M12: a genuine internal error must never echo str(exc) to the client
-    — only "Internal server error", with the real detail logged server-side."""
+    """A genuine internal error must never echo str(exc) to the client —
+    only "Internal server error", with the real detail logged server-side."""
     settings = make_settings()
     fake_worker = SimpleNamespace(id="w1")
     secret_detail = "connection refused to internal-db-host:5432 (leaky!)"

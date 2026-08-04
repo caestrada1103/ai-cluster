@@ -104,10 +104,8 @@ class LoadModelRequest(BaseModel):
     model_name: str
     worker_id: Optional[str] = None
     quantization: str = "none"  # only "none" is accepted by workers today; others are planned
-    # Concurrent conversation slots for an engine="llamaserver" model, overriding
-    # the registry's `instances`/`parallel` value for this load only. Costs
-    # memory (worker refuses the load if it doesn't fit) — not applicable to
-    # other engines.
+    # Conversation slots for an engine="llamaserver" model, overriding the
+    # registry's `instances` value for this load only.
     instances: Optional[int] = Field(default=None, ge=1)
 
 
@@ -182,7 +180,7 @@ def _parse_model_and_worker(model_string: str) -> tuple[str, Optional[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Engine dispatch + transparent llama-server proxy (Plan 13 Task 2)
+# Engine dispatch + transparent llama-server proxy
 # ---------------------------------------------------------------------------
 
 
@@ -236,7 +234,7 @@ def _worker_host(address: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# C3: POST /v1/workers/manual address validation
+# POST /v1/workers/manual address validation
 # ---------------------------------------------------------------------------
 
 #: Hard cap on addresses accepted in a single POST /v1/workers/manual call.
@@ -338,12 +336,9 @@ def _not_loaded_detail(model_name: str) -> str:
 async def _resolve_llamaserver_worker(coordinator: Any, model_cfg: ModelConfig) -> Any:
     """Find — or, when auto-load is on, load — a worker serving ``model_cfg``.
 
-    Plan 13 Task 5. The already-loaded common case takes the fast path
-    (``find_worker_for_model``) untouched. When no worker reports the model
-    loaded, ``settings.llamaserver_autoload`` decides: True (default) triggers
-    the coordinator's single-flight auto-load and returns the freshly-loaded
-    worker (a load failure/timeout surfaces as 503); False preserves the
-    Phase-1 behavior — 404 pointing at ``POST /v1/models/load``.
+    When no worker reports the model loaded, ``settings.llamaserver_autoload``
+    decides: True (default) auto-loads (a failure surfaces as 503); False
+    404s pointing at ``POST /v1/models/load``.
     """
     worker = await coordinator.find_worker_for_model(model_cfg.name)
     if worker is not None:
@@ -364,24 +359,17 @@ async def _resolve_llamaserver_worker(coordinator: Any, model_cfg: ModelConfig) 
         ) from exc
 
 
-#: H5 — llama-server has no admission control of its own for these fields;
-#: the in-process path already bounds max_tokens (CompletionRequest/
-#: ChatCompletionRequest: `le=32768`) via pydantic, but the proxy path
-#: forwards raw bytes and skips that entirely. This ceiling is looser
-#: (agentic/long-context llamaserver models legitimately want more headroom)
-#: but still bounded rather than "anything the client sends, verbatim".
+#: llama-server has no admission control of its own; the proxy path forwards
+#: raw bytes, so this ceiling is looser than the in-process path's but bounded.
 _PROXY_MAX_TOKENS_CEILING = 131_072
 
 
 def _validate_proxy_envelope(data: Dict[str, Any]) -> None:
-    """Minimal sanity checks on a proxied request body BEFORE it is
-    forwarded verbatim (H5).
+    """Minimal sanity checks on a proxied body before it's forwarded verbatim.
 
-    Deliberately NOT a full re-model of the OpenAI/Anthropic schema — that
-    would break forward compatibility with ``tools``/``tool_calls``/
-    ``thinking``/... fields, which is the entire point of proxying raw
-    bytes. Only the couple of fields llama-server has no bound of its own
-    for are checked.
+    Not a full re-model of the OpenAI/Anthropic schema — that would break
+    ``tools``/``tool_calls``/``thinking`` passthrough. Only checks the
+    couple of fields llama-server has no bound of its own for.
     """
     max_tokens = data.get("max_tokens")
     if max_tokens is not None:
@@ -409,14 +397,12 @@ async def _proxy_to_llamaserver(
 ) -> Response:
     """Forward a request to the worker-local llama-server serving ``model_cfg``.
 
-    Resolves a serving worker (auto-loading on demand — Plan 13 Task 5 — via
-    :func:`_resolve_llamaserver_worker`), builds
-    ``http://<worker_host>:<port><path>`` and passes the raw body straight
-    through. ``path`` defaults to the incoming ``request.url.path``; callers pass
-    ``upstream_path`` to override it (``/infill`` is served at llama-server's
-    root, not under the coordinator's ``/v1`` mount — see :func:`create_infill`).
-    ``data`` (H5), when given, is sanity-checked via
-    :func:`_validate_proxy_envelope` before anything is dialed.
+    Resolves a serving worker (auto-loading on demand via
+    :func:`_resolve_llamaserver_worker`) and passes the raw body straight
+    through to ``http://<worker_host>:<port><path>``. ``upstream_path``
+    overrides the default ``request.url.path`` (see :func:`create_infill`).
+    ``data``, when given, is sanity-checked via
+    :func:`_validate_proxy_envelope` first.
     """
     if data is not None:
         _validate_proxy_envelope(data)
@@ -457,11 +443,10 @@ def _require_llamaserver_model(model_string: Any, *, surface: str = "this endpoi
 
 
 async def _resolve_single_loaded_llamaserver(coordinator: Any) -> ModelConfig:
-    """Resolve ``/infill`` when the body omits ``model`` (Plan 13 Task 6).
+    """Resolve ``/infill`` when the body omits ``model``.
 
-    Uses the sole llamaserver model currently loaded across the fleet; raises a
-    400 telling the client to specify ``model`` when zero or more than one are
-    loaded (the request is genuinely ambiguous).
+    Uses the sole llamaserver model currently loaded; 400s asking the client
+    to specify ``model`` when zero or more than one are loaded.
     """
     loaded = await coordinator.loaded_llamaserver_models()
     if len(loaded) == 1:
@@ -482,10 +467,9 @@ async def _resolve_single_loaded_llamaserver(coordinator: Any) -> ModelConfig:
 async def create_completion(request: Request) -> Any:  # type: ignore[type-arg]
     """Run inference on the cluster (OpenAI text-completion endpoint).
 
-    Resolves the requested model's engine FIRST (Plan 13 Task 2): a model with
-    ``engine == "llamaserver"`` is proxied verbatim to its worker-local
-    llama-server (raw body + SSE passthrough, context compression skipped —
-    Phase 2); every other engine runs the existing in-process path below.
+    Resolves the model's engine first: ``engine == "llamaserver"`` is
+    proxied verbatim to its worker-local llama-server; every other engine
+    runs the in-process path below.
     """
     coordinator = _get_coordinator(request)
 
@@ -524,36 +508,23 @@ async def create_completion(request: Request) -> Any:  # type: ignore[type-arg]
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
-        # H4: an unregistered model_name with pull-through disabled raises
-        # ValueError from coordinator._load_model_on_worker — a client
-        # error (bad model name), not a server error.
+        # An unregistered model_name with pull-through disabled: a client
+        # error, not a server error.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception:
-        # M12: never echo a raw exception string to the client (it can leak
-        # internal paths/library internals/stack details) — the real error
-        # is already captured server-side by logger.exception above.
+        # Never echo a raw exception string to the client; it's already
+        # logged server-side above.
         logger.exception("Inference failed")
         raise HTTPException(status_code=500, detail="Internal server error") from None
 
 
 # ---------------------------------------------------------------------------
-# Chat prompt templates for the in-process engine path (item 4)
+# Chat prompt templates for the in-process engine path.
 #
-# Plan 13 Phase 3 will delete this whole section once the in-process chat path
-# is deprecated in favor of engine="llamaserver" (which uses llama.cpp's real,
-# per-model Jinja chat templates + native tool calling). Until then, a single
-# hardcoded Zephyr-style template was used for EVERY in-process model
-# regardless of family, which is wrong for anything that isn't Zephyr/similar:
-# verified on hardware with a Qwen model, replies terminated correctly but
-# were then followed by a spurious "<|user|>" turn replaying the prompt,
-# because the model was never trained on Zephyr's "</s>"-separated turns and
-# the coordinator had no stop sequence to cut the reply at the right point.
-#
-# Pragmatic fix (NOT a full Jinja/minja templating engine): pick a
-# template per the registry's ModelConfig.family, and always truncate the
-# final text at the first occurrence of that template's stop markers — this
-# bounds the damage even for families/templates that are only an
-# approximation of the model's real fine-tuning format.
+# Picks a template per the registry's ModelConfig.family (not a full
+# Jinja/minja engine) and truncates output at that template's stop markers.
+# See docs/troubleshooting.md for why a single hardcoded template doesn't
+# work across model families.
 # ---------------------------------------------------------------------------
 
 _ChatPromptBuilder = Any  # Callable[[List[ChatMessage]], str] — Any avoids a forward-ref headache
@@ -687,11 +658,8 @@ def _select_chat_template(
     """Pick a (prompt builder, stop sequences) pair for ``model_name``.
 
     Model-aware when the registry knows the model's ``family``; otherwise
-    (unregistered model, or a family with no dedicated template yet) falls
-    back to the historical one-size-fits-all template, WITH stop sequences
-    added so a spurious replayed turn still gets truncated. Logs a warning
-    pointing at ``engine="llamaserver"`` as the real fix — see the module
-    docstring for this section.
+    falls back to the generic template (with stop sequences) and logs a
+    warning suggesting ``engine="llamaserver"`` instead.
     """
     family = model_cfg.family.value if model_cfg is not None else None
     template = _FAMILY_CHAT_TEMPLATES.get(family) if family else None
@@ -712,11 +680,8 @@ def _select_chat_template(
 def _truncate_at_stop(text: str, stop_sequences: List[str]) -> str:
     """Cut ``text`` at the earliest occurrence of any ``stop_sequences`` entry.
 
-    Applied to the model's generated text (never the input prompt) so a
-    spurious replayed turn — the model continuing past where it should have
-    stopped, e.g. emitting ``<|user|>`` and restating the prompt — never
-    reaches the client, regardless of which template above produced the
-    prompt.
+    Applied to generated text only, so a spurious replayed turn never
+    reaches the client.
     """
     cut: Optional[int] = None
     for stop in stop_sequences:
@@ -731,18 +696,10 @@ def _truncate_at_stop(text: str, stop_sequences: List[str]) -> str:
 def _build_flat_response(result: Dict[str, Any], model: str, prompt: str) -> Dict[str, Any]:
     """Build a standard OpenAI-compatible chat completion response.
 
-    ``prompt_tokens`` for the in-process engine path: the gRPC
-    ``InferenceResponse`` (proto/cluster.proto) has no prompt-token-count
-    field today — the worker never counts or sends one, so the coordinator
-    cannot report the model's true prompt token count without a worker/proto
-    change (out of scope here — see AGENTS.md ownership boundaries). Instead
-    we estimate from the flattened prompt text using the same coarse,
-    offline, model-agnostic heuristic already used for the context-compression
-    budget check (``coordinator/context_compression/tokenizer.py``), so
-    ``total_tokens`` is at least internally consistent
-    (``prompt_tokens + completion_tokens``) instead of hardcoded to 0. The
-    proxied ``llamaserver`` path is unaffected — llama-server counts real
-    tokens itself.
+    ``prompt_tokens`` is estimated (the in-process gRPC path has no real
+    token count) using the same heuristic as context-compression's budget
+    check, so ``total_tokens`` stays internally consistent. The proxied
+    ``llamaserver`` path is unaffected — llama-server counts real tokens.
     """
     from coordinator.context_compression.tokenizer import estimate_tokens
 
@@ -842,14 +799,10 @@ async def create_chat_completion(
 ) -> Union[Dict[str, Any], Response, StreamingResponse]:
     """OpenAI-compatible chat completions endpoint used by Open-WebUI + agents.
 
-    Resolves the model's engine FIRST (Plan 13 Task 2): ``engine ==
-    "llamaserver"`` models are proxied verbatim to a worker-local llama-server
-    so OpenAI ``tools``/streaming ``tool_calls`` pass through unmodified (raw
-    body + SSE passthrough, context compression skipped — Phase 2). Every other
-    engine runs the in-process path below, which selects a chat template by
-    the registry's ``family`` (item 4 — see the "Chat prompt templates"
-    section above) instead of one hardcoded Zephyr-style template for every
-    model.
+    Resolves the model's engine first: ``engine == "llamaserver"`` models are
+    proxied verbatim to a worker-local llama-server. Every other engine runs
+    the in-process path, which selects a chat template by ``family`` (see
+    the "Chat prompt templates" section above).
     """
     coordinator = _get_coordinator(request)
 
@@ -916,28 +869,23 @@ async def create_chat_completion(
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
-        # H4: an unregistered model_name with pull-through disabled raises
-        # ValueError from coordinator._load_model_on_worker — a client
-        # error (bad model name), not a server error.
+        # An unregistered model_name with pull-through disabled: a client
+        # error, not a server error.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception:
-        # M12: never echo a raw exception string to the client (it can leak
-        # internal paths/library internals/stack details) — the real error
-        # is already captured server-side by logger.exception above.
+        # Never echo a raw exception string to the client; it's already
+        # logged server-side above.
         logger.exception("Inference failed")
         raise HTTPException(status_code=500, detail="Internal server error") from None
 
 
 @router.post("/messages", response_model=None)
 async def create_message(request: Request) -> Response:  # type: ignore[type-arg]
-    """Anthropic-format messages endpoint (Plan 13 Task 2), llamaserver-only.
+    """Anthropic-format messages endpoint, llamaserver-only.
 
-    The in-process engines have no Anthropic templating, so only ``engine ==
-    "llamaserver"`` models are served here: the coordinator proxies the raw body
-    — ``system``, ``tools``, ``thinking`` and all — to a worker-local
-    llama-server, which natively serves ``POST /v1/messages``. Anthropic clients
-    request streaming via ``"stream": true`` in the body, which is sniffed here
-    to decide SSE passthrough. Unknown model → 404; any other engine → 501.
+    The in-process engines have no Anthropic templating, so only
+    ``engine == "llamaserver"`` models are served: the raw body is proxied
+    to a worker-local llama-server. Unknown model → 404; other engine → 501.
     """
     coordinator = _get_coordinator(request)
     raw_body, data = await _read_json_body(request)
@@ -951,11 +899,10 @@ async def create_message(request: Request) -> Response:  # type: ignore[type-arg
 
 @router.post("/messages/count_tokens", response_model=None)
 async def count_message_tokens(request: Request) -> Response:  # type: ignore[type-arg]
-    """Anthropic ``POST /v1/messages/count_tokens`` (Plan 13 Task 2).
+    """Anthropic ``POST /v1/messages/count_tokens``.
 
-    llamaserver-only (unknown model → 404, other engine → 501) and never
-    streaming — the raw body is proxied verbatim to the worker-local
-    llama-server, whose token count is returned unchanged.
+    llamaserver-only (unknown model → 404, other engine → 501), never
+    streaming; the raw body is proxied to the worker-local llama-server.
     """
     coordinator = _get_coordinator(request)
     raw_body, data = await _read_json_body(request)
@@ -967,12 +914,11 @@ async def count_message_tokens(request: Request) -> Response:  # type: ignore[ty
 
 @router.post("/embeddings", response_model=None)
 async def create_embeddings(request: Request) -> Response:  # type: ignore[type-arg]
-    """OpenAI-compatible embeddings endpoint (Plan 13 Task 6), llamaserver-only.
+    """OpenAI-compatible embeddings endpoint, llamaserver-only.
 
-    Resolves the model from the JSON body's ``model`` field and proxies the raw
-    body — buffered, NEVER SSE — to the worker-local llama-server's
-    ``/v1/embeddings``. Unknown model → 404; any other engine → 501. Auto-load
-    (Task 5) applies via :func:`_proxy_to_llamaserver`.
+    Proxies the raw body — buffered, never SSE — to the worker-local
+    llama-server's ``/v1/embeddings``. Unknown model → 404; other engine →
+    501.
     """
     coordinator = _get_coordinator(request)
     raw_body, data = await _read_json_body(request)
@@ -982,20 +928,13 @@ async def create_embeddings(request: Request) -> Response:  # type: ignore[type-
 
 @router.post("/infill", response_model=None)
 async def create_infill(request: Request) -> Response:  # type: ignore[type-arg]
-    """llama.cpp FIM ``/infill`` proxy (Plan 13 Task 6), llamaserver-only.
+    """llama.cpp FIM ``/infill`` proxy, llamaserver-only.
 
-    The body MAY carry ``model``: when present it is resolved like the other
-    routes; when absent, ``/infill`` falls back to the single llamaserver model
-    currently loaded across the fleet (zero or multiple → 400 telling the client
-    to specify ``model``). The raw body is forwarded verbatim — llama-server
-    ignores unknown fields, so the ``model`` key is left in place. Streaming is
-    honored only when the body sets ``"stream": true`` (llama-server's ``/infill``
-    supports SSE), sniffed like ``/v1/messages``.
-
-    NOTE: llama-server serves FIM at its ROOT ``/infill``, not under ``/v1``. This
-    route is registered on the coordinator's ``/v1`` router (mounted in main.py,
-    outside this task's ownership), so the upstream path is pinned to ``/infill``
-    regardless of the coordinator-facing path.
+    ``model`` in the body is resolved like other routes; if absent, falls
+    back to the single llamaserver model currently loaded (zero or multiple
+    → 400). llama-server serves FIM at its root ``/infill``, not under
+    ``/v1``, so the upstream path is pinned regardless of the
+    coordinator-facing path.
     """
     coordinator = _get_coordinator(request)
     raw_body, data = await _read_json_body(request)
@@ -1094,10 +1033,10 @@ async def load_model(body: LoadModelRequest, request: Request) -> LoadModelRespo
     except HTTPException:
         raise
     except ValueError as exc:
-        # H4: model_name absent from the registry with pull-through disabled.
+        # model_name absent from the registry with pull-through disabled.
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception:
-        # M12: see create_completion's identical comment.
+        # Never echo a raw exception string to the client.
         logger.exception("Model load failed")
         raise HTTPException(status_code=500, detail="Internal server error") from None
 
@@ -1113,7 +1052,7 @@ async def unload_model(
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception:
-        # M12: see create_completion's identical comment.
+        # Never echo a raw exception string to the client.
         logger.exception("Model unload failed")
         raise HTTPException(status_code=500, detail="Internal server error") from None
     return {"status": "unloaded", "model_name": model_name, "workers": unloaded_from}
@@ -1133,21 +1072,9 @@ async def add_manual_worker(
 ) -> Dict[str, List[Dict[str, str]]]:
     """Manually add a worker by its host:port address.
 
-    C3: a worker registered here self-reports ``loaded_models`` and can be
-    selected by ``find_worker_for_model`` for real routed traffic (prompt
-    exfiltration + poisoned completions), and the address is passed straight
-    to ``grpc.aio.insecure_channel`` / the llamaserver HTTP proxy (SSRF). So
-    this route:
-      1. is disabled unless ``COORDINATOR_ALLOW_MANUAL_WORKER_REGISTRATION``
-         is set — most deployments never need runtime registration
-         (``COORDINATOR_STATIC_WORKERS`` covers the documented setups);
-      2. independently requires a valid ``COORDINATOR_API_KEYS`` credential
-         on THIS request regardless of whether the global
-         ``APIKeyAuthMiddleware`` happens to be a no-op elsewhere (e.g. a
-         dev deployment intentionally left open for everything else);
-      3. shape-validates every address (host:port, optional
-         ``COORDINATOR_MANUAL_WORKER_ALLOWED_HOSTS`` CIDR/host allowlist) and
-         caps the list length, all BEFORE any address is dialed.
+    Disabled by default, always requires its own API key, and validates
+    every address before dialing it — a registered worker can be routed
+    real traffic or used for SSRF otherwise. See docs/configuration.md.
     """
     coordinator = _get_coordinator(request)
     settings = coordinator.settings

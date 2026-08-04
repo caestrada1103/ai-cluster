@@ -1,20 +1,8 @@
-"""ASGI middleware enforcing a maximum HTTP request body size (H5).
+"""ASGI middleware enforcing a maximum HTTP request body size.
 
-Nothing in the coordinator's HTTP surface previously capped request body
-size: ``api.py``'s ``_read_json_body`` calls ``await request.body()``, which
-buffers the ENTIRE body into memory with no limit of its own. A client (or a
-compromised/rogue registered worker feeding back through some future path)
-sending an arbitrarily large body — buffered or chunked-transfer-encoded, no
-``Content-Length`` required — can exhaust coordinator memory. This also
-covers the ``engine="llamaserver"`` proxy path (``_proxy_to_llamaserver``),
-which forwards the raw body straight through and has no ``max_tokens``/queue
-admission control of its own to fall back on.
-
-Two layers, both before any route handler (or ``request.body()``) ever runs:
-  1. ``Content-Length`` header check — rejects the common case immediately,
-     before a single body byte is read.
-  2. A streaming byte counter wrapping ``receive()`` — catches a chunked
-     body with no (or a lying) ``Content-Length`` too.
+Checks ``Content-Length`` up front, then counts streamed bytes as a
+fallback for chunked bodies with no (or a lying) header. See
+docs/configuration.md.
 """
 
 from __future__ import annotations

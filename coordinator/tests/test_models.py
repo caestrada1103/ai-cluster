@@ -442,7 +442,7 @@ def test_hardcoded_gguf_models_match_models_toml() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Plan 11 Task 1 — Level 1: local multi-GPU split (local_gpu_ids / local_tensor_split)
+# Local multi-GPU split (local_gpu_ids / local_tensor_split)
 # ---------------------------------------------------------------------------
 
 
@@ -562,7 +562,7 @@ def test_load_from_dict_local_multi_gpu_keys_absent_by_default() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Plan 11 Task 4 — Level 2: distributed registry schema (ggml-RPC)
+# Distributed registry schema (ggml-RPC)
 # ---------------------------------------------------------------------------
 
 
@@ -798,7 +798,7 @@ def test_load_from_dict_distributed_absent_by_default() -> None:
 
 def test_real_models_toml_distributed_reference_entry_loads() -> None:
     """config/models.toml's qwen2.5-coder-32b-gguf.distributed reference block
-    (Plan 11 Task 4) parses into a valid, fully populated distributed schema."""
+    parses into a valid, fully populated distributed schema."""
     models_toml = Path(__file__).resolve().parents[2] / "config" / "models.toml"
     ModelRegistry.load_from_dict(toml.load(models_toml))
     cfg = ModelRegistry.get_model("qwen2.5-coder-32b-gguf")
@@ -816,7 +816,7 @@ def test_real_models_toml_distributed_reference_entry_loads() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Plan 11 Task 2b — KV-cache quantization (cache_type_k / cache_type_v)
+# KV-cache quantization (cache_type_k / cache_type_v)
 # ---------------------------------------------------------------------------
 
 
@@ -956,7 +956,7 @@ def test_load_from_dict_cache_type_absent_by_default() -> None:
 
 def test_real_models_toml_cache_type_example_loads() -> None:
     """config/models.toml's qwen2.5-coder-32b-gguf.gguf cache_type_k/v example
-    (Plan 11 Task 2b) parses and flows into grpc_metadata()."""
+    parses and flows into grpc_metadata()."""
     models_toml = Path(__file__).resolve().parents[2] / "config" / "models.toml"
     ModelRegistry.load_from_dict(toml.load(models_toml))
     cfg = ModelRegistry.get_model("qwen2.5-coder-32b-gguf")
@@ -969,7 +969,7 @@ def test_real_models_toml_cache_type_example_loads() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Plan 13 Task 2 — llamaserver engine: fields, validation, metadata emission
+# llamaserver engine: fields, validation, metadata emission
 # ---------------------------------------------------------------------------
 
 

@@ -1,10 +1,8 @@
-"""Tests for the Plan 13 llamaserver HTTP proxy + coordinator engine dispatch.
+"""Tests for the llamaserver HTTP proxy + coordinator engine dispatch.
 
-The proxy unit tests never touch a real socket: they inject an httpx transport
-(a ``MockTransport``) into the ``AsyncClient`` that ``coordinator.proxy`` builds
-internally, so the raw request bytes and the streamed response are exercised
-end-to-end in-process. The api dispatch tests drive the ``api.py`` route
-handlers directly with a duck-typed Request + coordinator.
+The proxy unit tests inject an httpx ``MockTransport`` (no real socket). The
+api dispatch tests drive ``api.py`` route handlers directly with a
+duck-typed Request + coordinator.
 """
 
 import asyncio
@@ -192,9 +190,8 @@ def test_filter_request_headers_strips_hop_by_hop_keeps_content_type() -> None:
 
 
 def test_filter_request_headers_strips_credentials() -> None:
-    """M2: the coordinator's own auth credential must never reach a
-    worker-local llama-server — it has no use for it, and a leaked
-    credential there has a bigger blast radius than an unused header."""
+    """The coordinator's own auth credential must never reach a
+    worker-local llama-server."""
     filtered = proxy.filter_request_headers(
         {
             "content-type": "application/json",
@@ -208,7 +205,7 @@ def test_filter_request_headers_strips_credentials() -> None:
 
 
 # ---------------------------------------------------------------------------
-# H5: minimal envelope validation on the llamaserver proxy path
+# Minimal envelope validation on the llamaserver proxy path
 # ---------------------------------------------------------------------------
 
 

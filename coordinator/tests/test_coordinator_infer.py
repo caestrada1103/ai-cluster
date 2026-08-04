@@ -198,8 +198,8 @@ async def test_connect_worker_adopts_resident_loaded_models(
 
 @pytest.mark.asyncio
 async def test_load_model_on_worker_rejects_unregistered_model_by_default() -> None:
-    """H4: an unregistered model_name must never reach the worker as an
-    implicit HuggingFace-repo pull unless explicitly opted into."""
+    """An unregistered model_name must never reach the worker as an implicit
+    HuggingFace-repo pull unless explicitly opted into."""
     from unittest.mock import AsyncMock, MagicMock
 
     from coordinator.coordinator import WorkerInfo, WorkerState
@@ -245,7 +245,7 @@ async def test_load_model_on_worker_allows_unregistered_when_opted_in() -> None:
 
 @pytest.mark.asyncio
 async def test_load_model_on_worker_allows_registered_model_by_default() -> None:
-    """Registered models (config/models.toml) are unaffected by H4's gate."""
+    """Registered models (config/models.toml) are unaffected by the gate."""
     from unittest.mock import AsyncMock, MagicMock
 
     import coordinator.proto.cluster_pb2 as pb

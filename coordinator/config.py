@@ -70,28 +70,18 @@ class Settings(BaseSettings):
     model_load_timeout: int = Field(
         3600,
         description=(
-            "LoadModel gRPC deadline (seconds). Covers the worker's GGUF "
-            "download, so it must exceed weight_size / link_speed: a 22 GB "
-            "model over a 10 MB/s link needs ~37 min. The previous hardcoded "
-            "300s capped API-loadable models at roughly 3 GB."
+            "LoadModel gRPC deadline (seconds). Must exceed the worker's "
+            "GGUF download time (weight_size / link_speed)."
         ),
         ge=1,
     )
 
-    # CORS
-    # M3: secure by default — no explicit origins (`[]`), not `"*"`. Combined
-    # with `main.py`'s always-on loopback `allow_origin_regex`
-    # (`http(s)://(localhost|127.0.0.1)[:port]`), the DEFAULT deployment
-    # allows browser calls from the machine the coordinator itself runs on
-    # (matches this project's "local debug is permissive but opt-in" story —
-    # a developer hitting the API from a page served on localhost keeps
-    # working with zero config) while any other origin is rejected until an
-    # operator explicitly sets COORDINATOR_CORS_ORIGINS. Set it to `"*"` to
-    # restore the old wide-open behavior (still forces
-    # `allow_credentials=False`, same anti-pattern guard as before), or to a
-    # comma-separated/JSON list of specific origins for a real deployment.
-    # NoDecode: pydantic-settings otherwise JSON-decodes any complex-typed env
-    # value before our validator runs, which rejects non-JSON strings like "*".
+    # CORS: defaults to no explicit origins, but main.py always applies a
+    # loopback allow_origin_regex, so local browser calls work with zero
+    # config while any other origin needs an explicit opt-in. See
+    # docs/configuration.md.
+    # NoDecode: pydantic-settings would otherwise JSON-decode this before our
+    # validator runs, rejecting non-JSON strings like "*".
     cors_origins: Annotated[List[str], NoDecode] = Field(
         default_factory=list,
         description=(
@@ -105,15 +95,8 @@ class Settings(BaseSettings):
         10, description="Maximum concurrent requests per worker", ge=1
     )
 
-    # C3 — POST /v1/workers/manual (unauthenticated arbitrary worker
-    # registration in the audit finding). Disabled by default: a rogue
-    # "worker" registered this way self-reports loaded_models and can be
-    # selected by find_worker_for_model for real routed traffic (prompt
-    # exfiltration + poisoned completions), and the address is also handed
-    # straight to grpc.aio.insecure_channel / the llamaserver proxy (SSRF).
-    # Opt in only for deployments that actually need runtime worker
-    # registration (most don't — COORDINATOR_STATIC_WORKERS covers the
-    # documented single-host/LAN-cluster setups).
+    # Disabled by default: a maliciously registered "worker" here can be
+    # routed real traffic or used for SSRF. See docs/configuration.md.
     allow_manual_worker_registration: bool = Field(
         False,
         description=(
@@ -133,11 +116,8 @@ class Settings(BaseSettings):
         ),
     )
 
-    # H4 — an unregistered model_name sent to POST /v1/models/load is passed
-    # to the worker as an arbitrary HuggingFace repo id to download and load
-    # (coordinator.py: "If unknown, it's a HuggingFace pull"). Off by
-    # default: only models in config/models.toml are loadable unless a
-    # deployment explicitly wants ad hoc HF pulls.
+    # Off by default: an unregistered model_name would otherwise become an
+    # arbitrary HuggingFace repo pull.
     allow_unregistered_model_pull: bool = Field(
         False,
         description=(
@@ -147,13 +127,8 @@ class Settings(BaseSettings):
         ),
     )
 
-    # H5: no request-body size cap previously existed anywhere on the HTTP
-    # surface (api.py's _read_json_body buffers the whole body via
-    # request.body()); this also covers the engine="llamaserver" proxy path,
-    # which has no max_tokens/queue admission control of its own. 25 MB is
-    # generous for a real chat/agentic request (long conversation history,
-    # embedded code, tool results) while still bounding worst-case memory use
-    # per request. See coordinator/body_limit.py.
+    # 25 MB is generous for a real chat/agentic request while still
+    # bounding worst-case memory use. See coordinator/body_limit.py.
     max_request_body_bytes: int = Field(
         25_000_000,
         description=(
@@ -179,11 +154,8 @@ class Settings(BaseSettings):
         600.0, description="How long a session sticks to a worker (affinity strategy)", gt=0
     )
 
-    # llama-server auto-load-on-demand (Plan 13 Task 5). When True (default), a
-    # proxied request for an `engine="llamaserver"` model that no worker reports
-    # loaded triggers the standard load path on a healthy worker (single-flight
-    # per model) before proxying. When False the coordinator preserves Phase-1
-    # behavior — it 404s and the client must POST /models/load first.
+    # When True (default), a proxied request for an unloaded llamaserver
+    # model triggers a load first. When False it 404s instead.
     llamaserver_autoload: bool = Field(
         True,
         description=(
@@ -192,12 +164,9 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Context compression middleware (coordinator/context_compression/) — see
-    # pending-work/12-context-compression-pipeline.md. Off by default: a
-    # request is only ever touched when (a) this is True or the request sets
-    # `compress_context: true`, AND (b) its estimated prompt tokens exceed
-    # context_compression_token_budget. Tune the budget per deployment —
-    # roughly `n_ctx - max_tokens - 512` for whatever model you route to.
+    # Context compression middleware (coordinator/context_compression/). Off
+    # by default; only applies when estimated prompt tokens exceed the
+    # budget. Tune the budget to roughly `n_ctx - max_tokens - 512`.
     context_compression_enabled: bool = Field(
         False, description="Server-wide default: compress oversized prompts before forwarding"
     )

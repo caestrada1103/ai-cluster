@@ -34,10 +34,9 @@ class _FakeCoordinator:
 def _fake_request(coordinator: _FakeCoordinator, body: Any) -> Any:
     """Build a duck-typed Request whose ``.body()`` returns the model's raw JSON.
 
-    The chat/completions + completions routes now read the RAW request body
-    (Plan 13) so they can proxy llamaserver models untouched; the in-process
-    path re-validates that same JSON through pydantic. Model ``"m"`` is unknown
-    to the registry, so these requests always take the in-process path.
+    The chat/completions + completions routes read the raw request body so
+    they can proxy llamaserver models untouched. Model ``"m"`` is unknown to
+    the registry, so these requests always take the in-process path.
     """
     from types import SimpleNamespace
 

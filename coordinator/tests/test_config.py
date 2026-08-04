@@ -101,10 +101,9 @@ def test_settings_ignores_unknown_dotenv_keys(tmp_path: Path) -> None:
 
 
 def test_cors_origins_default_is_empty_not_wildcard() -> None:
-    """M3: secure by default — no explicit cross-origin allowance out of the
-    box. main.py additionally applies an always-on loopback regex, but that
-    is a separate, narrower allowance covered by test_main.py, not this
-    field's own default."""
+    """Secure by default: no explicit cross-origin allowance out of the box.
+    main.py's always-on loopback regex is a separate allowance, covered by
+    test_main.py."""
     s = make_settings()
     assert s.cors_origins == []
 
@@ -174,7 +173,7 @@ def test_context_compression_techniques_accepts_comma_string() -> None:
 
 
 def test_llamaserver_autoload_default_on() -> None:
-    """Plan 13 Task 5 gate defaults to on (auto-load unloaded llamaserver models)."""
+    """Auto-load gate for unloaded llamaserver models defaults to on."""
     assert make_settings().llamaserver_autoload is True
 
 

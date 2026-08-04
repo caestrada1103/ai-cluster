@@ -164,20 +164,14 @@ def test_uses_constant_time_comparison() -> None:
 
 
 # ---------------------------------------------------------------------------
-# L1: non-ASCII candidate key must 401, never an unhandled 500
+# Non-ASCII candidate key must 401, never an unhandled 500
 # ---------------------------------------------------------------------------
 
 
 def test_non_ascii_x_api_key_header_returns_401_not_500(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A str candidate outside the ASCII range used to make
-    secrets.compare_digest raise TypeError (it requires ASCII-only str
-    arguments), surfacing as an unstyled 500 instead of a clean 401.
-
-    httpx's own client-side header encoding rejects a plain `str` containing
-    non-ASCII (it round-trips through the `ascii` codec unless given raw
-    `bytes`), so this sends the header value as latin-1-encoded bytes — the
-    same thing ASGI/Starlette hands the app for any header a raw socket
-    client can send, bypassing httpx's own validation.
+    """A non-ASCII candidate used to make compare_digest raise TypeError,
+    surfacing as a 500 instead of a 401. Sends the header as latin-1-encoded
+    bytes to bypass httpx's own str-header ASCII validation.
     """
     monkeypatch.setenv("COORDINATOR_API_KEYS", "secret-key")
     response = client.get(
@@ -195,7 +189,7 @@ def test_matches_any_handles_non_ascii_without_raising() -> None:
 
 
 # ---------------------------------------------------------------------------
-# L2: CORS preflight (OPTIONS) must never be gated behind the API key
+# CORS preflight (OPTIONS) must never be gated behind the API key
 # ---------------------------------------------------------------------------
 
 

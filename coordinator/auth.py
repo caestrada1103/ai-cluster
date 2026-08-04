@@ -1,23 +1,10 @@
 """Minimal opt-in API-key auth for the coordinator's HTTP surface.
 
-Keys come from ``COORDINATOR_API_KEYS`` (comma-separated, whitespace-trimmed,
-empty entries dropped), read directly from the process environment at
-request time. This is deliberately NOT a ``coordinator.config.Settings``
-field: ``coordinator/tests/test_config.py::test_dead_settings_fields_removed``
-guards against unwired ``Settings`` fields (it already asserts ``api_keys``
-and ``enable_auth`` are gone), and this env var is wired here instead, kept
-env-only until Plan 15 Phase B formalizes config.
-
-Behavior:
-- Env var unset or empty ⇒ this middleware is a complete no-op — every route
-  is open, matching the coordinator's current (pre-auth) default.
-- Env var set ⇒ every HTTP route requires a valid key via
-  ``Authorization: Bearer <key>`` or ``x-api-key: <key>``, except the
-  liveness (``/health``) and Prometheus (``/metrics``) endpoints, which stay
-  reachable for infra probes/scrapers that don't carry credentials.
-
-A single shared secret over plain HTTP: no TLS, no per-client keys, no rotation
-or replay protection. Deploy behind a firewall or VPN. See docs/configuration.md.
+Keys come from ``COORDINATOR_API_KEYS`` (comma-separated), read live from
+the environment rather than ``Settings``. Empty/unset ⇒ no-op (every route
+open). Set ⇒ every route needs ``Authorization: Bearer <key>`` or
+``x-api-key: <key>``, except ``/health`` and ``/metrics``. See
+docs/configuration.md.
 """
 
 from __future__ import annotations
@@ -41,22 +28,15 @@ _UNAUTHORIZED_BODY = {
 def load_api_keys() -> FrozenSet[str]:
     """Parse ``COORDINATOR_API_KEYS`` from the environment.
 
-    Re-reads the environment on every call instead of caching: parsing is a
-    single cheap ``split(",")`` over a short string, and reading live means
-    tests can flip the env var with ``monkeypatch.setenv``/``delenv`` with no
-    cache to reset, and a running process picks up a changed env without a
-    restart.
+    Re-read on every call (not cached) so a running process picks up a
+    changed env without a restart.
     """
     raw = os.environ.get("COORDINATOR_API_KEYS", "")
     return frozenset(key.strip() for key in raw.split(",") if key.strip())
 
 
 def _is_exempt(path: str) -> bool:
-    """Whether ``path`` is reachable with no key (health/metrics probes).
-
-    ``/metrics`` is mounted as a sub-app (``app.mount("/metrics", ...)`` in
-    main.py), so also exempt anything nested under it.
-    """
+    """Whether ``path`` is reachable with no key (health/metrics probes)."""
     return path in _EXEMPT_PATHS or path.startswith("/metrics/")
 
 
@@ -76,23 +56,10 @@ def _extract_candidate_key(headers: Headers) -> Optional[str]:
 def _matches_any(candidate: str, valid_keys: FrozenSet[str]) -> bool:
     """Constant-time membership check against the configured key set.
 
-    Uses ``secrets.compare_digest`` (not ``==``/``in``) for each comparison
-    to avoid leaking key contents via a timing side channel, and checks
-    every key rather than returning on the first match so the match's
-    position in the set doesn't leak either.
-
-    L1: ``compare_digest`` requires its ``str`` arguments to be ASCII-only —
-    it raises ``TypeError`` otherwise — but ``candidate`` comes straight from
-    a caller-supplied HTTP header, which can legally carry non-ASCII bytes
-    (ASGI header values are latin-1-decoded, so any byte sequence decodes
-    without error but can land outside the ASCII range). An unhandled
-    ``TypeError`` here previously surfaced as an unstyled 500 instead of the
-    intended 401. Comparing UTF-8-encoded ``bytes`` instead sidesteps the
-    ASCII restriction entirely (bytes-like objects have none) while still
-    comparing every candidate byte-for-byte against every configured key.
+    Compares UTF-8 bytes, not ``str``: ``compare_digest`` requires ASCII-only
+    ``str`` args and header values can be non-ASCII, which would otherwise
+    raise ``TypeError`` (a 500) instead of yielding a 401.
     """
-    # UTF-8 can encode any Unicode code point (including the 0x00-0xFF range
-    # ASGI's latin-1 header decoding produces), so this never raises.
     candidate_bytes = candidate.encode("utf-8")
     matched = False
     for key in valid_keys:
@@ -127,19 +94,10 @@ class APIKeyAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # L2: a CORS preflight (`OPTIONS`) never carries the caller's real
-        # credentials — browsers deliberately send it bare — so gating it
-        # behind the API key just makes it fail with 401 before
-        # ``CORSMiddleware`` ever runs, which the browser then reports as a
-        # CORS failure on the REAL request (its console error points at CORS,
-        # not auth, which is exactly why this was easy to miss). This bypass
-        # is independent of middleware registration order — see
-        # ``main.py``'s comment on why `CORSMiddleware` is also registered to
-        # wrap this middleware, not the other way around, but this makes the
-        # preflight bypass correct even if a future refactor gets the order
-        # wrong again. The actual (non-OPTIONS) request that follows a
-        # preflight is still fully authenticated below, same as any other
-        # method.
+        # A CORS preflight (OPTIONS) never carries real credentials, so
+        # gating it would 401 before CORSMiddleware runs and the browser
+        # would misreport it as a CORS failure. The real request that
+        # follows is still authenticated below.
         if scope["method"] == "OPTIONS":
             await self.app(scope, receive, send)
             return

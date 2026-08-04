@@ -104,7 +104,7 @@ async def test_load_model_on_worker_sends_empty_metadata_for_burn() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Plan 11 Task 1 — Level 1 local multi-GPU split transport
+# Local multi-GPU split transport
 # ---------------------------------------------------------------------------
 
 _LOCAL_MULTI_GPU_REGISTRY = {

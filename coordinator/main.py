@@ -32,13 +32,10 @@ _LOOPBACK_HOSTNAMES = frozenset({"localhost"})
 
 
 def _is_loopback_host(host: str) -> bool:
-    """Best-effort loopback check for `Settings.host` (C4).
+    """Best-effort loopback check for `Settings.host`.
 
-    Conservative on purpose: anything that isn't recognizably loopback (an
-    unparseable value, a bare LAN hostname, `0.0.0.0`/`::`) is treated as
-    NOT loopback — i.e. this fails CLOSED, requiring `COORDINATOR_API_KEYS`,
-    rather than accidentally waving through something that isn't actually
-    loopback-only.
+    Fails closed: anything not recognizably loopback (unparseable, a LAN
+    hostname, `0.0.0.0`/`::`) counts as NOT loopback.
     """
     if host in _LOOPBACK_HOSTNAMES:
         return True
@@ -49,21 +46,10 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def _refuse_insecure_bind(settings: Settings) -> None:
-    """C4 — the core of the prod-by-default posture.
+    """Refuse to start on a non-loopback host with no API keys configured.
 
-    Refuse to start when `COORDINATOR_HOST` is not loopback-only AND no
-    `COORDINATOR_API_KEYS` are configured: that combination means every
-    route (`/v1/models/load`, `/v1/workers/manual`, `/v1/chat/completions`,
-    ...) is reachable, unauthenticated, to anyone who can route to this
-    host. Raises rather than logging-and-continuing so a misconfiguration
-    can never silently ship — the process exits immediately (uvicorn/Docker
-    surfaces this as a crash-loop with the message below, not a
-    slow-to-notice open API).
-
-    This is intentionally a BREAKING change for anyone previously running
-    `--host 0.0.0.0` with no keys (the AGENTS.md-documented dev command is
-    one such case) — see .env.example / docs/deployment.md for the two
-    opt-ins: bind loopback, or set COORDINATOR_API_KEYS.
+    Raises instead of logging-and-continuing so an insecure bind can never
+    silently ship. See docs/deployment.md.
     """
     if _is_loopback_host(settings.host):
         return
@@ -118,33 +104,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Opt-in API-key auth (Plan 15 Phase A / Plan 13 Task 3). No-op unless
-# COORDINATOR_API_KEYS is set; see coordinator/auth.py for the contract.
-# Covers every router mounted below, including /metrics and routes other
-# modules add to api_router, except the /health and /metrics paths it
-# exempts itself.
-#
-# L2: registered BEFORE CORSMiddleware on purpose. Starlette's
-# `add_middleware` prepends to the middleware stack, so the LAST-added
-# middleware ends up OUTERMOST (it sees the request first). Adding auth
-# first here means CORSMiddleware ends up outermost — a cross-origin
-# preflight (`OPTIONS`) reaches CORSMiddleware before this one, so it gets a
-# proper CORS-headers response instead of being 401'd by auth before CORS
-# ever runs (which the browser then misreports as a CORS failure on the real
-# request, not an auth failure on the preflight). `APIKeyAuthMiddleware`
-# also bypasses `OPTIONS` itself (see auth.py) — belt-and-suspenders so this
-# stays correct even if the order above is ever accidentally swapped.
+# Opt-in API-key auth; no-op unless COORDINATOR_API_KEYS is set (see auth.py).
+# Registered before CORSMiddleware so CORS ends up outermost — a preflight
+# OPTIONS gets proper CORS headers instead of a 401 from auth. See
+# docs/deployment.md.
 app.add_middleware(APIKeyAuthMiddleware)
 
-# Add CORS middleware.
-# M3: secure by default. `COORDINATOR_CORS_ORIGINS` now defaults to `[]`
-# (see config.py), and a loopback `allow_origin_regex` is ALWAYS applied
-# (unless the operator opts fully into "*") so a browser page served from
-# the coordinator's own host (http(s)://localhost or 127.0.0.1, any port)
-# keeps working out of the box for local development — the permissive case
-# stays opt-in, not silently the default, for any other origin.
-# When allow_origins contains "*", allow_credentials must be False —
-# browsers reject the combination and it's a security anti-pattern.
+# CORS: defaults to loopback-only (plus explicit COORDINATOR_CORS_ORIGINS).
+# allow_credentials must be False when allow_origins is "*".
 _cors_origins = Settings().cors_origins
 _cors_wildcard = _cors_origins == ["*"]
 _LOOPBACK_CORS_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
@@ -157,11 +124,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# H5: request-body size cap, registered LAST so it ends up OUTERMOST (same
-# "last add_middleware wins the outer position" mechanics documented above)
-# — reject an oversized body before spending any cycles on CORS/auth. Covers
-# every route, including the engine="llamaserver" raw-body proxy path, which
-# has no max_tokens/queue admission control of its own.
+# Request-body size cap, registered last so it ends up outermost — rejects
+# an oversized body before CORS/auth run.
 app.add_middleware(BodySizeLimitMiddleware, max_bytes=Settings().max_request_body_bytes)
 
 # Add Prometheus metrics endpoint

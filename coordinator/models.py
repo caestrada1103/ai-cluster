@@ -1,13 +1,8 @@
 """Model registry and configuration.
 
-AICluster's goal is running LLM inference on consumer GPUs (gaming-PC cards,
-~8-16 GB VRAM each, including idle ones) across both NVIDIA and AMD hardware.
-The llama.cpp/GGUF engine (``engine="llamacpp"``) is the recommended, primary
-path for that: it natively quantizes models (Q4_K_M/Q5_K_M/Q8_0/...) so they
-fit in limited consumer VRAM, and runs on NVIDIA (CUDA/Vulkan) and AMD
-(ROCm/Vulkan). The Burn engine (``engine="burn"``, the dataclass default) is
-the experimental/reference path: it loads weights as FP32 only (no
-quantization) and runs a model on a single GPU per worker.
+``engine="llamacpp"`` (GGUF, quantized) is the recommended primary path for
+consumer GPUs on NVIDIA/AMD. ``engine="burn"`` (the dataclass default) is
+the experimental FP32-only reference path.
 """
 
 import logging
@@ -19,8 +14,7 @@ logger = logging.getLogger(__name__)
 
 # Allowed ggml KV-cache quantization type names for `gguf_cache_type_k` /
 # `gguf_cache_type_v` (llama.cpp's `--cache-type-k`/`--cache-type-v` flags).
-# `f16` is llama.cpp's own default (today's behavior); the rest trade VRAM for
-# precision — see Plan 11 Task 2b / Appendix D.
+# `f16` is the default; the rest trade VRAM for precision.
 _ALLOWED_KV_CACHE_TYPES = frozenset({"f16", "q8_0", "q4_0", "q5_0", "q5_1", "q4_1"})
 
 
@@ -106,48 +100,38 @@ class ModelConfig:
     gguf_n_gpu_layers: Optional[int] = None  # -1 = all layers on GPU
     gguf_n_ctx: Optional[int] = None  # context window override
 
-    # KV-cache quantization (Plan 11 Task 2b / Appendix D): halves (q8_0) or
-    # quarters (q4_0) the KV-cache VRAM footprint vs today's fp16 KV, which is
-    # the biggest lever for fitting large `n_ctx` in limited VRAM. Both None
-    # (the default) is today's behavior — llama.cpp's own fp16 KV cache.
+    # KV-cache quantization: halves (q8_0) or quarters (q4_0) the KV-cache
+    # VRAM footprint vs fp16. None (default) keeps llama.cpp's fp16 KV cache.
     gguf_cache_type_k: Optional[str] = None
     gguf_cache_type_v: Optional[str] = None
 
-    # MoE expert offload: maps to llama.cpp's `--n-cpu-moe N`, which keeps the
-    # first N layers' expert tensors on the CPU. This is the lever that makes a
-    # large MoE fit a small consumer GPU (8-16 GB) — without it the only option
-    # is the blunter all-experts-on-CPU fallback. `None` (default) omits the
-    # flag entirely, preserving today's behavior.
+    # MoE expert offload: llama.cpp's `--n-cpu-moe N`, keeping the first N
+    # layers' expert tensors on the CPU so a large MoE fits a small GPU.
     gguf_n_cpu_moe: Optional[int] = None
 
-    # llama-server engine (Plan 13 — agentic serving). The worker supervises a
+    # llama-server engine (agentic serving): the worker supervises a
     # `llama-server` child process per model; the coordinator proxies raw
-    # OpenAI/Anthropic JSON+SSE straight to it (see coordinator/proxy.py), so
-    # `tools`, streaming `tool_calls` and Anthropic `/v1/messages` flow through
-    # unmodified. These models reuse the SAME gguf.* source keys as the
-    # in-process `llamacpp` engine (the child still loads a GGUF) plus the
-    # llamaserver.* runtime knobs below.
+    # OpenAI/Anthropic JSON+SSE to it (see coordinator/proxy.py). Reuses the
+    # gguf.* source keys plus the llamaserver.* runtime knobs below.
     llamaserver_port: Optional[int] = None  # REQUIRED for engine=="llamaserver"; unique per model
-    # Concurrent conversation slots ("instances"), maps to llama-server --parallel.
+    # Concurrent conversation slots, maps to llama-server --parallel.
     # Registry key is `instances` (alias `parallel`); default 1 when unset.
     llamaserver_parallel: Optional[int] = None
     llamaserver_extra_args: Optional[str] = None  # extra CLI args, whitespace-split by the worker
 
-    # Level 1 — local multi-GPU split (llama.cpp splitting a model across a
-    # single node's OWN same-vendor GPUs, in-process, no network). Both None
-    # (the default) is today's behavior: the coordinator picks
-    # `worker.gpus[:recommended_gpus]` and no split metadata is sent.
+    # Local multi-GPU split: llama.cpp splitting a model across a single
+    # node's own GPUs, in-process, no network. None (default): the
+    # coordinator picks `worker.gpus[:recommended_gpus]`, no split metadata.
     local_gpu_ids: Optional[List[int]] = None
     local_tensor_split: Optional[List[float]] = None  # weights, same order/len as local_gpu_ids
 
-    # Level 2 — distributed (cross-node ggml-RPC) registry schema. A model
-    # splits pipeline layers across a "lead" node (owns the real llama.cpp
-    # context) and one or more "rpc_server" peer nodes that lend local GPUs.
-    # `distributed=False` (the default) is today's single-node behavior.
+    # Distributed (cross-node ggml-RPC): a model splits pipeline layers
+    # across a "lead" node and one or more "rpc_server" peers that lend
+    # local GPUs. `distributed=False` (default) is single-node.
     distributed: bool = False
     distributed_lead: Optional[str] = None  # worker_id of the lead node
     distributed_peers: List[str] = field(default_factory=list)  # worker_ids of rpc_server peers
-    distributed_split: Optional[List[float]] = None  # None = auto-derive at load time (Task 6)
+    distributed_split: Optional[List[float]] = None  # None = auto-derive at load time
     distributed_rpc_port: int = 50151  # base ggml-RPC port each peer binds from
     distributed_gpu_ids: Dict[str, List[int]] = field(
         default_factory=dict
@@ -166,19 +150,16 @@ class ModelConfig:
                 f"Unknown engine '{self.engine}' " "(expected 'burn', 'llamacpp', or 'llamaserver')"
             )
 
-        # Both llama.cpp transports load a GGUF: the in-process 'llamacpp' engine
-        # and the 'llamaserver' child process the coordinator proxies to. Both
-        # therefore require the gguf.* source keys.
+        # Both llama.cpp transports (in-process 'llamacpp' and the
+        # 'llamaserver' child process) load a GGUF and need the source keys.
         if self.engine in ("llamacpp", "llamaserver") and not (
             self.gguf_repo_id and self.gguf_file
         ):
             raise ValueError(f"{self.engine} engine models must set gguf.repo_id and gguf.file")
 
-        # llamaserver_port is coordinator-assigned and REQUIRED so the proxy
-        # knows where the worker-local llama-server listens (Plan 13 contract).
-        # Registry-wide uniqueness is enforced separately by
-        # ModelRegistry.validate_llamaserver_ports() (a single config can't see
-        # its peers).
+        # llamaserver_port tells the proxy where the worker-local
+        # llama-server listens. Uniqueness is checked separately by
+        # ModelRegistry.validate_llamaserver_ports() (one config can't see its peers).
         if self.engine == "llamaserver" and self.llamaserver_port is None:
             raise ValueError("llamaserver engine models must set llamaserver_port")
 
@@ -218,12 +199,8 @@ class ModelConfig:
                 raise ValueError("distributed models must set at least one distributed peer")
 
     def _gguf_metadata(self) -> Dict[str, str]:
-        """Base engine + GGUF-source metadata shared by every GGUF transport
-        helper (in-process single-node, distributed lead, distributed
-        rpc_server, and the llama-server child all need the same model source
-        keys). ``engine`` carries ``self.engine`` verbatim so the worker can
-        dispatch ``"llamacpp"`` (in-process) vs ``"llamaserver"`` (child
-        process) off the same map."""
+        """Base engine + GGUF-source metadata shared by every GGUF transport.
+        See docs/configuration.md for the gRPC metadata key contract."""
         metadata: Dict[str, str] = {
             "engine": self.engine,
             "gguf_repo_id": self.gguf_repo_id or "",
@@ -242,14 +219,11 @@ class ModelConfig:
         return metadata
 
     def _llamaserver_metadata(self, instances: Optional[int] = None) -> Dict[str, str]:
-        """Metadata for a llamaserver-engine model (Plan 13 Task 2).
+        """Metadata for a llamaserver-engine model.
 
-        Rides the shared engine/gguf.* source keys from `_gguf_metadata()` (the
-        worker's llama-server child still loads a GGUF) plus the EXACT
-        cross-language contract keys the worker parses to spawn/configure the
-        process: `llamaserver.port`, `llamaserver.parallel`, and — only when set
-        — `llamaserver.extra_args`. `instances` (a per-request override, e.g. from
-        POST /v1/models/load) wins over the registry value, which defaults to 1.
+        Adds `llamaserver.port`/`llamaserver.parallel`/`llamaserver.extra_args`
+        to `_gguf_metadata()`. `instances` overrides the registry value
+        (default 1) for this call only.
         """
         metadata = self._gguf_metadata()
         metadata["llamaserver.port"] = str(self.llamaserver_port)
@@ -263,14 +237,10 @@ class ModelConfig:
     def grpc_metadata(self, instances: Optional[int] = None) -> Dict[str, str]:
         """Engine-routing metadata carried in the gRPC ModelConfig.metadata map.
 
-        The worker's model loader reads these string keys to route the model.
-        Burn models send an empty map (zero proto change, fully backwards
-        compatible). `llamacpp` models send the gguf.* source (plus a
-        `tensor_split` key for Level-1 local multi-GPU splits). `llamaserver`
-        models send the gguf.* source plus the `llamaserver.*` keys the worker
-        uses to spawn the llama-server child (see `_llamaserver_metadata`).
-        `instances` overrides the registry's `llamaserver_parallel`/`instances`
-        value for `engine == "llamaserver"` models; ignored otherwise.
+        Burn models send an empty map. `llamacpp` sends the gguf.* source
+        (plus `tensor_split` for a local multi-GPU split). `llamaserver`
+        sends gguf.* plus the llamaserver.* keys (see `_llamaserver_metadata`).
+        `instances` only applies to `engine == "llamaserver"`.
         """
         if self.engine == "llamaserver":
             return self._llamaserver_metadata(instances)
@@ -284,13 +254,10 @@ class ModelConfig:
     def grpc_metadata_lead(
         self, peer_endpoints: List[str], tensor_split: Optional[List[float]]
     ) -> Dict[str, str]:
-        """Metadata for the LEAD node of a Level-2 distributed load.
+        """Metadata for the LEAD node of a distributed load.
 
-        Rides the same base engine/gguf keys as `grpc_metadata()` plus the
-        distributed-role keys the worker parses: `distributed_role="lead"`,
-        `rpc_peers` (ordered, comma-joined "host:port" — SAME order as the
-        peer-portion of `tensor_split`), and `tensor_split` (the combined
-        [lead gpu_ids..., peer_1 lent gpus..., ...] weights) when given.
+        Adds `distributed_role="lead"`, `rpc_peers` (ordered "host:port"
+        list), and `tensor_split` when given, to the base gguf keys.
         """
         metadata = self._gguf_metadata()
         metadata["distributed_role"] = "lead"
@@ -300,12 +267,10 @@ class ModelConfig:
         return metadata
 
     def grpc_metadata_rpc_server(self, base_port: int) -> Dict[str, str]:
-        """Metadata for an RPC_SERVER peer node of a Level-2 distributed load.
+        """Metadata for an RPC_SERVER peer node of a distributed load.
 
-        Carries the same base engine/gguf keys (the peer needs the identical
-        GGUF source to fetch/serve the same model) plus
-        `distributed_role="rpc_server"` and `rpc_bind_port` — the base port; a
-        node lending k GPUs binds `rpc_bind_port..+k-1`.
+        Adds `distributed_role="rpc_server"` and `rpc_bind_port` (a node
+        lending k GPUs binds `rpc_bind_port..+k-1`) to the base gguf keys.
         """
         metadata = self._gguf_metadata()
         metadata["distributed_role"] = "rpc_server"
@@ -316,11 +281,8 @@ class ModelConfig:
 class ModelRegistry:
     """Registry of all available models.
 
-    Featured/recommended: the ``*-gguf`` entries below (``engine="llamacpp"``)
-    are the primary path for AICluster's consumer-GPU goal — quantized models
-    that fit in 8-16 GB of VRAM, on NVIDIA or AMD. The remaining entries use
-    the Burn engine (``engine="burn"``, the dataclass default), an
-    experimental/reference path that loads FP32 weights on a single GPU.
+    The ``*-gguf`` entries (``engine="llamacpp"``) are the recommended path.
+    The remaining entries use the experimental Burn engine.
     """
 
     # Predefined model configurations
@@ -329,18 +291,9 @@ class ModelRegistry:
     @classmethod
     def initialize(cls) -> None:
         """Initialize the model registry with default models."""
-        # Note: In a production environment, this could be empty and
-        # only populated via load_from_config.
-
-        # GGUF / llama.cpp models (PRIMARY — quantized, consumer NVIDIA+AMD)
-        # ====================================================================
-        # Recommended path for AICluster's actual goal: running a quantized
-        # model on consumer GPUs (~8-16 GB VRAM gaming cards, including idle
-        # ones) on NVIDIA (CUDA/Vulkan) or AMD (ROCm/Vulkan). Served by the
-        # worker's llama.cpp engine (worker built with --features llamacpp).
-        # These entries mirror config/models.toml so the two sources never
-        # diverge; architecture fields are unused for this engine (real
-        # values come from GGUF metadata at load time), so they are zeroed.
+        # GGUF / llama.cpp models (recommended, quantized, NVIDIA+AMD).
+        # Mirrors config/models.toml; architecture fields are unused for
+        # this engine (real values come from GGUF metadata at load time).
         cls.MODELS["qwen2.5-0.5b-gguf"] = ModelConfig(
             name="qwen2.5-0.5b-gguf",
             family=ModelFamily.QWEN,
@@ -464,8 +417,7 @@ class ModelRegistry:
             gguf_n_ctx=8192,
         )
 
-        # Multi-GPU split via llama.cpp is the upcoming worker feature; this is
-        # the "quantized model split across two consumer GPUs" showcase entry.
+        # Local multi-GPU split showcase entry.
         cls.MODELS["qwen2.5-coder-32b-gguf"] = ModelConfig(
             name="qwen2.5-coder-32b-gguf",
             family=ModelFamily.QWEN,
@@ -491,7 +443,6 @@ class ModelRegistry:
         )
 
         # Burn models (experimental — FP32 reference engine, single GPU)
-        # ====================================================================
 
         # DeepSeek models
         cls.MODELS["deepseek-7b"] = ModelConfig(
@@ -827,12 +778,8 @@ class ModelRegistry:
     def validate_llamaserver_ports(cls, models: Optional[Dict[str, ModelConfig]] = None) -> None:
         """Assert every llamaserver-engine model has a unique `llamaserver_port`.
 
-        A single `ModelConfig.__post_init__` can only check that its own port is
-        set; registry-wide uniqueness (Plan 13 contract) has to be checked
-        across all entries. Called at the end of `load_from_dict` so a
-        mis-configured `config/models.toml` fails loudly at load time. Raises
-        `ValueError` on the first duplicate. Operates on ``cls.MODELS`` unless an
-        explicit ``models`` mapping is supplied (used by tests for isolation).
+        Raises `ValueError` on the first duplicate. Operates on
+        ``cls.MODELS`` unless an explicit ``models`` mapping is given.
         """
         registry = cls.MODELS if models is None else models
         seen: Dict[int, str] = {}

@@ -1,11 +1,9 @@
-"""Tests for POST /v1/workers/manual (C3) — disabled-by-default, independently
+"""Tests for POST /v1/workers/manual — disabled-by-default, independently
 authenticated, address-validated worker registration.
 
 Route-level tests inject a fake coordinator directly into `app.state`
-(mirroring how `main.py`'s real `lifespan` does it) rather than entering the
-app's lifespan (which would need a live/fake gRPC worker stack) — the same
-pattern `test_auth.py`/`test_main.py` document and rely on for their own
-`TestClient`.
+rather than entering the app's lifespan, same pattern as
+`test_auth.py`/`test_main.py`.
 """
 
 from types import SimpleNamespace
@@ -120,7 +118,7 @@ def test_validate_manual_worker_address_accepts_allowed_host() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Route: disabled by default (C3)
+# Route: disabled by default
 # ---------------------------------------------------------------------------
 
 
