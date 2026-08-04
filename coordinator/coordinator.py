@@ -605,9 +605,29 @@ class ClusterCoordinator:
         quantization: Quantization = Quantization.NONE,
     ) -> bool:
         """Load a model on a worker."""
-        try:
-            model_config = ModelRegistry.get_model(model_name)
+        model_config = ModelRegistry.get_model(model_name)
 
+        # H4: an unregistered model_name falls through below to a raw
+        # HuggingFace pull — the worker downloads whatever repo `model_name`
+        # (or `model_path`) names. That is fine when the coordinator
+        # operator explicitly wants ad hoc HF pulls
+        # (allow_unregistered_model_pull=True), but by default a
+        # caller-supplied model_name absent from config/models.toml is
+        # rejected outright, with a clear ValueError, rather than silently
+        # becoming an arbitrary repo download. Raised BEFORE the try/except
+        # below (which turns every other failure into `return False`) so
+        # callers (api.py's /models/load) can distinguish "rejected by
+        # policy" from "the worker failed to load it" and answer 4xx, not a
+        # misleading 200 {"status": "failed"}.
+        if model_config is None and not self.settings.allow_unregistered_model_pull:
+            raise ValueError(
+                f"Model '{model_name}' is not in the registry (config/models.toml) "
+                "and unregistered-model pull-through is disabled. Add it to the "
+                "registry, or set COORDINATOR_ALLOW_UNREGISTERED_MODEL_PULL=true "
+                "to explicitly opt into loading arbitrary HuggingFace repos by name."
+            )
+
+        try:
             if model_config:
                 # Use strict registry configuration if known
                 config_pb = pb.ModelConfig(
