@@ -15,22 +15,47 @@ git clone https://github.com/caestrada1103/ai-cluster.git
 cd ai-cluster
 cp .env.example .env
 # REQUIRED: set GRAFANA_ADMIN_PASSWORD in .env (compose refuses to start Grafana without it)
+# REQUIRED: set COORDINATOR_API_KEYS in .env (a comma-separated secret list, e.g.
+#   `openssl rand -hex 32`) — the coordinator's REST API port (8000) IS published to
+#   the host by this compose file, and the coordinator now REFUSES TO START with a
+#   non-loopback bind and no keys configured (secure-by-default; see coordinator/main.py).
 # REQUIRED: set COMPOSE_PROFILES in .env to match your GPU (see "GPU variants" below) —
 #   with no profile set, `docker compose up` starts everything EXCEPT a worker.
 # Set HF_TOKEN for gated models (Llama 3, ...)
 docker compose up -d --build
-curl http://localhost:8000/health
+curl -H "Authorization: Bearer <your COORDINATOR_API_KEYS value>" http://localhost:8000/health
 ```
 
-Services and host ports:
+Services and host ports (default — nothing else is published; see "Exposing
+worker/Open-WebUI ports" below for the opt-in override):
 
 | Service | Port | Notes |
 |---|---|---|
-| coordinator | 8000 | REST API + `/metrics` (Prometheus scrapes 8000 — there is no :9090 coordinator port) |
-| worker | 50051 (gRPC), 9091 (`/metrics`, `/health`, `/live`) | replica N listens on base+N |
+| coordinator | 8000 | REST API + `/metrics`, gated by `COORDINATOR_API_KEYS` (Prometheus scrapes 8000 — there is no :9090 coordinator port) |
+| worker | none by default | gRPC (50051)/metrics (9091)/llama-server (8081/8082) are reachable by the coordinator CONTAINER over the private compose network, but not published to the host |
 | prometheus | 9099 → container 9090 | |
 | grafana | 3000 | admin / $GRAFANA_ADMIN_PASSWORD |
-| open-webui | 8080 | chat UI against the coordinator |
+| open-webui | none by default | chat UI against the coordinator; not published to the host |
+
+### Exposing worker/Open-WebUI ports (opt in)
+
+Security-audit findings C1/H1/M11 made the base `docker-compose.yml`
+secure-by-default: no worker port or Open-WebUI's port is published to the
+host. That is correct for the common single-host case (coordinator and
+worker(s) only need to reach each other over the private compose network).
+Layer `docker-compose.expose-ports.yml` when something OUTSIDE this compose
+project needs to reach one of these directly — e.g. a LAN cluster where the
+coordinator runs on a different host (section 3), or you want to browse to
+Open-WebUI from another machine:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.expose-ports.yml \
+  --profile cuda-native up -d
+```
+
+Set `WORKER_GRPC_AUTH_TOKEN` in `.env` before doing this beyond a trusted
+LAN behind a firewall/VPN — the worker gRPC port has no other authentication
+(see `worker/src/grpc_auth.rs`).
 
 ### GPU variants
 
@@ -137,6 +162,11 @@ Spark / any Vulkan driver for wgpu).
 # Coordinator — run from the REPO ROOT (module path matters)
 python3 -m venv venv && source venv/bin/activate
 pip install -r coordinator/requirements.txt
+# Loopback-only, single-machine (secure by default — no COORDINATOR_API_KEYS needed):
+uvicorn coordinator.main:app --host 127.0.0.1 --port 8000
+# Reachable from elsewhere on your LAN — the coordinator now REFUSES to start with
+# a non-loopback --host and no COORDINATOR_API_KEYS configured (C4):
+export COORDINATOR_API_KEYS=$(openssl rand -hex 32)   # or set it in .env
 uvicorn coordinator.main:app --host 0.0.0.0 --port 8000
 
 # Worker (second terminal)
@@ -146,7 +176,12 @@ cargo build --release --features wgpu     # Burn engine only (default; FP32, no 
 cargo build --release --features wgpu,llamacpp                  # llama.cpp on CPU
 cargo build --release --features wgpu,llamacpp,llamacpp-vulkan  # llama.cpp Vulkan offload (NVIDIA or AMD)
 cargo build --release --features cuda,llamacpp,llamacpp-cuda    # llama.cpp CUDA offload (NVIDIA)
+# Loopback-only bind is the worker binary's default too (grpc_bind_host in
+# worker.toml, or the built-in default when no config file is present).
 ./target/release/ai-worker --port 50051 --gpu-ids 0
+# Coordinator on a DIFFERENT host: set grpc_bind_host = "0.0.0.0" (and
+# llamaserver_bind_host, for engine="llamaserver" models) in worker.toml, and set
+# WORKER_GRPC_AUTH_TOKEN — the worker gRPC port has no other authentication.
 ```
 
 `wgpu` is the default Burn backend feature (`rocm`/`cuda` are the native
@@ -244,18 +279,28 @@ export LLAMASERVER_BINARY_PATH="$PWD/build/bin/llama-server"
 ### Port reachability (coordinator → worker)
 
 Each llamaserver model listens on its own coordinator-assigned `llamaserver_port`
-(`config/models.toml`: **8081** Devstral, **8082** Qwen3-Coder). The worker binds
-`--host 0.0.0.0` (`llamaserver_bind_host`), and the coordinator proxies to
-`http://<worker_host>:<port>`. Those TCP ports must therefore be **reachable from
-the coordinator host** across the LAN:
+(`config/models.toml`: **8081** Devstral, **8082** Qwen3-Coder). The worker's
+`llamaserver_bind_host` now defaults to **`127.0.0.1`** (H1, secure by default —
+`/slots` can leak another job's prompt text, and this port has no auth at all).
+The coordinator proxies to `http://<worker_host>:<port>`; those TCP ports must
+therefore be **reachable from the coordinator host**:
 
-- **Docker:** publish them on the worker container — already done in
-  `docker-compose.yml` (`- "8081:8081"` / `- "8082:8082"`); copy the same lines
-  if you swap in a different worker service block. Within one compose network the
-  coordinator reaches the worker as `worker:8081` without publishing.
-- **Bare metal:** open the ports in the worker host's firewall to the coordinator.
-- **Trusted-LAN only:** that proxy hop is plaintext and unauthenticated — never
-  expose the llamaserver ports to an untrusted network (see Plan 15).
+- **Same-host Docker Compose (the default, no action needed):** the shipped
+  `config/worker.toml` sets `llamaserver_bind_host = "0.0.0.0"` explicitly
+  (documented there) because the worker and coordinator are separate
+  containers on the private compose network — that is NOT the same as LAN
+  exposure, since `docker-compose.yml` no longer publishes 8081/8082 to the
+  host by default.
+- **LAN cluster (coordinator on a DIFFERENT host):** publish the ports by
+  layering `docker-compose.expose-ports.yml`
+  (`docker compose -f docker-compose.yml -f docker-compose.expose-ports.yml
+  --profile <name> up -d`) — see section 1 — and set `WORKER_GRPC_AUTH_TOKEN`.
+- **Bare metal:** set `llamaserver_bind_host = "0.0.0.0"` in `worker.toml`
+  and open the ports in the worker host's firewall to the coordinator only.
+- **Trusted-LAN only:** that proxy hop is still plaintext and unauthenticated
+  at the HTTP layer — never expose the llamaserver ports to an untrusted
+  network (see Plan 15). Also disable `/slots` unless you specifically need
+  it (`llamaserver_enable_slots_endpoint = false` is the new default).
 
 ### Windows
 
