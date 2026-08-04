@@ -415,8 +415,218 @@ async def create_completion(request: Request) -> Any:  # type: ignore[type-arg]
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-def _build_flat_response(result: Dict[str, Any], model: str) -> Dict[str, Any]:
-    """Build a standard OpenAI-compatible chat completion response."""
+# ---------------------------------------------------------------------------
+# Chat prompt templates for the in-process engine path (item 4)
+#
+# Plan 13 Phase 3 will delete this whole section once the in-process chat path
+# is deprecated in favor of engine="llamaserver" (which uses llama.cpp's real,
+# per-model Jinja chat templates + native tool calling). Until then, a single
+# hardcoded Zephyr-style template was used for EVERY in-process model
+# regardless of family, which is wrong for anything that isn't Zephyr/similar:
+# verified on hardware with a Qwen model, replies terminated correctly but
+# were then followed by a spurious "<|user|>" turn replaying the prompt,
+# because the model was never trained on Zephyr's "</s>"-separated turns and
+# the coordinator had no stop sequence to cut the reply at the right point.
+#
+# Pragmatic fix (NOT a full Jinja/minja templating engine): pick a
+# template per the registry's ModelConfig.family, and always truncate the
+# final text at the first occurrence of that template's stop markers — this
+# bounds the damage even for families/templates that are only an
+# approximation of the model's real fine-tuning format.
+# ---------------------------------------------------------------------------
+
+_ChatPromptBuilder = Any  # Callable[[List[ChatMessage]], str] — Any avoids a forward-ref headache
+
+
+def _build_chatml_prompt(messages: List[ChatMessage]) -> str:
+    """ChatML (Qwen, and many others fine-tuned on the same format)."""
+    prompt = ""
+    for msg in messages:
+        role = msg.role.lower()
+        prompt += f"<|im_start|>{role}\n{msg.content}<|im_end|>\n"
+    prompt += "<|im_start|>assistant\n"
+    return prompt
+
+
+def _build_llama3_prompt(messages: List[ChatMessage]) -> str:
+    """Llama-3/3.1-Instruct header-block format."""
+    prompt = "<|begin_of_text|>"
+    for msg in messages:
+        role = msg.role.lower()
+        prompt += f"<|start_header_id|>{role}<|end_header_id|>\n\n{msg.content}<|eot_id|>"
+    prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    return prompt
+
+
+def _build_mistral_prompt(messages: List[ChatMessage]) -> str:
+    """Mistral-Instruct [INST]/[/INST] format; system content folds into the
+    next user turn (Mistral has no separate system role)."""
+    parts: List[str] = []
+    pending_system = ""
+    for msg in messages:
+        role = msg.role.lower()
+        if role == "system":
+            pending_system += msg.content + "\n\n"
+        elif role == "user":
+            content = pending_system + msg.content if pending_system else msg.content
+            pending_system = ""
+            parts.append(f"[INST] {content} [/INST]")
+        elif role == "assistant":
+            parts.append(f" {msg.content}</s>")
+    return "".join(parts)
+
+
+def _build_gemma_prompt(messages: List[ChatMessage]) -> str:
+    """Gemma <start_of_turn>/<end_of_turn> format; system content folds into
+    the next user turn (Gemma has no separate system role)."""
+    prompt = ""
+    pending_system = ""
+    for msg in messages:
+        role = msg.role.lower()
+        if role == "system":
+            pending_system += msg.content + "\n\n"
+            continue
+        gemma_role = "model" if role == "assistant" else "user"
+        content = msg.content
+        if gemma_role == "user" and pending_system:
+            content = pending_system + content
+            pending_system = ""
+        prompt += f"<start_of_turn>{gemma_role}\n{content}<end_of_turn>\n"
+    prompt += "<start_of_turn>model\n"
+    return prompt
+
+
+def _build_phi_prompt(messages: List[ChatMessage]) -> str:
+    """Phi-3-style format — structurally like the old fallback but with
+    Phi's actual end-of-turn token (``<|end|>``) instead of Zephyr's
+    ``</s>``."""
+    prompt = ""
+    for msg in messages:
+        role = msg.role.lower()
+        if role in ("system", "user", "assistant"):
+            prompt += f"<|{role}|>\n{msg.content}<|end|>\n"
+    prompt += "<|assistant|>\n"
+    return prompt
+
+
+def _build_deepseek_prompt(messages: List[ChatMessage]) -> str:
+    """DeepSeek-V2/V3-style format (best-effort — DeepSeek checkpoints vary
+    more than most families; the stop sequences below are the real safety
+    net for this one)."""
+    prompt = ""
+    for msg in messages:
+        role = msg.role.lower()
+        if role == "system":
+            prompt += f"{msg.content}\n\n"
+        elif role == "user":
+            prompt += f"<｜User｜>{msg.content}"
+        elif role == "assistant":
+            prompt += f"<｜Assistant｜>{msg.content}<｜end▁of▁sentence｜>"
+    prompt += "<｜Assistant｜>"
+    return prompt
+
+
+def _build_zephyr_prompt(messages: List[ChatMessage]) -> str:
+    """The original hardcoded Zephyr-ish fallback template, used only when
+    the model's family has no dedicated template above (or the model is
+    unregistered)."""
+    prompt = ""
+    for msg in messages:
+        role = msg.role.lower()
+        content = msg.content
+        if role == "system":
+            prompt += f"<|system|>\n{content}</s>\n"
+        elif role == "user":
+            prompt += f"<|user|>\n{content}</s>\n"
+        elif role == "assistant":
+            prompt += f"<|assistant|>\n{content}</s>\n"
+    prompt += "<|assistant|>\n"
+    return prompt
+
+
+# family.value (coordinator/models.py ModelFamily) -> (builder, stop sequences)
+_FAMILY_CHAT_TEMPLATES: Dict[str, tuple[_ChatPromptBuilder, List[str]]] = {
+    "qwen": (_build_chatml_prompt, ["<|im_end|>", "<|im_start|>"]),
+    "llama": (_build_llama3_prompt, ["<|eot_id|>", "<|start_header_id|>"]),
+    "mistral": (_build_mistral_prompt, ["</s>", "[INST]"]),
+    "gemma": (_build_gemma_prompt, ["<end_of_turn>", "<start_of_turn>"]),
+    "phi": (_build_phi_prompt, ["<|end|>", "<|user|>"]),
+    "deepseek": (
+        _build_deepseek_prompt,
+        ["<｜end▁of▁sentence｜>", "<｜User｜>"],
+    ),
+}
+
+_ZEPHYR_FALLBACK_STOP = ["<|user|>", "<|system|>"]
+
+
+def _select_chat_template(
+    model_cfg: Optional[ModelConfig], model_name: str
+) -> tuple[_ChatPromptBuilder, List[str]]:
+    """Pick a (prompt builder, stop sequences) pair for ``model_name``.
+
+    Model-aware when the registry knows the model's ``family``; otherwise
+    (unregistered model, or a family with no dedicated template yet) falls
+    back to the historical one-size-fits-all template, WITH stop sequences
+    added so a spurious replayed turn still gets truncated. Logs a warning
+    pointing at ``engine="llamaserver"`` as the real fix — see the module
+    docstring for this section.
+    """
+    family = model_cfg.family.value if model_cfg is not None else None
+    template = _FAMILY_CHAT_TEMPLATES.get(family) if family else None
+    if template is not None:
+        return template
+    logger.warning(
+        "Model '%s' (family=%s) has no model-aware chat template; falling back to the "
+        "generic template. This can still produce lower-quality output (e.g. a spurious "
+        "extra turn after the real answer) for models that don't match it. For best "
+        'quality and tool-calling support, set engine="llamaserver" for this model in '
+        "config/models.toml instead of relying on the in-process engine's flattened prompt.",
+        model_name,
+        family,
+    )
+    return _build_zephyr_prompt, _ZEPHYR_FALLBACK_STOP
+
+
+def _truncate_at_stop(text: str, stop_sequences: List[str]) -> str:
+    """Cut ``text`` at the earliest occurrence of any ``stop_sequences`` entry.
+
+    Applied to the model's generated text (never the input prompt) so a
+    spurious replayed turn — the model continuing past where it should have
+    stopped, e.g. emitting ``<|user|>`` and restating the prompt — never
+    reaches the client, regardless of which template above produced the
+    prompt.
+    """
+    cut: Optional[int] = None
+    for stop in stop_sequences:
+        if not stop:
+            continue
+        idx = text.find(stop)
+        if idx != -1 and (cut is None or idx < cut):
+            cut = idx
+    return text if cut is None else text[:cut]
+
+
+def _build_flat_response(result: Dict[str, Any], model: str, prompt: str) -> Dict[str, Any]:
+    """Build a standard OpenAI-compatible chat completion response.
+
+    ``prompt_tokens`` for the in-process engine path: the gRPC
+    ``InferenceResponse`` (proto/cluster.proto) has no prompt-token-count
+    field today — the worker never counts or sends one, so the coordinator
+    cannot report the model's true prompt token count without a worker/proto
+    change (out of scope here — see AGENTS.md ownership boundaries). Instead
+    we estimate from the flattened prompt text using the same coarse,
+    offline, model-agnostic heuristic already used for the context-compression
+    budget check (``coordinator/context_compression/tokenizer.py``), so
+    ``total_tokens`` is at least internally consistent
+    (``prompt_tokens + completion_tokens``) instead of hardcoded to 0. The
+    proxied ``llamaserver`` path is unaffected — llama-server counts real
+    tokens itself.
+    """
+    from coordinator.context_compression.tokenizer import estimate_tokens
+
+    prompt_tokens = estimate_tokens(prompt)
+    completion_tokens = result["tokens_generated"]
     return {
         "id": result["request_id"],
         "object": "chat.completion",
@@ -430,18 +640,28 @@ def _build_flat_response(result: Dict[str, Any], model: str) -> Dict[str, Any]:
             }
         ],
         "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": result["tokens_generated"],
-            "total_tokens": result["tokens_generated"],
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
     }
 
 
 async def _stream_chat_completion(
-    coordinator: Any, ctx: Any, model: str, timeout: float
+    coordinator: Any, ctx: Any, model: str, timeout: float, stop_sequences: List[str]
 ) -> AsyncGenerator[str, None]:
-    """Stream chunks live from the request's token queue as the worker produces them."""
+    """Stream chunks live from the request's token queue as the worker produces them.
+
+    ``stop_sequences`` (item 4) are checked against the FULL text accumulated
+    so far on every chunk — not just the newly-arrived piece — so a stop
+    marker split across two queue messages is still caught. Once one is
+    found, only the text up to the marker is emitted, the stream is closed as
+    ``finish_reason: "stop"``, and no further chunks are read from the queue
+    (the in-flight worker request keeps running to completion in the
+    background, same as today's early-break-on-``finished`` path).
+    """
     deadline = time.time() + timeout
+    accumulated = ""
     try:
         while True:
             remaining = deadline - time.time()
@@ -462,6 +682,11 @@ async def _stream_chat_completion(
                     break
                 continue  # still generating — poll again
 
+            new_accumulated = _truncate_at_stop(accumulated + response.text, stop_sequences)
+            delta = new_accumulated[len(accumulated) :]
+            hit_stop = len(new_accumulated) < len(accumulated) + len(response.text)
+            accumulated = new_accumulated
+
             chunk = {
                 "id": ctx.id,
                 "object": "chat.completion.chunk",
@@ -471,14 +696,14 @@ async def _stream_chat_completion(
                     {
                         "index": 0,
                         # Emit the text even on the final chunk (proto allows text+finished)
-                        "delta": {"content": response.text},
-                        "finish_reason": "stop" if response.finished else None,
+                        "delta": {"content": delta},
+                        "finish_reason": "stop" if (response.finished or hit_stop) else None,
                     }
                 ],
             }
             yield f"data: {json.dumps(chunk)}\n\n"
 
-            if response.finished:
+            if response.finished or hit_stop:
                 yield "data: [DONE]\n\n"
                 break
     except Exception as e:
@@ -500,7 +725,10 @@ async def create_chat_completion(
     "llamaserver"`` models are proxied verbatim to a worker-local llama-server
     so OpenAI ``tools``/streaming ``tool_calls`` pass through unmodified (raw
     body + SSE passthrough, context compression skipped — Phase 2). Every other
-    engine runs the in-process Zephyr-flattening path below.
+    engine runs the in-process path below, which selects a chat template by
+    the registry's ``family`` (item 4 — see the "Chat prompt templates"
+    section above) instead of one hardcoded Zephyr-style template for every
+    model.
     """
     coordinator = _get_coordinator(request)
 
@@ -522,21 +750,12 @@ async def create_chat_completion(
         body.messages, coordinator=coordinator, override_enabled=body.compress_context
     )
 
-    # Convert chat history to a raw prompt
-    # A simple chat template, can be expanded later for specific models (llama3, chatml, etc)
-    prompt = ""
-    for msg in messages:
-        role = msg.role.lower()
-        content = msg.content
-        if role == "system":
-            prompt += f"<|system|>\n{content}</s>\n"
-        elif role == "user":
-            prompt += f"<|user|>\n{content}</s>\n"
-        elif role == "assistant":
-            prompt += f"<|assistant|>\n{content}</s>\n"
-
-    # Add generation token
-    prompt += "<|assistant|>\n"
+    # Convert chat history to a raw prompt using a template selected by the
+    # model's family (falls back to the legacy generic template, with stop
+    # sequences, for unregistered models or families with no dedicated
+    # template yet — see _select_chat_template).
+    build_prompt, stop_sequences = _select_chat_template(model_cfg, model_name)
+    prompt = build_prompt(messages)
 
     try:
         if body.stream:
@@ -554,7 +773,7 @@ async def create_chat_completion(
             )
             timeout = coordinator.settings.request_timeout
             return StreamingResponse(
-                _stream_chat_completion(coordinator, ctx, body.model, timeout),
+                _stream_chat_completion(coordinator, ctx, body.model, timeout, stop_sequences),
                 media_type="text/event-stream",
             )
 
@@ -569,7 +788,8 @@ async def create_chat_completion(
             worker_id=worker_id,
             session_id=body.session_id,
         )
-        return _build_flat_response(result, body.model)
+        result = dict(result, text=_truncate_at_stop(result["text"], stop_sequences))
+        return _build_flat_response(result, body.model, prompt)
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except RuntimeError as exc:
