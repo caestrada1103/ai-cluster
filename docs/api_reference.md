@@ -119,13 +119,16 @@ Request fields (everything else is rejected with 422):
 | worker_id | string | null | force a specific worker |
 | session_id | string | null | sticky-session key for affinity routing |
 
-Response (NOT OpenAI-shaped — `/v1/chat/completions` is the OpenAI-compatible one):
+Response (NOT OpenAI-shaped — `/v1/chat/completions` is the OpenAI-compatible one).
+`prompt_tokens` is the worker's real tokenized prompt length, or `null` if the
+engine couldn't report one:
 
 ```json
 {
   "request_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
   "text": "…generated text…",
   "tokens_generated": 50,
+  "prompt_tokens": 18,
   "processing_time_ms": 2140.5,
   "worker_id": "worker-0"
 }
@@ -147,9 +150,15 @@ Non-streaming response:
   "choices": [
     {"index": 0, "message": {"role": "assistant", "content": "…"}, "finish_reason": "stop"}
   ],
-  "usage": {"prompt_tokens": 0, "completion_tokens": 42, "total_tokens": 42}
+  "usage": {"prompt_tokens": 18, "completion_tokens": 42, "total_tokens": 60}
 }
 ```
+
+`prompt_tokens` is the worker's real tokenized prompt length (not a
+character-count estimate). When the engine can't report one, `prompt_tokens`
+and `total_tokens` are omitted from `usage` entirely — rather than guessed —
+since an approximate count is worse than an obvious absence for a field
+clients bill against; only `completion_tokens` is present in that case.
 
 With `"stream": true`, Server-Sent Events are emitted live as the worker
 generates (`Content-Type: text/event-stream`):

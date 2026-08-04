@@ -689,4 +689,8 @@ impl<B: Backend> TextGeneration for Llama<B> {
 
         Ok(Box::pin(stream))
     }
+
+    fn count_prompt_tokens(&self, prompt: &str) -> Option<u32> {
+        self.tokenize_prompt(prompt).ok().map(|t| t.len() as u32)
+    }
 }
