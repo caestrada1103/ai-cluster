@@ -59,6 +59,9 @@ pub struct ModelLoaderConfig {
     /// Seconds to poll `llama-server`'s `/health` before declaring the load
     /// failed — reuses the worker's `request_timeout_secs`.
     pub llamaserver_health_timeout_secs: u64,
+    /// Maximum number of models kept resident at once (0 = unlimited). See
+    /// `WorkerConfig::max_loaded_models` in config/worker.toml.
+    pub max_loaded_models: usize,
 }
 
 impl Default for ModelLoaderConfig {
@@ -74,6 +77,7 @@ impl Default for ModelLoaderConfig {
             llamaserver_binary_path: "llama-server".to_string(),
             llamaserver_bind_host: "0.0.0.0".to_string(),
             llamaserver_health_timeout_secs: 120,
+            max_loaded_models: 0,
         }
     }
 }
@@ -95,12 +99,28 @@ pub struct ModelLoader {
     /// separate from `loaded_models` because the child handle (not a
     /// `TextGeneration`) must be reachable for kill-on-unload and liveness.
     llamaserver_processes: Arc<DashMap<String, Arc<tokio::sync::Mutex<LlamaServerProcess>>>>,
+    /// Models evicted internally by the `max_loaded_models` policy, awaiting
+    /// pickup by the gRPC layer.
+    ///
+    /// `worker.rs` keeps its OWN `loaded_models` map, and only its gRPC
+    /// `unload_model` handler clears both. An eviction happens *inside*
+    /// `load_model`, so without this queue `worker.rs` would keep a stale
+    /// entry — reporting the model as loaded and, worse for the in-process
+    /// `llamacpp` engine, holding the last `Arc` to the model so its weights
+    /// would never be freed. Drained by [`ModelLoader::take_evicted`].
+    /// `tokio::sync::Mutex` (not the `std::sync::Mutex` imported above) because
+    /// it is locked from async code across the eviction path.
+    evicted_pending: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Path to the `llama-server` binary (env/config resolved).
     llamaserver_binary_path: String,
     /// `--host` bind interface for spawned `llama-server` processes.
     llamaserver_bind_host: String,
     /// `/health` poll timeout (seconds) for a spawned `llama-server`.
     llamaserver_health_timeout_secs: u64,
+    /// Maximum number of models kept resident at once (0 = unlimited). When a
+    /// load would exceed this, `load_model` evicts the oldest-loaded model(s)
+    /// first via `unload`.
+    max_loaded_models: usize,
 }
 
 impl ModelLoader {
@@ -139,9 +159,11 @@ impl ModelLoader {
             llamacpp_n_threads: config.llamacpp_n_threads,
             llamacpp_default_n_gpu_layers: config.llamacpp_default_n_gpu_layers,
             llamaserver_processes: Arc::new(DashMap::new()),
+            evicted_pending: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             llamaserver_binary_path: config.llamaserver_binary_path,
             llamaserver_bind_host: config.llamaserver_bind_host,
             llamaserver_health_timeout_secs: config.llamaserver_health_timeout_secs,
+            max_loaded_models: config.max_loaded_models,
         })
     }
 
@@ -186,6 +208,37 @@ impl ModelLoader {
             return Ok(entry.value().clone());
         }
 
+        // Resident-model cap: evict the oldest-loaded model(s) to make room
+        // before starting this load. `max_loaded_models == 0` means
+        // unlimited (no eviction, preserves prior behavior).
+        while self.max_loaded_models > 0 && self.loaded_models.len() >= self.max_loaded_models {
+            // Find the oldest-loaded entry that isn't the model we're about
+            // to load. Collect the victim's name into an owned String and
+            // drop the DashMap iterator before awaiting `unload` — holding a
+            // DashMap ref/iterator across an `.await` on another shard can
+            // deadlock.
+            let victim = self
+                .loaded_models
+                .iter()
+                .filter(|entry| entry.key() != model_name)
+                .min_by_key(|entry| entry.value().loaded_at())
+                .map(|entry| entry.key().clone());
+
+            let Some(victim) = victim else {
+                // No eviction candidate (e.g. every remaining entry is the
+                // target itself) — break rather than spinning forever.
+                break;
+            };
+
+            info!(
+                "Evicting {} (max_loaded_models = {}) to make room for {}",
+                victim, self.max_loaded_models, model_name
+            );
+            self.unload(&victim).await;
+            // Hand the name to the gRPC layer so it drops its own copy too.
+            self.evicted_pending.lock().await.push(victim);
+        }
+
         let _permit =
             self.load_semaphore.acquire().await.map_err(|e| {
                 WorkerError::Resource(format!("Failed to acquire load permit: {}", e))
@@ -211,7 +264,10 @@ impl ModelLoader {
         // child process (Plan 13). Checked BEFORE the gguf branch below —
         // `gguf_spec_from_metadata` errors on an unknown engine string like
         // "llamaserver", so this must intercept it first.
-        if let Some(spec) = llamaserver_spec_from_metadata(model_config.map(|c| &c.metadata))? {
+        if let Some(spec) = llamaserver_spec_from_metadata(
+            model_config.map(|c| &c.metadata),
+            self.llamacpp_default_n_gpu_layers,
+        )? {
             return self
                 .load_llamaserver_model(model_name, spec, gpu_ids, quantization, parallelism)
                 .await;
@@ -511,25 +567,37 @@ impl ModelLoader {
             model_name, spec.port, spec.repo_id, spec.file
         );
 
-        // Resolve/download the GGUF — identical hf-hub pattern to llama.cpp.
+        // Resolve/download the GGUF (plus any sibling shards) — identical
+        // hf-hub pattern to llama.cpp.
         let api = self
             .hf_api
             .as_ref()
             .ok_or_else(|| WorkerError::ModelLoad("HF API not initialized".to_string()))?;
         let repo = api.repo(Repo::new(spec.repo_id.clone(), RepoType::Model));
-        let gguf_path = repo.get(&spec.file).await.map_err(|e| {
-            WorkerError::ModelLoad(format!(
-                "Failed to download GGUF {}/{}: {}",
-                spec.repo_id, spec.file, e
-            ))
-        })?;
+        let (gguf_path, file_size) = download_gguf(&repo, &spec.file).await?;
 
-        // Honest VRAM estimate: the GGUF file size (llama-server holds the real
-        // weights in its own process; this is bookkeeping for placement).
-        let file_size = tokio::fs::metadata(&gguf_path)
-            .await
-            .map_err(|e| WorkerError::ModelLoad(format!("Failed to stat GGUF: {}", e)))?
-            .len();
+        // Log the effective per-slot / total context BEFORE spawning, so a
+        // misconfiguration is loud in the logs even if `/props` verification
+        // below is inconclusive (process not reachable yet, etc.). See the
+        // `LlamaServerSpec::n_ctx`/`total_ctx` docs for why this multiply
+        // exists: llama-server divides its own `-c` evenly across
+        // `--parallel` slots, so the registry's `n_ctx` must be multiplied by
+        // `parallel` here to keep meaning "tokens per conversation".
+        match spec.total_ctx()? {
+            Some(total) => info!(
+                "llama-server {}: n_ctx={} tokens/slot x parallel={} slots = {} total context (-c)",
+                model_name,
+                spec.n_ctx.unwrap_or_default(),
+                spec.parallel,
+                total
+            ),
+            None => info!(
+                "llama-server {}: no n_ctx configured — using llama-server's own default context \
+                 (per-slot value cannot be verified from config alone)",
+                model_name
+            ),
+        }
+
         let mut reserved_gpus: Vec<usize> = Vec::new();
         for &gpu_id in gpu_ids {
             match self
@@ -548,7 +616,15 @@ impl ModelLoader {
         }
 
         // Build argv + spawn. On failure roll back the reservations.
-        let args = spec.build_args(&gguf_path, &self.llamaserver_bind_host);
+        let args = match spec.build_args(&gguf_path, &self.llamaserver_bind_host) {
+            Ok(args) => args,
+            Err(e) => {
+                for &g in &reserved_gpus {
+                    self.gpu_manager.free_memory(g, model_name).await;
+                }
+                return Err(e);
+            }
+        };
         let spawn_res =
             LlamaServerProcess::spawn(model_name, spec.port, &self.llamaserver_binary_path, &args);
         let mut process = match spawn_res {
@@ -571,6 +647,12 @@ impl ModelLoader {
             }
             return Err(e);
         }
+
+        // Best-effort: cross-check the context llama-server actually started
+        // with against what this load computed, so a future regression in
+        // this arithmetic (or in llama-server's own slot-division behavior)
+        // is loud in the logs rather than silently wrong again.
+        process.verify_props(spec.total_ctx()?).await;
 
         // Register the supervised child + a model-less instance (inference goes
         // through the coordinator HTTP proxy, not this worker's gRPC Infer).
@@ -606,6 +688,14 @@ impl ModelLoader {
     /// `loaded_models`, and free their GPU reservations. Returns the reaped
     /// model names so callers can prune their own view too. Keeps status honest
     /// ("report as not loaded" once the child dies) without a background task.
+    /// Drain the names evicted by the `max_loaded_models` policy since the last
+    /// call. The caller (`worker.rs`) must remove each from its own
+    /// `loaded_models` map and clear the model's metrics — see
+    /// [`ModelLoader::evicted_pending`] for why that second map exists.
+    pub async fn take_evicted(&self) -> Vec<String> {
+        std::mem::take(&mut *self.evicted_pending.lock().await)
+    }
+
     pub async fn reap_exited_llamaservers(&self) -> Vec<String> {
         let names: Vec<String> = self
             .llamaserver_processes
@@ -871,29 +961,35 @@ impl ModelLoader {
             model_name, spec.repo_id, spec.file
         );
 
-        // Download the GGUF with the same hf-hub API pattern as safetensors.
+        // Download the GGUF (plus any sibling shards) with the same hf-hub
+        // API pattern as safetensors.
         let api = self
             .hf_api
             .as_ref()
             .ok_or_else(|| WorkerError::ModelLoad("HF API not initialized".to_string()))?;
         let repo = api.repo(Repo::new(spec.repo_id.clone(), RepoType::Model));
-        let gguf_path = repo.get(&spec.file).await.map_err(|e| {
-            WorkerError::ModelLoad(format!(
-                "Failed to download GGUF {}/{}: {}",
-                spec.repo_id, spec.file, e
-            ))
-        })?;
+        let (gguf_path, file_size) = download_gguf(&repo, &spec.file).await?;
 
-        // Honest VRAM estimate: the GGUF file size. llama.cpp uses the
-        // quantized weights as-is; the per-request KV cache is not counted.
-        let file_size = tokio::fs::metadata(&gguf_path)
-            .await
-            .map_err(|e| WorkerError::ModelLoad(format!("Failed to stat GGUF: {}", e)))?
-            .len();
+        // Phase 1 — reserve the weights (the total GGUF size across every
+        // shard; llama.cpp uses the quantized weights as-is). The KV cache
+        // needs the model's dimensions, which are only known once it is
+        // loaded, so it is reserved in phase 2 below. Roll back on partial
+        // failure, matching every sibling path.
+        let mut reserved_gpus: Vec<usize> = Vec::new();
         for &gpu_id in gpu_ids {
-            self.gpu_manager
+            match self
+                .gpu_manager
                 .allocate_memory(gpu_id as usize, file_size, model_name)
-                .await?;
+                .await
+            {
+                Ok(()) => reserved_gpus.push(gpu_id as usize),
+                Err(e) => {
+                    for &g in &reserved_gpus {
+                        self.gpu_manager.free_memory(g, model_name).await;
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         // Model load is blocking (mmap + optional GPU upload) — one
@@ -915,7 +1011,43 @@ impl ModelLoader {
             )
         })
         .await
-        .map_err(|e| WorkerError::Internal(format!("spawn_blocking join error: {e}")))??;
+        .map_err(|e| WorkerError::Internal(format!("spawn_blocking join error: {e}")));
+
+        // The load itself can fail (bad GGUF, OOM inside llama.cpp) — release
+        // the phase-1 weight reservation before propagating.
+        let engine = match engine {
+            Ok(Ok(engine)) => engine,
+            Ok(Err(e)) | Err(e) => {
+                for &g in &reserved_gpus {
+                    self.gpu_manager.free_memory(g, model_name).await;
+                }
+                return Err(e);
+            }
+        };
+
+        // Phase 2 — reserve the KV cache now that the model's dimensions are
+        // known. The in-process engine builds one context per request, so a
+        // single slot is the honest per-load figure; concurrent requests are
+        // separately bounded by `max_concurrent_requests`.
+        let kv_bytes = engine.kv_cache_bytes(1);
+        for &gpu_id in gpu_ids {
+            if let Err(e) = self
+                .gpu_manager
+                .allocate_memory(gpu_id as usize, kv_bytes, model_name)
+                .await
+            {
+                for &g in &reserved_gpus {
+                    self.gpu_manager.free_memory(g, model_name).await;
+                }
+                return Err(e);
+            }
+        }
+        info!(
+            "GGUF {} reserved {:.2} GiB weights + {:.2} GiB KV cache",
+            model_name,
+            file_size as f64 / (1024.0 * 1024.0 * 1024.0),
+            kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
 
         // Explicit trait-object coercion, same style as the Burn branches above.
         let model: Arc<Mutex<dyn TextGeneration + Send>> = Arc::new(Mutex::new(engine));
@@ -956,6 +1088,156 @@ impl ModelLoader {
             model_name
         )))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-shard GGUF download (always compiled — pure hf-hub + string logic,
+// no llama.cpp dependency). HuggingFace splits very large GGUFs across
+// several files because of its per-file size cap (naming convention
+// `<prefix>-%05d-of-%05d.gguf`, e.g. "...-00001-of-00004.gguf"). llama.cpp
+// itself auto-loads every sibling once given the FIRST shard's local path,
+// but only if every shard already sits next to it on disk — hf-hub does not
+// fetch siblings on its own, so the loader must resolve and download every
+// shard before handing the first one's path to llama.cpp / llama-server.
+// ---------------------------------------------------------------------------
+
+/// Reject a GGUF filename (or a shard name derived from one) that could
+/// escape the HF cache directory once handed to `hf-hub`.
+///
+/// `hf_hub::CacheRepo::get`/`ApiRepo::download_with_progress` build the local
+/// cache path with `PathBuf::push(filename)` and DO NOT sanitize `..`
+/// components or absolute paths themselves (verified against hf-hub 0.4.3
+/// `src/lib.rs::CacheRepo::get` / `src/api/tokio.rs::download_with_progress`
+/// — `pointer_path.push(filename)`, no validation). A `filename` of
+/// `"../../../../etc/passwd"` (or similar) would make the resulting pointer
+/// path — and, via `symlink_or_rename`, an actual symlink — land outside the
+/// cache directory. This is a property of the crate, not of shard
+/// derivation specifically, but shard derivation (`gguf_shard_filenames`)
+/// generates NEW filenames from `file` at runtime that were never literally
+/// present in `config/models.toml`, so every one of them is re-validated
+/// here too, not just the configured `file`.
+///
+/// Rejects: empty, absolute (leading `/` or `\`, or a Windows drive prefix
+/// like `C:`), and any path component that is exactly `.` or `..`. Forward-
+/// slash directory prefixes are otherwise ALLOWED — that is a legitimate,
+/// already-used pattern (e.g. the commented-out `glm-4.5-air-gguf` entry's
+/// `file = "Q4_K_M/GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf"`).
+fn is_safe_gguf_relative_path(name: &str) -> bool {
+    if name.is_empty() || name.starts_with('/') || name.starts_with('\\') {
+        return false;
+    }
+    if name.as_bytes().get(1) == Some(&b':') {
+        return false; // e.g. "C:\..." — hf-hub is cross-platform even if this worker targets Linux today
+    }
+    name.split(['/', '\\'])
+        .all(|part| part != "." && part != "..")
+}
+
+/// Parse the `<prefix>-<NNNNN>-of-<MMMMM>.gguf` shard-naming convention.
+///
+/// Returns `(prefix, shard_index, total_shards, digit_width)` on a match.
+/// Both numeric groups must be the same zero-padded width (the real
+/// llama.cpp/HuggingFace convention — guards against false positives like
+/// "release-2024-of-3.gguf") and `1 <= shard_index <= total_shards`;
+/// anything else is treated as "not actually a shard filename" (`None`), so
+/// ordinary single-file GGUFs are always left untouched.
+fn parse_shard_suffix(file: &str) -> Option<(&str, u32, u32, usize)> {
+    let stem = file.strip_suffix(".gguf")?;
+    // rsplitn(4, '-') yields, from the right: [total, "of", index, prefix]
+    // (the 4th item absorbs everything else, so a prefix containing '-' is
+    // preserved verbatim).
+    let mut parts = stem.rsplitn(4, '-');
+    let total_str = parts.next()?;
+    let of_str = parts.next()?;
+    let index_str = parts.next()?;
+    let prefix = parts.next()?;
+    if of_str != "of" {
+        return None;
+    }
+    let digit_width = index_str.len();
+    if digit_width == 0
+        || total_str.len() != digit_width
+        || !index_str.bytes().all(|b| b.is_ascii_digit())
+        || !total_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let index: u32 = index_str.parse().ok()?;
+    let total: u32 = total_str.parse().ok()?;
+    if index == 0 || total == 0 || index > total {
+        return None;
+    }
+    Some((prefix, index, total, digit_width))
+}
+
+/// Every shard filename a configured GGUF `file` needs, in order
+/// (`...-00001-of-N...` first). Returns `vec![file.to_string()]` unchanged
+/// when `file` does not match the multi-shard naming convention — the common
+/// case, and byte-for-byte the prior single-file behavior.
+fn gguf_shard_filenames(file: &str) -> Vec<String> {
+    match parse_shard_suffix(file) {
+        Some((prefix, _index, total, width)) => (1..=total)
+            .map(|i| format!("{prefix}-{i:0width$}-of-{total:0width$}.gguf"))
+            .collect(),
+        None => vec![file.to_string()],
+    }
+}
+
+/// Download `file` and, if it is part of a multi-shard GGUF, every sibling
+/// shard too (see [`gguf_shard_filenames`]). Returns the local path of
+/// `file` itself (what gets handed to llama.cpp / llama-server as `-m`) and
+/// the TOTAL size in bytes across every downloaded shard — the honest weight
+/// size for GPU-memory reservation/logging, not just the first shard's size.
+async fn download_gguf(
+    repo: &hf_hub::api::tokio::ApiRepo,
+    file: &str,
+) -> Result<(PathBuf, u64), WorkerError> {
+    // Validate BEFORE any shard derivation or network/filesystem action — see
+    // `is_safe_gguf_relative_path` for why this exists.
+    if !is_safe_gguf_relative_path(file) {
+        return Err(WorkerError::Configuration(format!(
+            "invalid GGUF filename '{file}': must be a relative path with no '.'/'..' components"
+        )));
+    }
+    let shards = gguf_shard_filenames(file);
+    if shards.len() > 1 {
+        info!(
+            "GGUF '{}' is a {}-shard model — fetching all shards before loading",
+            file,
+            shards.len()
+        );
+    }
+    let mut primary: Option<PathBuf> = None;
+    let mut total_bytes: u64 = 0;
+    for shard in &shards {
+        // Defense in depth: every DERIVED shard name is re-checked too, not
+        // just the configured `file` above (see the doc comment on
+        // `is_safe_gguf_relative_path`).
+        if !is_safe_gguf_relative_path(shard) {
+            return Err(WorkerError::Configuration(format!(
+                "invalid derived GGUF shard name '{shard}': must be a relative path with no '.'/'..' components"
+            )));
+        }
+        let path = repo.get(shard).await.map_err(|e| {
+            WorkerError::ModelLoad(format!("Failed to download GGUF shard '{shard}': {e}"))
+        })?;
+        let size = tokio::fs::metadata(&path)
+            .await
+            .map_err(|e| {
+                WorkerError::ModelLoad(format!("Failed to stat GGUF shard '{shard}': {e}"))
+            })?
+            .len();
+        total_bytes += size;
+        if shard == file {
+            primary = Some(path);
+        }
+    }
+    let primary = primary.ok_or_else(|| {
+        WorkerError::ModelLoad(format!(
+            "internal error: shard list for '{file}' did not include the file itself"
+        ))
+    })?;
+    Ok((primary, total_bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,6 +1475,135 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    // --- path-traversal validation (security hardening on fix 3) ----------
+
+    #[test]
+    fn safe_path_accepts_plain_and_directory_prefixed_names() {
+        assert!(is_safe_gguf_relative_path("model-q4_k_m.gguf"));
+        assert!(is_safe_gguf_relative_path(
+            "Q4_K_M/GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf"
+        ));
+        // A component that merely STARTS with ".." but isn't exactly ".." is
+        // a legitimate (if unusual) filename, not a traversal.
+        assert!(is_safe_gguf_relative_path("..hidden-00001-of-00002.gguf"));
+    }
+
+    #[test]
+    fn safe_path_rejects_traversal_and_absolute_paths() {
+        assert!(!is_safe_gguf_relative_path(""));
+        assert!(!is_safe_gguf_relative_path("../../../../etc/passwd"));
+        assert!(!is_safe_gguf_relative_path("a/../../b.gguf"));
+        assert!(!is_safe_gguf_relative_path("./model.gguf"));
+        assert!(!is_safe_gguf_relative_path("/etc/passwd"));
+        assert!(!is_safe_gguf_relative_path("\\Windows\\System32\\evil"));
+        assert!(!is_safe_gguf_relative_path("C:\\evil.gguf"));
+    }
+
+    #[test]
+    fn download_gguf_rejects_traversal_before_any_shard_expansion() {
+        // gguf_shard_filenames is pure string logic and never invoked over
+        // the network, so this exercises the same validation `download_gguf`
+        // performs without needing a real hf-hub API/repo. A crafted
+        // multi-shard-looking traversal filename must never even reach shard
+        // expansion/download.
+        assert!(!is_safe_gguf_relative_path(
+            "../../../../etc/cron.d/evil-00001-of-00002.gguf"
+        ));
+    }
+
+    // --- multi-shard GGUF filename detection/generation (fix 3) ------------
+
+    #[test]
+    fn shard_pattern_single_file_unchanged() {
+        assert_eq!(
+            gguf_shard_filenames("qwen2.5-0.5b-instruct-q4_k_m.gguf"),
+            vec!["qwen2.5-0.5b-instruct-q4_k_m.gguf".to_string()]
+        );
+    }
+
+    #[test]
+    fn shard_pattern_detects_and_generates_all_siblings() {
+        let shards = gguf_shard_filenames("Qwen3-Coder-Next-00001-of-00004.gguf");
+        assert_eq!(
+            shards,
+            vec![
+                "Qwen3-Coder-Next-00001-of-00004.gguf".to_string(),
+                "Qwen3-Coder-Next-00002-of-00004.gguf".to_string(),
+                "Qwen3-Coder-Next-00003-of-00004.gguf".to_string(),
+                "Qwen3-Coder-Next-00004-of-00004.gguf".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shard_pattern_works_from_any_starting_shard() {
+        // The configured `file` need not be shard 1 — the sibling list is
+        // always the full 1..=total set regardless of which one was given.
+        let shards = gguf_shard_filenames("gpt-oss-120b-mxfp4-00003-of-00003.gguf");
+        assert_eq!(
+            shards,
+            vec![
+                "gpt-oss-120b-mxfp4-00001-of-00003.gguf".to_string(),
+                "gpt-oss-120b-mxfp4-00002-of-00003.gguf".to_string(),
+                "gpt-oss-120b-mxfp4-00003-of-00003.gguf".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shard_pattern_preserves_directory_prefix() {
+        let shards =
+            gguf_shard_filenames("Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-00001-of-00004.gguf");
+        assert_eq!(shards.len(), 4);
+        assert_eq!(
+            shards[3],
+            "Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-00004-of-00004.gguf"
+        );
+    }
+
+    #[test]
+    fn shard_pattern_two_way_split_with_directory() {
+        let shards = gguf_shard_filenames("Q4_K_M/GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf");
+        assert_eq!(
+            shards,
+            vec![
+                "Q4_K_M/GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf".to_string(),
+                "Q4_K_M/GLM-4.5-Air-Q4_K_M-00002-of-00002.gguf".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shard_pattern_rejects_malformed_or_non_shard_names() {
+        // No ".gguf" suffix at all.
+        assert_eq!(
+            gguf_shard_filenames("model-00001-of-00004"),
+            vec!["model-00001-of-00004".to_string()]
+        );
+        // Mismatched zero-padding width between the two numeric groups.
+        assert_eq!(
+            gguf_shard_filenames("model-1-of-00004.gguf"),
+            vec!["model-1-of-00004.gguf".to_string()]
+        );
+        // Shard index 0 (1-based convention) is not a valid shard set.
+        assert_eq!(
+            gguf_shard_filenames("model-00000-of-00004.gguf"),
+            vec!["model-00000-of-00004.gguf".to_string()]
+        );
+        // Shard index beyond the declared total.
+        assert_eq!(
+            gguf_shard_filenames("model-00005-of-00004.gguf"),
+            vec!["model-00005-of-00004.gguf".to_string()]
+        );
+        // A filename that merely CONTAINS "-of-" text but isn't the shard
+        // pattern (non-digit segment where the index should be) must fall
+        // through unchanged rather than false-positive.
+        assert_eq!(
+            gguf_shard_filenames("best-of-3-results.gguf"),
+            vec!["best-of-3-results.gguf".to_string()]
+        );
     }
 
     #[test]
