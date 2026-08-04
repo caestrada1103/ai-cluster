@@ -212,7 +212,11 @@ amd-node-3 = [0]
 # contract; a `[models.X.llamaserver]` sub-table (mirroring the `.gguf`
 # sub-table pattern already used above) with:
 #   port        (int, REQUIRED)  -> --port <N>, coordinator-assigned, unique per model
-#   parallel    (int, optional)  -> --parallel <N>, default 4 if omitted
+#   instances   (int, optional)  -> --parallel <N> (conversation slots), default 1.
+#                                     `parallel` also still works (alias). Overridable
+#                                     per-load via POST /v1/models/load {"instances": N};
+#                                     the worker reserves memory for N slots and refuses
+#                                     the load if it does not fit.
 #   extra_args  (string, optional) -> whitespace-split, appended verbatim to the
 #                                     llama-server command line (e.g. MoE CPU-offload flags)
 # NOTE: engine = "llamaserver" and the `[models.X.llamaserver]` table will not
