@@ -23,6 +23,7 @@ pub mod backend;
 mod config;
 mod error;
 mod gpu_manager;
+mod grpc_auth;
 #[cfg(feature = "llamacpp")]
 mod llamacpp_engine;
 mod llamaserver_process;
@@ -42,6 +43,7 @@ pub mod cluster {
 use crate::cluster::worker_server::WorkerServer;
 use crate::config::WorkerConfig;
 use crate::error::WorkerError;
+use crate::grpc_auth::TokenInterceptor;
 use crate::metrics::MetricsServer;
 use crate::model_loader::{ModelLoader, ModelLoaderConfig};
 use crate::worker::WorkerService;
@@ -217,6 +219,11 @@ async fn async_main(
         // Reuse the worker's single load/inference timeout for /health polling.
         llamaserver_health_timeout_secs: config.request_timeout_secs,
         max_loaded_models: config.max_loaded_models,
+        max_n_ctx: config.max_n_ctx,
+        max_concurrent_requests: config.max_concurrent_requests,
+        llamaserver_enable_slots_endpoint: config.llamaserver_enable_slots_endpoint,
+        llamaserver_port_min: config.llamaserver_port_min,
+        llamaserver_port_max: config.llamaserver_port_max,
     };
     let model_loader = Arc::new(ModelLoader::new(loader_config, gpu_manager.clone())?);
 
@@ -227,6 +234,28 @@ async fn async_main(
         .worker_id
         .or_else(|| config.worker_id.clone())
         .unwrap_or_else(|| format!("worker-{}", gpu_ids[0]));
+
+    // C1: bind interface is config-driven and defaults to loopback-only
+    // (WorkerConfig::default's grpc_bind_host = "127.0.0.1") — a
+    // non-loopback bind is an explicit opt-in (worker.toml/env), mirroring
+    // how gpu_ids/ports already resolve. Computed BEFORE `config` moves into
+    // `WorkerService::new` below.
+    let bind_ip: std::net::IpAddr = config.grpc_bind_host.parse().map_err(|e| {
+        WorkerError::Configuration(format!(
+            "invalid grpc_bind_host '{}': {e}",
+            config.grpc_bind_host
+        ))
+    })?;
+    let addr = SocketAddr::from((bind_ip, grpc_port));
+
+    // C1: shared-secret auth, gated on config. Env WORKER_GRPC_AUTH_TOKEN
+    // wins over worker.toml's grpc_auth_token, mirroring HF_TOKEN/
+    // LLAMASERVER_BINARY_PATH. `None`/empty leaves the server OPEN — the
+    // existing behavior for single-host loopback-only deployments.
+    let grpc_auth_token = std::env::var("WORKER_GRPC_AUTH_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| config.grpc_auth_token.clone());
 
     // Create worker service
     let worker_service = WorkerService::new(worker_id, gpu_manager.clone(), model_loader, config);
@@ -239,9 +268,16 @@ async fn async_main(
         }
     });
     info!("Metrics server listening on port {}", metrics_port);
-
-    // Build gRPC server
-    let addr = SocketAddr::from(([0, 0, 0, 0], grpc_port));
+    if grpc_auth_token.is_none() && !bind_ip.is_loopback() {
+        warn!(
+            "gRPC server binding to non-loopback address {} with NO grpc_auth_token/\
+             WORKER_GRPC_AUTH_TOKEN configured — every gRPC RPC (LoadModel, Infer, ...) \
+             is reachable by anyone who can route to this address. Set \
+             WORKER_GRPC_AUTH_TOKEN (or worker.toml's grpc_auth_token) before exposing \
+             this port beyond a container-internal network you already trust.",
+            addr
+        );
+    }
     info!("gRPC server listening on {}", addr);
 
     // Health service
@@ -250,9 +286,15 @@ async fn async_main(
         .set_serving::<WorkerServer<WorkerService>>()
         .await;
 
+    let interceptor = TokenInterceptor::new(grpc_auth_token);
+
     Server::builder()
+        // The plain gRPC health-check service is intentionally left
+        // unauthenticated — orchestrators/load balancers/`grpc_health_probe`
+        // need to reach it without a credential, and it exposes no model
+        // data or control-plane actions.
         .add_service(health_service)
-        .add_service(WorkerServer::new(worker_service))
+        .add_service(WorkerServer::with_interceptor(worker_service, interceptor))
         .serve(addr)
         .await
         .map_err(|e| WorkerError::Grpc(format!("Server error: {}", e)))?;
