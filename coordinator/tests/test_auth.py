@@ -161,3 +161,54 @@ def test_uses_constant_time_comparison() -> None:
     """Guard against a naive `==`/`in` regression: must use secrets.compare_digest."""
     source = inspect.getsource(auth)
     assert "compare_digest" in source
+
+
+# ---------------------------------------------------------------------------
+# L1: non-ASCII candidate key must 401, never an unhandled 500
+# ---------------------------------------------------------------------------
+
+
+def test_non_ascii_x_api_key_header_returns_401_not_500(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A str candidate outside the ASCII range used to make
+    secrets.compare_digest raise TypeError (it requires ASCII-only str
+    arguments), surfacing as an unstyled 500 instead of a clean 401.
+
+    httpx's own client-side header encoding rejects a plain `str` containing
+    non-ASCII (it round-trips through the `ascii` codec unless given raw
+    `bytes`), so this sends the header value as latin-1-encoded bytes — the
+    same thing ASGI/Starlette hands the app for any header a raw socket
+    client can send, bypassing httpx's own validation.
+    """
+    monkeypatch.setenv("COORDINATOR_API_KEYS", "secret-key")
+    response = client.get(
+        "/",
+        headers=[(b"x-api-key", "café-not-the-key".encode("latin-1"))],
+    )
+    assert response.status_code == 401
+
+
+def test_matches_any_handles_non_ascii_without_raising() -> None:
+    """Direct unit check of the comparison helper for the same case."""
+    assert auth._matches_any("café", frozenset({"secret-key"})) is False
+    # A configured key itself containing non-ASCII must still be matchable.
+    assert auth._matches_any("café", frozenset({"café"})) is True
+
+
+# ---------------------------------------------------------------------------
+# L2: CORS preflight (OPTIONS) must never be gated behind the API key
+# ---------------------------------------------------------------------------
+
+
+def test_options_preflight_bypasses_auth_when_keys_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A CORS preflight carries no Authorization/x-api-key by design — gating
+    it behind auth 401s it before CORSMiddleware can attach headers, which
+    the browser then misreports as a CORS failure on the real request."""
+    monkeypatch.setenv("COORDINATOR_API_KEYS", "secret-key")
+    response = client.options(
+        "/v1/models",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert response.status_code != 401
