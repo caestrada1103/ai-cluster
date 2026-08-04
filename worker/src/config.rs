@@ -81,6 +81,13 @@ pub struct WorkerConfig {
     /// the coordinator can reach it across the trusted LAN — firewall the
     /// llamaserver ports to the LAN (there is no built-in auth on that port).
     pub llamaserver_bind_host: String,
+
+    /// Maximum number of models kept resident at once. Default `0` means
+    /// unlimited (preserves existing behavior — no eviction). When a load
+    /// would exceed this limit, the oldest-loaded model(s) are evicted first
+    /// to make room. Set to `1` for one-model-at-a-time on memory-constrained
+    /// hosts (e.g. a single unified-memory DGX Spark node).
+    pub max_loaded_models: usize,
 }
 
 impl Default for WorkerConfig {
@@ -104,6 +111,7 @@ impl Default for WorkerConfig {
             rpc_server_bind_host: None,
             llamaserver_binary_path: "llama-server".to_string(),
             llamaserver_bind_host: "0.0.0.0".to_string(),
+            max_loaded_models: 0,
         }
     }
 }
@@ -229,5 +237,26 @@ mod tests {
             "/opt/llama.cpp/llama-server"
         );
         assert_eq!(config.llamaserver_bind_host, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_max_loaded_models_default_unlimited() {
+        let config = WorkerConfig::default();
+        assert_eq!(config.max_loaded_models, 0);
+    }
+
+    #[test]
+    fn test_max_loaded_models_parses_from_flat_toml() {
+        let toml_str = "max_loaded_models = 1\n";
+        let config: WorkerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.max_loaded_models, 1);
+    }
+
+    #[test]
+    fn test_shipped_config_parses_with_max_loaded_models_one() {
+        // The shipped worker.toml targets a DGX Spark and pins one resident model.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../config/worker.toml");
+        let config = WorkerConfig::from_file(path).unwrap();
+        assert_eq!(config.max_loaded_models, 1);
     }
 }
