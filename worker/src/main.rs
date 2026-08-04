@@ -185,14 +185,8 @@ async fn async_main(
     #[cfg(feature = "wgpu")]
     {
         use burn::backend::wgpu::WgpuDevice;
-        // WgpuDevice::default() picks the best available adapter automatically:
-        //   Windows  → DX12 (prefers discrete GPU, e.g. RTX 3050)
-        //   Linux    → Vulkan (requires a hardware Vulkan ICD from the driver)
-        //   macOS    → Metal
-        // NOTE: in Docker Desktop on Windows (WSL2), NVIDIA's driver only exposes CUDA—
-        // no Vulkan ICD is injected—so wgpu falls back to Mesa llvmpipe (CPU).
-        // On a native Linux host with NVIDIA Container Toolkit + graphics capability,
-        // the NVIDIA Vulkan ICD is injected and the real GPU is selected.
+        // Auto-selects the best available adapter (DX12/Vulkan/Metal). See
+        // docs/troubleshooting.md for the Docker Desktop/WSL2 CPU-fallback gotcha.
         let device = WgpuDevice::default();
         info!("Selected WGPU Device: {:?}", device);
     }
@@ -237,11 +231,8 @@ async fn async_main(
         .or_else(|| config.worker_id.clone())
         .unwrap_or_else(|| format!("worker-{}", gpu_ids[0]));
 
-    // C1: bind interface is config-driven and defaults to loopback-only
-    // (WorkerConfig::default's grpc_bind_host = "127.0.0.1") — a
-    // non-loopback bind is an explicit opt-in (worker.toml/env), mirroring
-    // how gpu_ids/ports already resolve. Computed BEFORE `config` moves into
-    // `WorkerService::new` below.
+    // Bind interface defaults to loopback; non-loopback is an explicit
+    // opt-in. Computed before `config` moves into `WorkerService::new` below.
     let bind_ip: std::net::IpAddr = config.grpc_bind_host.parse().map_err(|e| {
         WorkerError::Configuration(format!(
             "invalid grpc_bind_host '{}': {e}",
@@ -250,10 +241,8 @@ async fn async_main(
     })?;
     let addr = SocketAddr::from((bind_ip, grpc_port));
 
-    // C1: shared-secret auth, gated on config. Env WORKER_GRPC_AUTH_TOKEN
-    // wins over worker.toml's grpc_auth_token, mirroring HF_TOKEN/
-    // LLAMASERVER_BINARY_PATH. `None`/empty leaves the server OPEN — the
-    // existing behavior for single-host loopback-only deployments.
+    // WORKER_GRPC_AUTH_TOKEN wins over worker.toml's grpc_auth_token.
+    // Empty/unset leaves the server open (fine for loopback-only deployments).
     let grpc_auth_token = std::env::var("WORKER_GRPC_AUTH_TOKEN")
         .ok()
         .filter(|s| !s.is_empty())
@@ -291,10 +280,8 @@ async fn async_main(
     let interceptor = TokenInterceptor::new(grpc_auth_token);
 
     Server::builder()
-        // The plain gRPC health-check service is intentionally left
-        // unauthenticated — orchestrators/load balancers/`grpc_health_probe`
-        // need to reach it without a credential, and it exposes no model
-        // data or control-plane actions.
+        // Health-check service is left unauthenticated — load balancers
+        // need to reach it without a credential, and it exposes nothing.
         .add_service(health_service)
         .add_service(WorkerServer::with_interceptor(worker_service, interceptor))
         .serve(addr)

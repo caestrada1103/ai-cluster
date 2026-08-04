@@ -1,14 +1,10 @@
-//! Shared-secret gRPC authentication (C1).
+//! Shared-secret gRPC authentication.
 //!
-//! The worker's gRPC service has no mTLS (out of scope per the security
-//! audit — a shared secret plus a loopback-by-default bind is the agreed
-//! deliverable). When [`crate::config::WorkerConfig::grpc_auth_token`] /
-//! `WORKER_GRPC_AUTH_TOKEN` is configured, every RPC (except the standard
-//! gRPC health-check service, which orchestrators/load balancers need to
-//! reach without a credential) must present a matching `x-worker-token`
-//! metadata value. When no token is configured the server stays OPEN —
-//! existing single-host deployments where `grpc_bind_host` stays loopback
-//! keep working unchanged; this is the "gated on config" requirement.
+//! When [`crate::config::WorkerConfig::grpc_auth_token`] /
+//! `WORKER_GRPC_AUTH_TOKEN` is configured, every RPC except the standard
+//! health-check service must present a matching `x-worker-token` metadata
+//! value. No token configured leaves the server open (loopback-only bind
+//! is the safety net).
 
 use tonic::metadata::MetadataMap;
 use tonic::service::Interceptor;
@@ -17,11 +13,8 @@ use tonic::{Request, Status};
 /// gRPC metadata key clients must set to the shared secret.
 pub const TOKEN_METADATA_KEY: &str = "x-worker-token";
 
-/// Constant-time byte comparison — avoids leaking the secret's length-prefix
-/// timing signal a naive `==` would give an attacker probing over the
-/// network. Still short-circuits on length mismatch (the length itself is
-/// not the secret) but never on content, so equal-length guesses all take
-/// the same time regardless of how many leading bytes match.
+/// Constant-time byte comparison — avoids leaking a timing signal on which
+/// byte differs. Still short-circuits on length mismatch.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -45,9 +38,7 @@ pub struct TokenInterceptor {
 }
 
 impl TokenInterceptor {
-    /// Build an interceptor. `token` is the effective, already-resolved
-    /// secret (env `WORKER_GRPC_AUTH_TOKEN` beats `worker.toml`'s
-    /// `grpc_auth_token` — resolved by the caller, mirroring `HF_TOKEN`).
+    /// Build an interceptor from the effective, already-resolved secret.
     pub fn new(token: Option<String>) -> Self {
         Self {
             token: token.filter(|t| !t.is_empty()),

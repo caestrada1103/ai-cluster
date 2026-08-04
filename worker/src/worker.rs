@@ -100,13 +100,9 @@ impl Drop for ActiveGuard {
 impl Worker for WorkerService {
     type InferStream = Pin<Box<dyn Stream<Item = Result<InferenceResponse, Status>> + Send>>;
 
-    // H6: `skip(self, request)` — the default `#[instrument]` behavior
-    // records every non-skipped argument via `Debug`, and `Request<T>`
-    // derives `Debug` over BOTH its gRPC metadata (headers — including any
-    // future auth header) and its message body (which can carry full user
-    // prompts elsewhere in this file). Recording the whole `Request` at INFO
-    // would put that into every worker log. Only an explicit, reviewed,
-    // non-sensitive field (`model_name`) is recorded instead.
+    // `skip(self, request)`: logging the whole Request would dump gRPC
+    // metadata/headers and (elsewhere in this file) prompt text into logs.
+    // Only the reviewed, non-sensitive `model_name` field is recorded.
     #[instrument(skip(self, request), fields(model_name = %request.get_ref().model_name))]
     async fn load_model(
         &self,
@@ -169,10 +165,8 @@ impl Worker for WorkerService {
                 let memory_used = model_instance.memory_used();
 
                 // Drop our copies of anything the loader evicted to honor
-                // `max_loaded_models`. The loader owns the eviction decision but
-                // cannot reach this map; without this, the stale entry would keep
-                // the model reported as loaded AND (for the in-process llamacpp
-                // engine) hold the last Arc, so its weights would never be freed.
+                // `max_loaded_models` — otherwise this map would keep a stale
+                // "loaded" entry and hold the last Arc, leaking the weights.
                 for evicted in self.model_loader.take_evicted().await {
                     self.loaded_models.write().await.remove(&evicted);
                     self.metrics.remove_model_metrics(&evicted);
@@ -214,8 +208,7 @@ impl Worker for WorkerService {
         }
     }
 
-    // H6: see `load_model`'s doc — the prompt text lives in this request's
-    // body, so `request` itself must never be captured by the span.
+    // See `load_model`'s note — the prompt text lives in the request body.
     #[instrument(skip(self, request), fields(model_name = %request.get_ref().model_name))]
     async fn infer(
         &self,
@@ -235,10 +228,8 @@ impl Worker for WorkerService {
             req.prompt.len()
         );
 
-        // llamaserver-engine models are served over the coordinator's HTTP
-        // proxy (agentic tool-calling / streaming), never through this gRPC
-        // data plane. Reject clearly instead of falling into the generic
-        // "no runnable model" path — and before consuming a concurrency permit.
+        // llamaserver-engine models are served via the coordinator's HTTP
+        // proxy, never this gRPC data plane — reject before taking a permit.
         if self.model_loader.is_llamaserver(&req.model_name) {
             return Err(Status::failed_precondition(format!(
                 "model '{}' uses the llamaserver engine; send agentic inference to the \
@@ -419,14 +410,13 @@ impl Worker for WorkerService {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    // H6: skip `_request` too — `Empty`'s body carries nothing sensitive,
-    // but the gRPC metadata (headers) on the same `Request` might.
+    // Skip `_request` too — its gRPC metadata (headers) might be sensitive.
     #[instrument(skip(self, _request))]
     async fn get_status(&self, _request: Request<Empty>) -> Result<Response<WorkerStatus>, Status> {
         debug!("Status request received - waiting for locks");
 
         // Reap any llama-server children that exited on their own so status
-        // reports them as unloaded (Plan 13 contract: process exit => unloaded).
+        // reports them as unloaded (process exit implies unloaded).
         let reaped = self.model_loader.reap_exited_llamaservers().await;
         if !reaped.is_empty() {
             let mut models = self.loaded_models.write().await;
@@ -478,7 +468,7 @@ impl Worker for WorkerService {
         }))
     }
 
-    // H6: see `load_model`'s doc.
+    // See `load_model`'s note.
     #[instrument(skip(self, request), fields(model_name = %request.get_ref().model_name))]
     async fn unload_model(
         &self,
@@ -509,7 +499,7 @@ impl Worker for WorkerService {
         }
     }
 
-    // H6: see `get_status`'s doc.
+    // See `get_status`'s note.
     #[instrument(skip(self, _request))]
     async fn health_check(
         &self,

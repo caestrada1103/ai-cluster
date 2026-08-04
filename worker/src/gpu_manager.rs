@@ -174,50 +174,10 @@ impl GPUManager {
         wgpu::Backend::Gl,
     ];
 
-    /// Pick ONE backend's adapter list and discard every other backend's
-    /// adapters entirely, so the same physical GPU enumerated under multiple
-    /// backends (e.g. NVIDIA GB10 as `IntegratedGpu` via Vulkan AND as
-    /// `Other` via GL) contributes exactly once.
-    ///
-    /// # Why not dedup by name/vendor/device instead?
-    ///
-    /// The previous implementation deduplicated adapters via
-    /// `format!("{name}-{vendor}-{device_type:?}")`. That key describes the
-    /// *GPU model*, not the physical card: two identical cards in a
-    /// multi-GPU rig (e.g. two RTX 3080s — a primary target configuration for
-    /// this project) report an IDENTICAL name, vendor id, and device_type, so
-    /// that key would silently collapse them into a single managed device.
-    /// It also failed the actual bug report (name AND device_type both
-    /// differ across backends for the same physical card: `NVIDIA GB10` /
-    /// `IntegratedGpu` on Vulkan vs. `NVIDIA GB10/PCIe` / `Other` on GL), so
-    /// it neither deduplicated correctly nor was safe to "fix" by loosening
-    /// the key further.
-    ///
-    /// wgpu's `AdapterInfo` (`name`, `vendor`, `device`, `device_type`,
-    /// `driver`, `driver_info`, `backend`) has no PCI bus/slot address or any
-    /// other per-instance identifier — `vendor`/`device` are PCI
-    /// vendor/device IDs, which identify the *model* (silicon), not the
-    /// physical instance. Two identical cards report identical values for
-    /// every field wgpu exposes. **There is therefore no reliable way, at the
-    /// wgpu API level, to tell two identical physical cards apart.** Picking
-    /// one backend and trusting that backend's own enumeration to list each
-    /// physical device once (which every backend's adapter enumeration does)
-    /// is the only strategy that can never merge genuinely distinct
-    /// hardware — the correctness property that matters most for a
-    /// multi-GPU rig. Its cost is the untested (but very unusual) case of a
-    /// single physical card double-enumerated *within one backend* by two
-    /// competing drivers/ICDs for that backend (e.g. two Vulkan ICDs
-    /// claiming the same device) — such a card would still be counted
-    /// twice. That is a host misconfiguration outside any topology this
-    /// project targets, not a supported multi-GPU shape, so we accept the
-    /// residual risk in exchange for never collapsing real multi-GPU rigs.
-    ///
-    /// Selection: the highest-priority backend (by [`BACKEND_PRIORITY`])
-    /// that has at least one non-CPU (`DeviceType::Cpu`) adapter wins. If no
-    /// backend has real hardware (e.g. only `llvmpipe`/software rasterizers
-    /// are present), fall back to the highest-priority backend present at
-    /// all, so behavior stays deterministic instead of depending on hash-map
-    /// iteration order.
+    /// Pick ONE backend's adapter list and discard the rest, so the same
+    /// physical GPU enumerated under multiple backends contributes exactly
+    /// once. wgpu's `AdapterInfo` has no per-instance identifier, so this is
+    /// the only strategy that never merges distinct hardware. See docs/configuration.md.
     fn select_hardware_adapters(infos: Vec<wgpu::AdapterInfo>) -> Vec<wgpu::AdapterInfo> {
         let mut by_backend: std::collections::HashMap<wgpu::Backend, Vec<wgpu::AdapterInfo>> =
             std::collections::HashMap::new();
@@ -248,12 +208,9 @@ impl GPUManager {
         }
     }
 
-    /// Detect available GPU devices using wgpu adapter enumeration.
-    ///
-    /// Collapses the same physical card enumerated under multiple backends
-    /// (Vulkan/DX12/GL/Metal) down to one device by keeping only one
-    /// backend's adapters — see [`select_hardware_adapters`] for the full
-    /// multi-GPU-safety reasoning.
+    /// Detect available GPU devices via wgpu adapter enumeration. Collapses
+    /// the same physical card enumerated under multiple backends down to one
+    /// device — see [`select_hardware_adapters`].
     async fn detect_devices() -> Vec<GPUDevice> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -336,20 +293,9 @@ impl GPUManager {
         devices
     }
 
-    /// Resolve `(total_bytes, available_bytes)` for one adapter.
-    ///
-    /// Precedence, highest first:
-    /// 1. `GPU_VRAM_GB` — an explicit operator override. It previously could
-    ///    be silently clobbered a few lines later by a successful
-    ///    `nvidia-smi`/`rocm-smi` query; that was a bug (the override is
-    ///    documented as highest priority) — checking it first and returning
-    ///    immediately fixes that.
-    /// 2. A real vendor query (NVIDIA: CUDA driver API, then `nvidia-smi`;
-    ///    AMD: `rocm-smi`), which reports both total AND currently-free
-    ///    memory when available.
-    /// 3. [`estimate_total_memory`] (unified-memory /proc/meminfo budget, or
-    ///    a conservative 8 GiB default) — total only; "available" is assumed
-    ///    equal to total since nothing else is known.
+    /// Resolve `(total_bytes, available_bytes)` for one adapter. Precedence:
+    /// `GPU_VRAM_GB` override, then a real vendor query (CUDA/`nvidia-smi` or
+    /// `rocm-smi`), then [`estimate_total_memory`].
     fn detect_memory(device_idx: usize, adapter_name: &str, is_unified: bool) -> (u64, u64) {
         if let Some(bytes) = Self::vram_override_bytes() {
             return (bytes, bytes);
@@ -389,60 +335,18 @@ impl GPUManager {
     }
 
     /// Best-effort NVIDIA `(total, free)` bytes via the CUDA driver API,
-    /// loaded at runtime with `dlopen` (see [`cuda_driver`]) so hosts and
-    /// builds without an NVIDIA driver never link against or require it —
-    /// AMD-only, Intel-only, and Vulkan-only builds/hosts are completely
-    /// unaffected, and any failure (missing library, missing symbol, a
-    /// non-success `CUresult`) just returns `None` and falls through to
-    /// `nvidia-smi`.
-    ///
-    /// # Why not `nvidia-smi` or NVML (`libnvidia-ml.so`) alone?
-    ///
-    /// Both report failure for the "FB Memory" total/free query on
-    /// unified-memory NVIDIA hardware. Verified manually on a DGX Spark
-    /// (GB10) host: `nvidia-smi --query-gpu=memory.total` prints `[N/A]`,
-    /// and calling `nvmlDeviceGetMemoryInfo`/`nvmlDeviceGetMemoryInfo_v2`
-    /// directly returns `NVML_ERROR_NOT_SUPPORTED` (return code 3) even
-    /// though the GPU is otherwise fully functional. `cuMemGetInfo` on the
-    /// *driver* API queries the actual CUDA-allocatable memory pool and
-    /// works correctly there instead — confirmed manually on the same host:
-    /// 124545 MiB total / ~124.1 GiB free, matching `llama-server
-    /// --list-devices`'s independently-reported `CUDA0: NVIDIA GB10 (124545
-    /// MiB, 113235 MiB free)` for the same card. NVML was evaluated and
-    /// rejected specifically because of this: it shares nvidia-smi's
-    /// underlying query and fails the same way.
-    ///
-    /// # Why dlopen instead of a build dependency?
-    ///
-    /// A `cust`/`cudarc`/`nvml-wrapper`-style crate dependency would need to
-    /// either link `libcuda.so` unconditionally (breaking AMD-only,
-    /// Intel-only, and Vulkan-only builds that have no CUDA toolkit
-    /// installed) or be feature-gated behind a new Cargo feature that every
-    /// packaging/build path (`wgpu`, `cuda`, `rocm`, Docker variants) would
-    /// need to remember to wire up correctly. Resolving the handful of
-    /// symbols we need via `dlopen`/`dlsym` at runtime instead means the
-    /// dependency is zero-cost and silently absent on every non-NVIDIA
-    /// host — no new Cargo dependency, no new feature flag, and no build-time
-    /// coupling to CUDA at all.
-    ///
-    /// # Why the *primary* context?
-    ///
-    /// `cuDevicePrimaryCtxRetain` is reference-counted per process per
-    /// device — the same mechanism the CUDA runtime API uses internally.
-    /// Sharing it with any other CUDA user already running in this process
-    /// (Burn's `cuda` feature, llama.cpp's CUDA backend) only bumps the
-    /// refcount; it cannot destroy or otherwise interfere with a context
-    /// another component is actively using, and we release our reference
-    /// immediately after the query.
+    /// loaded at runtime with `dlopen` (see [`cuda_driver`]) so non-NVIDIA
+    /// hosts/builds never link against it. Falls through to `nvidia-smi` on
+    /// any failure. Needed because `nvidia-smi`/NVML both fail to report
+    /// memory on unified-memory NVIDIA hardware (e.g. DGX Spark) — see
+    /// docs/configuration.md for the measured numbers and rationale.
     #[cfg(target_os = "linux")]
     fn try_detect_nvidia_memory_cuda(device_idx: usize) -> Option<(u64, u64)> {
         cuda_driver::device_memory(device_idx)
     }
 
-    /// Non-Linux stub: `dlopen`/`libcuda.so` is a Linux-loader concept, so
-    /// this path simply falls through to `nvidia-smi` everywhere else
-    /// (Windows/macOS NVIDIA hosts do not exhibit the GB10 unified-memory
-    /// `[N/A]` failure mode this function exists to work around).
+    /// Non-Linux stub: falls through to `nvidia-smi` (Windows/macOS don't
+    /// exhibit the unified-memory `[N/A]` failure mode this works around).
     #[cfg(not(target_os = "linux"))]
     fn try_detect_nvidia_memory_cuda(_device_idx: usize) -> Option<(u64, u64)> {
         None
@@ -546,13 +450,9 @@ impl GPUManager {
         None
     }
 
-    /// Memory budget for a unified-memory (integrated) adapter.
-    ///
-    /// On unified-memory hardware — DGX Spark's GB10, and APUs generally — the
-    /// GPU has no private VRAM: model weights, the KV cache, the OS, and every
-    /// other process draw from one physical pool. Handing the tracker 100% of
-    /// RAM would let it admit models that OOM-kill the host, so reserve a
-    /// headroom slice (default 15%, override via `GPU_MEMORY_HEADROOM_PERCENT`).
+    /// Memory budget for a unified-memory (integrated) adapter — reserves a
+    /// headroom slice of system RAM (default 15%, override via
+    /// `GPU_MEMORY_HEADROOM_PERCENT`) so admission can't OOM-kill the host.
     fn unified_memory_budget() -> Option<u64> {
         let headroom_pct = std::env::var("GPU_MEMORY_HEADROOM_PERCENT")
             .ok()
@@ -562,23 +462,9 @@ impl GPUManager {
         Some(apply_headroom(Self::system_memory_total()?, headroom_pct))
     }
 
-    /// Estimate total GPU memory for one adapter, when no real vendor query
-    /// succeeded.
-    ///
-    /// Precedence: an explicit `GPU_VRAM_GB` override wins (redundant with
-    /// [`GPUManager::detect_memory`]'s own check — kept here too so this
-    /// function stays correct if ever called on its own); otherwise a
-    /// unified-memory adapter gets a headroom-adjusted slice of system RAM;
-    /// otherwise a conservative 8 GiB.
-    ///
-    /// Discrete cards normally never see the 8 GiB default — `detect_memory`
-    /// overwrites it with the vendor tool's answer. Unified-memory NVIDIA
-    /// devices used to reach it via this fallback whenever `nvidia-smi`
-    /// reported `[N/A]` (see `try_detect_nvidia_memory_cuda`'s doc comment
-    /// for why that happens and how the CUDA driver API now recovers a real
-    /// number in that case instead). This fallback still exists for hosts
-    /// where even that fails (no NVIDIA driver library reachable, AMD/Intel
-    /// unified adapters, `rocm-smi` unavailable, etc.).
+    /// Estimate total GPU memory for one adapter when no vendor query
+    /// succeeded: `GPU_VRAM_GB` override, then a headroom-adjusted slice of
+    /// system RAM for unified adapters, else a conservative 8 GiB.
     fn estimate_total_memory(is_unified: bool) -> u64 {
         if let Some(bytes) = Self::vram_override_bytes() {
             return bytes;
@@ -777,17 +663,9 @@ impl GPUManager {
 }
 
 /// Minimal, `dlopen`-based bindings for the handful of CUDA driver API calls
-/// needed to read total/free device memory (`GPUManager::detect_nvidia_memory`).
-///
-/// Deliberately NOT a Cargo dependency — see
-/// `GPUManager::try_detect_nvidia_memory_cuda`'s doc comment for the
-/// reasoning. Every symbol is resolved at runtime via `dlopen`/`dlsym`, and
-/// every failure mode (library absent, symbol absent, non-success
-/// `CUresult`) is folded into a plain `None` so callers fall through to the
-/// existing `nvidia-smi`/estimate chain exactly as if this module were
-/// compiled out. Linux only (`libcuda.so` / `dlopen` are POSIX/Linux-loader
-/// concepts); other platforms fall through to the same `None` behavior via
-/// `GPUManager::try_detect_nvidia_memory_cuda`'s `#[cfg]`-gated stub.
+/// needed to read total/free device memory. Deliberately not a Cargo
+/// dependency — see [`GPUManager::try_detect_nvidia_memory_cuda`]. Linux
+/// only; every failure mode folds into `None`.
 #[cfg(target_os = "linux")]
 mod cuda_driver {
     use std::ffi::{c_char, c_int, c_void, CString};
@@ -797,14 +675,8 @@ mod cuda_driver {
     type CuDevice = c_int;
     type CuContext = *mut c_void;
 
-    // Deliberately no `#[link(...)]`: `dlopen`/`dlsym`/`dlclose` are part of
-    // every glibc >= 2.34 `libc.so.6` (and always part of musl's libc), and
-    // every Rust binary already links libc dynamically on `*-linux-gnu`
-    // targets — this project's Docker images are all Ubuntu 24.04 (glibc
-    // 2.39). An explicit `-ldl` would actually be LESS portable here: older
-    // glibc split `dlopen` into a separate `libdl.so`, but that dev symlink
-    // (needed for `-ldl` to resolve at link time) is not guaranteed present
-    // even where the runtime `libdl.so.2`/merged `libc.so.6` is.
+    // Deliberately no `#[link(...)]`: dlopen/dlsym/dlclose ship in every
+    // glibc/musl libc already linked by this binary. See docs/configuration.md.
     extern "C" {
         fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
         fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
@@ -843,12 +715,8 @@ mod cuda_driver {
         }
 
         /// # Safety
-        /// The caller must ensure `T` exactly matches the C ABI signature of
-        /// the symbol named `name` in this library. There is no way for
-        /// `dlsym` to verify this — a mismatched `T` is undefined behavior.
-        /// Every call site below pins `T` to a `type ... = unsafe extern "C"
-        /// fn(...)` alias declared next to the real CUDA driver API
-        /// prototype it corresponds to.
+        /// Caller must ensure `T` exactly matches the C ABI signature of the
+        /// symbol named `name` — `dlsym` cannot verify this.
         unsafe fn sym<T: Copy>(&self, name: &str) -> Option<T> {
             let cname = CString::new(name).ok()?;
             let ptr = dlsym(self.0, cname.as_ptr());
@@ -983,7 +851,7 @@ mod tests {
         }
     }
 
-    // --- fix (1): select_hardware_adapters ---------------------------------
+    // --- select_hardware_adapters -------------------------------------------
 
     #[test]
     fn same_card_across_two_backends_collapses_to_one() {
@@ -1156,7 +1024,7 @@ mod tests {
         assert!(GPUManager::select_hardware_adapters(Vec::new()).is_empty());
     }
 
-    // --- fix (2): GPU_VRAM_GB precedence ------------------------------------
+    // --- GPU_VRAM_GB precedence ----------------------------------------------
 
     #[test]
     fn vram_override_bytes_parses_gib() {
@@ -1179,11 +1047,9 @@ mod tests {
     #[ignore = "requires real NVIDIA hardware + driver (run with --ignored on an NVIDIA host)"]
     #[cfg(target_os = "linux")]
     fn cuda_driver_reports_real_memory_on_nvidia_hardware() {
-        // Manual verification gate for the dlopen-based CUDA driver API path
-        // (fix 2): on unified-memory NVIDIA hardware (e.g. GB10/DGX Spark)
-        // nvidia-smi and NVML both fail to report memory, so this is the
-        // only automatable way to confirm the driver-API path actually
-        // works end-to-end against a real GPU rather than just compiling.
+        // Manual verification gate: unified-memory NVIDIA hardware (e.g.
+        // DGX Spark) can't report memory via nvidia-smi/NVML, so this is
+        // the only way to confirm the driver-API path works end-to-end.
         let (total, free) =
             cuda_driver::device_memory(0).expect("CUDA driver API query must succeed on GPU 0");
         println!(

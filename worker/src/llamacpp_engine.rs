@@ -1,17 +1,9 @@
 //! llama.cpp inference engine (cargo feature `llamacpp`).
 //!
-//! Wraps the `llama-cpp-2` bindings (llama.cpp compiled from source) behind
-//! the existing [`TextGeneration`] trait so GGUF models plug into
-//! `ModelInstance` exactly like the Burn engines.
-//!
-//! Concurrency model (matches llama-cpp-2 reality):
-//! * one [`LlamaModel`] per loaded model, shared via `Arc` (the crate marks it
-//!   `Send + Sync`);
-//! * one [`LlamaContext`] (own KV cache) created per generation call, entirely
-//!   inside a single `spawn_blocking` closure — the context is not `Send` and
-//!   never crosses threads;
-//! * token pieces stream to the async side through an mpsc channel, mirroring
-//!   the Burn pattern in `worker/models/llama.rs::generate`.
+//! Wraps the `llama-cpp-2` bindings behind [`TextGeneration`] so GGUF models
+//! plug in like the Burn engines: one [`LlamaModel`] shared via `Arc`, one
+//! [`LlamaContext`] per generation call inside a `spawn_blocking` (not
+//! `Send`), streamed to async via mpsc.
 
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -101,18 +93,9 @@ fn build_sampler(params: SamplerParams, seed: u32) -> LlamaSampler {
     LlamaSampler::chain_simple(chain)
 }
 
-// ---------------------------------------------------------------------------
-// KV-cache quantization (Task 2b)
-// ---------------------------------------------------------------------------
-
-/// Map a ggml type name to the crate's [`KvCacheType`].
-///
-/// The allowed set is validated once upstream, in
-/// `model_loader::gguf_spec_from_metadata` (`ALLOWED_KV_CACHE_TYPES`), which
-/// has no llama.cpp dependency; this mirrors that same set so the two stay in
-/// lockstep. `f16` maps explicitly even though it's llama.cpp's own default —
-/// see `KvCacheType`'s doc examples in the vendored crate for the exact enum
-/// shape (`with_type_k(KvCacheType::Q4_0)`).
+/// Map a ggml type name to the crate's [`KvCacheType`]. Mirrors the allowed
+/// set validated upstream in `model_loader::ALLOWED_KV_CACHE_TYPES`, which
+/// has no llama.cpp dependency.
 fn parse_kv_cache_type(name: &str) -> Result<KvCacheType, WorkerError> {
     match name {
         "f16" => Ok(KvCacheType::F16),
@@ -150,8 +133,8 @@ pub struct LlamaCppEngine {
     backend: Arc<LlamaBackend>,
     n_ctx: Option<u32>,
     n_threads: i32,
-    /// KV-cache quantization for K/V (Task 2b). `None` leaves llama.cpp's own
-    /// default (f16) untouched — byte-for-byte today's behavior.
+    /// KV-cache quantization for K/V. `None` leaves llama.cpp's own default
+    /// (f16) untouched.
     cache_type_k: Option<KvCacheType>,
     cache_type_v: Option<KvCacheType>,
 }
@@ -164,8 +147,7 @@ impl LlamaCppEngine {
     ///   (mapped to `u32::MAX`, which llama.cpp clamps to "all layers").
     /// * `n_ctx` — per-generation context window (`None` = min(trained, 4096)).
     /// * `n_threads` — CPU threads for generation (`0` = llama.cpp default).
-    /// * `cache_type_k`/`cache_type_v` — KV-cache quantization type names
-    ///   (Task 2b metadata contract: `f16`/`q8_0`/`q4_0`/`q5_0`/`q5_1`/`q4_1`),
+    /// * `cache_type_k`/`cache_type_v` — KV-cache quantization type names,
     ///   already validated by `model_loader::gguf_spec_from_metadata`.
     ///   `None` leaves llama.cpp's own default (f16) in effect.
     pub fn load(
@@ -215,11 +197,9 @@ impl LlamaCppEngine {
     }
 
     /// Estimated KV-cache + compute-buffer footprint in bytes for `slots`
-    /// concurrent contexts at this engine's configured window. `slots` must
-    /// be worst-case concurrency (each generation call opens a fresh
-    /// `LlamaContext`), not `1` — the caller (`model_loader.rs`) passes
-    /// `max_concurrent_requests`. Weights-independent; see
-    /// [`crate::kv_estimate`] for the shared math and hybrid-attention notes.
+    /// concurrent contexts (each generation call opens a fresh
+    /// `LlamaContext`, so pass worst-case concurrency, not `1`). See
+    /// [`crate::kv_estimate`] for the shared math.
     pub fn kv_cache_bytes(&self, slots: u32) -> u64 {
         let n_ctx_train = self.model.n_ctx_train().max(1);
         let n_ctx = u64::from(self.n_ctx.unwrap_or(DEFAULT_N_CTX).min(n_ctx_train));
@@ -359,11 +339,8 @@ impl TextGeneration for LlamaCppEngine {
         top_k: usize,
         seed: Option<u64>,
     ) -> Result<TextStream, WorkerError> {
-        // llama-cpp-2's sampler seed is u32, but the shared TextGeneration
-        // trait (and the proto InferenceRequest.seed it derives from) uses
-        // u64/uint32==0-means-random semantics; worker/src/worker.rs maps
-        // proto seed 0 -> None. Truncate a real seed to u32, or derive one
-        // from the clock when the caller asked for random sampling.
+        // llama-cpp-2's sampler seed is u32; the trait's is u64/Option.
+        // Truncate a real seed, or derive one from the clock for "random".
         let seed: u32 = seed.map(|s| s as u32).unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

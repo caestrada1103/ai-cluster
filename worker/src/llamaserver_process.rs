@@ -1,15 +1,10 @@
-//! `llama-server` process supervision (engine `"llamaserver"`, Plan 13).
+//! `llama-server` process supervision (engine `"llamaserver"`).
 //!
-//! Unlike the in-process [`crate::llamacpp_engine`] (feature-gated, links
-//! `libllama`), the `llamaserver` engine is **pure process management** and is
-//! always compiled: the worker spawns and supervises a `llama-server` child
-//! process per model and the coordinator proxies agentic HTTP inference
-//! (OpenAI / Anthropic tool calling, streaming `tool_calls`, ...) straight to
-//! it. The control plane stays gRPC (`LoadModel`/`UnloadModel`); the data plane
-//! becomes an HTTP proxy owned by the coordinator.
+//! Spawns and supervises a `llama-server` child process per model; the
+//! coordinator proxies agentic HTTP inference straight to it. Control plane
+//! stays gRPC, data plane is an HTTP proxy. See docs/configuration.md.
 //!
-//! This module carries no `llama-cpp-2` dependency, so it builds and its unit
-//! tests run under a default `cargo build`/`cargo test` (no libclang, no GPU).
+//! No `llama-cpp-2` dependency, so this builds under a default `cargo build`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -26,31 +21,9 @@ use crate::model_loader::parse_cache_type;
 /// `llamaserver.parallel` metadata key is set.
 const DEFAULT_PARALLEL: u32 = 1;
 
-/// C2 — flags [`LlamaServerSpec::extra_args`] (metadata key
-/// `llamaserver.extra_args`, coordinator-controlled and, transitively,
-/// attacker-influenceable if C3/C4 auth is ever misconfigured) is allowed to
-/// contain. `extra_args` is whitespace-split verbatim and appended to the
-/// `llama-server` child's argv (`execve`-style — no shell — so this is flag
-/// injection, not shell injection, but that is still enough for e.g. `--path
-/// <dir>` to turn the child into an arbitrary-file HTTP server, `--log-file
-/// <path>` into an arbitrary write primitive, or `--host`/`--port` to
-/// silently rebind the process this loader just spawned and is tracking by a
-/// DIFFERENT port).
-///
-/// Every flag `llama-server --help` accepts that takes a filesystem path, a
-/// network address, or a credential is deliberately left OFF this list —
-/// those already have first-class, validated fields on [`LlamaServerSpec`]
-/// (`port`, `n_gpu_layers`, `n_cpu_moe`, `cache_type_k`/`v`) or simply have no
-/// legitimate use here. Flags that DUPLICATE one of those typed fields
-/// (`-np`/`--parallel`, `-c`/`--ctx-size`, `-m`/`--model`, `-ngl`/
-/// `--n-gpu-layers`, `-ncmoe`/`--n-cpu-moe`, `-ctk`/`-ctv`, `--host`,
-/// `--port`) are ALSO excluded — allowing them here would let a second,
-/// conflicting flag silently override the value this loader already used to
-/// size the KV-cache GPU reservation (H2) or to build the argv, which
-/// `llama-server`'s "last flag wins" argv parsing would accept without
-/// complaint. This is a strict ALLOWLIST: any token that looks like a flag
-/// (starts with `-`) and is not in this set is rejected outright — including
-/// flags not yet invented when this list was written.
+/// Allowlist for [`LlamaServerSpec::extra_args`] flags. Excludes anything
+/// with path/network/credential semantics or that duplicates a typed field
+/// (`port`, `n_gpu_layers`, etc.) — see docs/configuration.md.
 const ALLOWED_EXTRA_FLAGS: &[&str] = &[
     // Sampling / generation tuning — no path or network semantics.
     "--temp",
@@ -161,13 +134,8 @@ fn validate_extra_arg(token: &str) -> Result<(), WorkerError> {
 }
 
 /// Spawn/health/kill config parsed from `ModelConfig.metadata` for a model with
-/// `engine = "llamaserver"`.
-///
-/// File resolution (`repo_id`/`file`) and context size (`n_ctx`) reuse the
-/// **existing** `gguf.*` metadata keys the coordinator already emits for the
-/// in-process llama.cpp engine — only the `llamaserver.*` keys are new. All keys
-/// are part of the cross-language gRPC contract (see
-/// `pending-work/13-agentic-serving-llama-server.md`); do not rename them.
+/// `engine = "llamaserver"`. Reuses the existing `gguf.*` metadata keys; only
+/// `llamaserver.*` keys are new. Part of the gRPC contract — do not rename.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LlamaServerSpec {
     /// HuggingFace repo containing the GGUF (metadata key `gguf_repo_id`).
@@ -177,47 +145,25 @@ pub struct LlamaServerSpec {
     /// TCP port `llama-server` listens on (metadata key `llamaserver.port`,
     /// REQUIRED — coordinator-assigned, unique per model).
     pub port: u16,
-    /// **Per-conversation/slot** context window (metadata key `n_ctx`; `None`
-    /// leaves `llama-server`'s own default, and no `-c` is passed).
-    ///
-    /// `llama-server` divides its own `-c` value EVENLY across `--parallel`
-    /// slots (verified on hardware: `-c 262144` with `--parallel 4` reports
-    /// `n_ctx: 65536, total_slots: 4` via `GET /props`) — so passing this
-    /// field straight through as `-c` would silently give every conversation
-    /// only `n_ctx / parallel` tokens. [`Self::total_ctx`] (used by
-    /// [`Self::build_args`]) multiplies by `parallel` before building `-c` so
-    /// this field keeps its intuitive registry meaning: the number of tokens
-    /// ONE conversation actually gets, honoring the user requirement that a
-    /// model's own trained context (`n_ctx_train`) is the ceiling AND the
-    /// thing actually delivered, never silently shrunk underneath it.
+    /// Per-slot context window (metadata key `n_ctx`; `None` leaves
+    /// `llama-server`'s own default, no `-c` passed). `llama-server` divides
+    /// `-c` evenly across `--parallel` slots, so [`Self::total_ctx`]
+    /// multiplies this by `parallel` before building `-c`. See docs/configuration.md.
     pub n_ctx: Option<u32>,
     /// Continuous-batching slots ("instances"), maps to `--parallel`
     /// (metadata key `llamaserver.instances`, alias `llamaserver.parallel`;
     /// default [`DEFAULT_PARALLEL`]). Costs `parallel` times the single-slot
-    /// KV-cache footprint — `model_loader.rs` reserves and refuses the load
-    /// if it does not fit, rather than raising it for free.
+    /// KV-cache footprint; the loader reserves and refuses the load if it
+    /// does not fit.
     pub parallel: u32,
     /// Transformer layers to offload to the GPU, maps to `-ngl` (metadata key
-    /// `n_gpu_layers`; same key/semantics as the in-process `llamacpp`
-    /// engine's `GgufLoadSpec::n_gpu_layers` — `< 0` means "all", passed to
-    /// `llama-server` as `-ngl 999` since llama.cpp clamps any value >= the
-    /// real layer count to "all"). Defaults to the worker's
-    /// `llamacpp_default_n_gpu_layers` config (itself `-1` — today's
-    /// full-offload behavior — unless overridden), so existing deployments
-    /// that never set this key are unaffected. This is the partial-offload
-    /// knob consumer GPUs with 8-16 GB VRAM need when a model does not fit
-    /// entirely on-GPU.
+    /// `n_gpu_layers`; `< 0` means "all", sent as `-ngl 999`). Defaults to
+    /// the worker's `llamacpp_default_n_gpu_layers` config. Partial-offload
+    /// knob for GPUs too small to fit the whole model.
     pub n_gpu_layers: i32,
     /// MoE expert-tensor CPU offload, maps to `--n-cpu-moe <N>` (metadata key
-    /// `n_cpu_moe`) — keeps the MoE weights of the first `N` layers on the
-    /// CPU while `-ngl`/`n_gpu_layers` still places every non-expert tensor
-    /// (and any non-offloaded experts) on GPU. This is llama.cpp's
-    /// purpose-built knob for fitting a big MoE model's expert tensors into
-    /// less VRAM than `n_gpu_layers` alone can achieve (see
-    /// `qwen3-coder-30b-a3b-instruct-gguf` in `config/models.toml`, which
-    /// used a raw `extra_args = "--n-cpu-moe 40"` workaround before this
-    /// field existed). `None` omits the flag (llama.cpp's own default: no
-    /// forced CPU offload).
+    /// `n_cpu_moe`) — keeps the first `N` layers' MoE weights on CPU while
+    /// `-ngl` places everything else on GPU. `None` omits the flag.
     pub n_cpu_moe: Option<u32>,
     /// KV-cache K quantization, maps to `-ctk` (metadata key `cache_type_k`).
     pub cache_type_k: Option<String>,
@@ -229,20 +175,9 @@ pub struct LlamaServerSpec {
 }
 
 impl LlamaServerSpec {
-    /// The actual `-c` value: `n_ctx` (this struct's per-slot/per-conversation
-    /// meaning) multiplied by `parallel`, so `llama-server`'s own division of
-    /// `-c` across slots reproduces exactly `n_ctx` tokens per slot instead of
-    /// silently shrinking it by a factor of `parallel` (see the `n_ctx` field
-    /// doc and the "HIGHEST PRIORITY" fix in `config/models.toml`'s
-    /// `qwen3.6-35b-a3b-gguf` entry for the full measured KV-cache
-    /// arithmetic this implies).
-    ///
-    /// `Ok(None)` when `n_ctx` is unset (defer to `llama-server`'s own
-    /// default; per-slot context is then whatever `llama-server` picks, not
-    /// independently verifiable here). `Err` only on `u32` overflow — an
-    /// astronomically large `n_ctx * parallel` that cannot be represented,
-    /// caught explicitly rather than silently wrapping to a smaller (wrong)
-    /// value.
+    /// The actual `-c` value: `n_ctx * parallel`, so `llama-server`'s own
+    /// division across slots reproduces `n_ctx` tokens per slot. `Ok(None)`
+    /// when `n_ctx` is unset; `Err` on `u32` overflow.
     pub fn total_ctx(&self) -> Result<Option<u32>, WorkerError> {
         match self.n_ctx {
             None => Ok(None),
@@ -259,19 +194,9 @@ impl LlamaServerSpec {
     }
 
     /// Build the exact `llama-server` argv (excluding the binary itself).
-    ///
-    /// Order: `-m <path> --host <bind> --port <port> [-c <total_ctx>] -ngl
-    /// <N> [--n-cpu-moe <N>] --parallel <N> [-ctk <t>] [-ctv <t>]
-    /// (--slots|--no-slots) <extra_args...>`.
-    ///
-    /// `--jinja` is intentionally NOT passed — it is default-on in current
-    /// llama.cpp.
-    ///
-    /// `--slots`/`--no-slots` is always passed explicitly so the setting never
-    /// depends on the llama-server build's own default. See docs/configuration.md.
-    ///
-    /// `extra_args` is re-validated against [`ALLOWED_EXTRA_FLAGS`] here as well
-    /// as at parse time, for callers that build a spec directly.
+    /// `--slots`/`--no-slots` is always passed explicitly. `extra_args` is
+    /// re-validated against [`ALLOWED_EXTRA_FLAGS`] here too, for callers
+    /// that build a spec directly.
     pub fn build_args(
         &self,
         gguf_path: &Path,
@@ -289,19 +214,12 @@ impl LlamaServerSpec {
             "--port".to_string(),
             self.port.to_string(),
         ];
-        // `-c` only when an explicit n_ctx was configured; otherwise let
-        // llama-server pick its own default (the metadata key is optional).
-        // See `total_ctx()`: this is `n_ctx * parallel`, NOT the raw
-        // per-slot `n_ctx`, so llama-server's internal division reproduces
-        // `n_ctx` tokens per slot.
+        // `-c` only when n_ctx was configured; total_ctx() = n_ctx * parallel.
         if let Some(total_ctx) = self.total_ctx()? {
             args.push("-c".to_string());
             args.push(total_ctx.to_string());
         }
-        // Offload layers to the GPU. `< 0` == "all" (llama.cpp clamps any
-        // value >= the real layer count to "all", so 999 is the conventional
-        // sentinel); a non-negative value is the partial-offload knob for
-        // cards too small to fit every layer.
+        // `< 0` means "all" (999 is llama.cpp's clamp-to-all sentinel).
         args.push("-ngl".to_string());
         args.push(if self.n_gpu_layers < 0 {
             "999".to_string()
@@ -332,18 +250,9 @@ impl LlamaServerSpec {
     }
 }
 
-/// Parse `engine = "llamaserver"` routing metadata.
-///
-/// * `Ok(None)` — no metadata, or `engine` is absent / not `"llamaserver"`
-///   (burn and in-process llamacpp models fall through untouched).
-/// * `Ok(Some(spec))` — a complete llamaserver spec.
-/// * `Err(..)` — missing `llamaserver.port` / `gguf_repo_id` / `gguf_file`, or a
-///   malformed numeric / cache-type value.
-///
-/// `default_n_gpu_layers` is used when the `n_gpu_layers` metadata key is
-/// absent — callers pass the worker's `llamacpp_default_n_gpu_layers` config
-/// (shared with the in-process `llamacpp` engine's identical default, since
-/// both ultimately drive the same llama.cpp `-ngl`/`n_gpu_layers` knob).
+/// Parse `engine = "llamaserver"` routing metadata. `Ok(None)` if absent or
+/// a different engine; `Err` on a missing/malformed required key.
+/// `default_n_gpu_layers` fills `n_gpu_layers` when that metadata key is absent.
 pub fn llamaserver_spec_from_metadata(
     metadata: Option<&HashMap<String, String>>,
     default_n_gpu_layers: i32,
@@ -386,9 +295,7 @@ pub fn llamaserver_spec_from_metadata(
         WorkerError::Configuration(format!("invalid llamaserver.port '{port_str}': {e}"))
     })?;
 
-    // `instances` is the canonical name (capacity setting); `parallel` is
-    // kept as an alias — the existing wire/argv name — so neither side of
-    // the gRPC contract has to change to adopt it.
+    // `instances` is the canonical name; `parallel` is kept as an alias.
     let (parallel_key, parallel_raw) = match metadata.get("llamaserver.instances") {
         Some(v) => ("llamaserver.instances", Some(v)),
         None => ("llamaserver.parallel", metadata.get("llamaserver.parallel")),
@@ -420,9 +327,7 @@ pub fn llamaserver_spec_from_metadata(
     let cache_type_k = parse_cache_type(metadata, "cache_type_k")?;
     let cache_type_v = parse_cache_type(metadata, "cache_type_v")?;
 
-    // Same metadata key/semantics as GgufLoadSpec::n_gpu_layers (in-process
-    // llamacpp engine) — `-1`/absent means "all layers", which is today's
-    // behavior (`-ngl 999`), so existing deployments are unaffected.
+    // Same key/semantics as GgufLoadSpec::n_gpu_layers; absent means "all".
     let n_gpu_layers = match metadata.get("n_gpu_layers") {
         Some(v) => v
             .parse::<i32>()
@@ -442,9 +347,8 @@ pub fn llamaserver_spec_from_metadata(
         .get("llamaserver.extra_args")
         .map(|s| s.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
-    // C2 — validate every token against the flag allowlist BEFORE it can ever
-    // reach `Command::new(binary).args(...)`. See `validate_extra_arg`/
-    // `ALLOWED_EXTRA_FLAGS` for what is and is not permitted and why.
+    // Validate every token against the flag allowlist before it can reach
+    // `Command::new(binary).args(...)`.
     for token in &extra_args {
         validate_extra_arg(token)?;
     }
@@ -463,13 +367,8 @@ pub fn llamaserver_spec_from_metadata(
     }))
 }
 
-/// Reject a `llamaserver.port` outside the configured allowed range (C2
-/// defense-in-depth). The typed `port` field always drives the child's
-/// `--port`/`--host` — those flag NAMES can never appear in `extra_args`
-/// (see [`ALLOWED_EXTRA_FLAGS`]) — but an unconstrained port number could
-/// still be pointed at a privileged port or collide with another service on
-/// the host, so the coordinator-assigned value is checked against a
-/// configured range (`worker.toml`'s `llamaserver_port_min`/`_max`).
+/// Reject a `llamaserver.port` outside the configured allowed range
+/// (`worker.toml`'s `llamaserver_port_min`/`_max`).
 pub fn validate_llamaserver_port(port: u16, min: u16, max: u16) -> Result<(), WorkerError> {
     if port < min || port > max {
         return Err(WorkerError::Configuration(format!(
@@ -480,12 +379,9 @@ pub fn validate_llamaserver_port(port: u16, min: u16, max: u16) -> Result<(), Wo
     Ok(())
 }
 
-/// A supervised `llama-server` child process.
-///
-/// Spawning does NOT block on readiness; call [`Self::wait_until_healthy`]
-/// afterwards. The child is killed explicitly on unload
-/// ([`Self::start_kill`]/[`Self::shutdown`]) and, as a backstop,
-/// `kill_on_drop` ensures it never outlives the worker.
+/// A supervised `llama-server` child process. Spawning does not block on
+/// readiness — call [`Self::wait_until_healthy`] afterwards. `kill_on_drop`
+/// is a backstop so the child never outlives the worker.
 pub struct LlamaServerProcess {
     /// Registry key of the model this process serves (for logs/errors).
     model_name: String,
@@ -499,9 +395,7 @@ pub struct LlamaServerProcess {
 impl LlamaServerProcess {
     /// Spawn `binary args...` WITHOUT waiting for HTTP health.
     ///
-    /// `binary` is resolved via `PATH` unless it is an absolute path. Used both
-    /// for the real `llama-server` and, in tests, for a harmless stand-in
-    /// (e.g. `sleep`) so no real binary or GPU is required.
+    /// `binary` is resolved via `PATH` unless it is an absolute path.
     pub fn spawn(
         model_name: &str,
         port: u16,
@@ -539,11 +433,8 @@ impl LlamaServerProcess {
     }
 
     /// Poll `GET http://127.0.0.1:<port>/health` until it returns 200, the
-    /// child exits, or `timeout` elapses.
-    ///
-    /// A minimal loopback HTTP GET via the `reqwest` client already present in
-    /// the dependency tree (no new heavy dependency). Fails fast if the child
-    /// dies during startup (bad binary / args / port clash).
+    /// child exits, or `timeout` elapses. Fails fast if the child dies during
+    /// startup.
     pub async fn wait_until_healthy(&mut self, timeout: Duration) -> Result<(), WorkerError> {
         let url = format!("http://127.0.0.1:{}/health", self.port);
         let client = reqwest::Client::builder()
@@ -580,19 +471,10 @@ impl LlamaServerProcess {
         }
     }
 
-    /// Best-effort post-health sanity check: `GET /props` and compare the
-    /// context `llama-server` actually reports against what this load asked
-    /// for (`expected_total_ctx`, i.e. [`LlamaServerSpec::total_ctx`]),
-    /// logging a WARNING on any mismatch instead of blindly trusting our own
-    /// arg-building arithmetic.
-    ///
-    /// This is exactly the mechanism that caught the original "`-c` silently
-    /// divided by `--parallel`" bug on real hardware — `llama-server /props`
-    /// reports `n_ctx`/`total_slots` for the process as actually started, so
-    /// checking it here makes a future regression (a llama.cpp version that
-    /// changes this behavior again, a bad flag, ...) loud instead of silent.
-    /// Never fails the load: `/props` is a diagnostic, not a contract, and a
-    /// healthy `/health` response already means the model is servable.
+    /// Best-effort post-health check: `GET /props` and compare the reported
+    /// context against `expected_total_ctx` ([`LlamaServerSpec::total_ctx`]),
+    /// logging a warning on mismatch. Never fails the load — `/props` is a
+    /// diagnostic, not a contract. See docs/configuration.md.
     pub async fn verify_props(&self, expected_total_ctx: Option<u32>) {
         let Some(expected_total_ctx) = expected_total_ctx else {
             return;
@@ -667,10 +549,8 @@ impl LlamaServerProcess {
         }
     }
 
-    /// Send the terminate signal to the child (SIGKILL on Unix /
-    /// `TerminateProcess` on Windows) without awaiting. Non-blocking and safe to
-    /// call on an already-exited child. Cross-platform via tokio's
-    /// [`Child::start_kill`] — no unix-only APIs.
+    /// Send the terminate signal without awaiting. Safe to call on an
+    /// already-exited child.
     pub fn start_kill(&mut self) -> Result<(), WorkerError> {
         self.child.start_kill().map_err(WorkerError::Io)
     }
@@ -756,7 +636,7 @@ mod tests {
         );
     }
 
-    // --- C2: extra_args flag allowlist --------------------------------------
+    // --- extra_args flag allowlist ------------------------------------------
 
     #[test]
     fn spec_rejects_disallowed_extra_arg_flags() {
@@ -828,7 +708,7 @@ mod tests {
         );
     }
 
-    // --- C2: llamaserver.port range constraint ------------------------------
+    // --- llamaserver.port range constraint ----------------------------------
 
     #[test]
     fn port_range_accepts_in_range() {

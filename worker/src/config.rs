@@ -13,18 +13,15 @@ use crate::error::WorkerError;
 /// Configuration for the AI worker.
 ///
 /// `Debug` is hand-written (not derived) so `hf_token` and `grpc_auth_token`
-/// never land in logs via `info!("Configuration: {:?}", config)` (M1 —
-/// secrets must never be printed, even accidentally).
+/// never land in logs via `info!("Configuration: {:?}", config)`.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkerConfig {
     /// Optional human-readable worker identifier.
     pub worker_id: Option<String>,
 
-    /// Bind interface for the gRPC inference server. Default `127.0.0.1`
-    /// (loopback-only, secure by default). Set to `0.0.0.0` (or a specific
-    /// LAN interface) ONLY when the coordinator runs on another host — pair
-    /// that with `grpc_auth_token` so the now-reachable port isn't wide open.
+    /// Bind interface for the gRPC server. Default `127.0.0.1` (loopback,
+    /// secure by default); pair a non-loopback value with `grpc_auth_token`.
     pub grpc_bind_host: String,
 
     /// Port for the gRPC inference server.
@@ -66,68 +63,51 @@ pub struct WorkerConfig {
     /// from the registry overrides this.
     pub llamacpp_default_n_gpu_layers: i32,
 
-    /// Whether this node lends its local GPU(s) to a distributed model's
-    /// "lead" node as a ggml-RPC peer (Level 2, `distributed_role=rpc_server`
-    /// metadata). Default `false` — no `worker.toml` edits needed on nodes
-    /// that never act as an RPC peer.
+    /// Whether this node lends its GPU(s) to a distributed model's lead node
+    /// as a ggml-RPC peer (`distributed_role=rpc_server` metadata).
     pub rpc_server_enabled: bool,
 
     /// Base TCP port this node's `rpc-server` process(es) bind to when
     /// `rpc_server_enabled=true`. One GPU per port, starting here.
     pub rpc_server_port: u16,
 
-    /// Bind interface for the `rpc-server` process(es). `None` defaults to
-    /// the loopback/LAN interface the (future) subprocess supervisor picks.
-    /// ggml-RPC has no auth — never bind this to a public interface
-    /// (trusted-LAN only).
+    /// Bind interface for the `rpc-server` process(es). ggml-RPC has no
+    /// auth — never bind this to a public interface.
     pub rpc_server_bind_host: Option<String>,
 
-    /// Path to the `llama-server` binary the worker spawns for models with
-    /// `engine = "llamaserver"` metadata (Plan 13). NOT built by cargo — install
-    /// llama.cpp's `llama-server` on the host. Env `LLAMASERVER_BINARY_PATH`
-    /// wins over this value. Default `"llama-server"` (resolved on `PATH`).
+    /// Path to the `llama-server` binary the worker spawns for
+    /// `engine = "llamaserver"` models. Not built by cargo — install
+    /// llama.cpp's `llama-server` separately. `LLAMASERVER_BINARY_PATH` wins.
     pub llamaserver_binary_path: String,
 
     /// Bind interface passed to `llama-server --host`. Default `"127.0.0.1"`
-    /// (loopback-only, secure by default — H1). Set to `0.0.0.0` (or a
-    /// specific LAN interface) ONLY when the coordinator runs on another
-    /// host; that port has no built-in auth, so treat it as trusted-LAN-only
-    /// and firewall it when opened up.
+    /// (loopback, secure by default) — that port has no built-in auth of its
+    /// own. See docs/configuration.md.
     pub llamaserver_bind_host: String,
 
     /// Expose `llama-server`'s `/slots` endpoint. Default `false` — it returns
     /// per-slot state including cached prompt text. See docs/configuration.md.
     pub llamaserver_enable_slots_endpoint: bool,
 
-    /// Inclusive allowed range for `llamaserver.port` metadata (C2) — a
-    /// coordinator-assigned value the worker otherwise trusts. Defaults
-    /// (1024-65535) exclude privileged ports while covering every port used
-    /// in `config/models.toml` today (8081/8082).
+    /// Inclusive allowed range for `llamaserver.port` metadata. Defaults
+    /// (1024-65535) exclude privileged ports.
     pub llamaserver_port_min: u16,
     pub llamaserver_port_max: u16,
 
-    /// Maximum number of models kept resident at once. Default `0` means
-    /// unlimited (preserves existing behavior — no eviction). When a load
-    /// would exceed this limit, the oldest-loaded model(s) are evicted first
-    /// to make room. Set to `1` for one-model-at-a-time on memory-constrained
-    /// hosts (e.g. a single unified-memory DGX Spark node).
+    /// Maximum number of models kept resident at once. `0` (default) means
+    /// unlimited. Above the limit, the oldest-loaded model(s) are evicted
+    /// first. Set to `1` for one-model-at-a-time on memory-constrained hosts.
     pub max_loaded_models: usize,
 
-    /// Ceiling applied to any caller-supplied per-slot `n_ctx` (both the
-    /// in-process `llamacpp` engine and the `llamaserver` child-process
-    /// engine) before it is used to size a KV-cache reservation or passed to
-    /// `llama-server -c`. Protects the reservation math in H2 from being
-    /// defeated by an oversized context request; does not raise a model's own
-    /// trained context ceiling. Default `262144` — the largest per-slot
-    /// value configured anywhere in `config/models.toml` today.
+    /// Ceiling applied to any caller-supplied per-slot `n_ctx` before it
+    /// sizes a KV-cache reservation or reaches `llama-server -c`. Does not
+    /// raise a model's own trained context ceiling. See docs/configuration.md.
     pub max_n_ctx: u32,
 
     /// Shared-secret token gRPC clients must present (metadata key
     /// `x-worker-token`) for every RPC. `None` (default) leaves the server
-    /// OPEN — acceptable only when `grpc_bind_host` stays loopback and
-    /// nothing untrusted can reach the port. Required reading before binding
-    /// to a non-loopback address in any multi-host/LAN deployment (C1). Env
-    /// `WORKER_GRPC_AUTH_TOKEN` wins over this value (mirrors `HF_TOKEN`).
+    /// open — only safe while `grpc_bind_host` stays loopback.
+    /// `WORKER_GRPC_AUTH_TOKEN` wins over this value.
     pub grpc_auth_token: Option<String>,
 }
 
@@ -164,9 +144,8 @@ impl Default for WorkerConfig {
 }
 
 impl fmt::Debug for WorkerConfig {
-    /// Hand-written: `hf_token`/`grpc_auth_token` are redacted (M1) so
-    /// `info!("Configuration: {:?}", config)` at startup never leaks a
-    /// HuggingFace token or the worker's own shared secret into logs.
+    /// Hand-written: `hf_token`/`grpc_auth_token` are redacted so startup
+    /// logging never leaks a secret.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WorkerConfig")
             .field("worker_id", &self.worker_id)
@@ -208,10 +187,8 @@ impl fmt::Debug for WorkerConfig {
 }
 
 impl WorkerConfig {
-    /// Load configuration from a TOML file.
-    ///
-    /// Falls back to [`Default`] values for any missing keys.  If the file
-    /// does not exist, a warning is logged and pure defaults are returned.
+    /// Load configuration from a TOML file, falling back to [`Default`] for
+    /// missing keys. Logs a warning and returns defaults if the file is absent.
     pub fn from_file(path: &str) -> Result<Self, WorkerError> {
         let path = PathBuf::from(path);
 
@@ -268,10 +245,8 @@ mod tests {
         // 600 differs from the removed default on purpose — proves parsing works.
         assert_eq!(config.request_timeout_secs, 120);
         assert_eq!(config.grpc_port, 50051);
-        // C1/H1: the shipped Docker config EXPLICITLY opts into non-loopback
-        // binds (required for cross-container reachability on the compose
-        // network) rather than inheriting it silently — see the comments in
-        // config/worker.toml for why this is still safe (ports not published).
+        // The shipped Docker config explicitly opts into non-loopback binds
+        // for cross-container reachability — see config/worker.toml.
         assert_eq!(config.grpc_bind_host, "0.0.0.0");
         assert_eq!(config.llamaserver_bind_host, "0.0.0.0");
     }
@@ -321,14 +296,14 @@ mod tests {
     fn test_llamaserver_defaults() {
         let config = WorkerConfig::default();
         assert_eq!(config.llamaserver_binary_path, "llama-server");
-        // H1: loopback-only by default — opt in to 0.0.0.0 explicitly.
+        // Loopback-only by default — opt in to 0.0.0.0 explicitly.
         assert_eq!(config.llamaserver_bind_host, "127.0.0.1");
         assert!(!config.llamaserver_enable_slots_endpoint);
     }
 
     #[test]
     fn test_grpc_bind_host_defaults_to_loopback() {
-        // C1: secure by default — no gRPC exposure without an explicit opt-in.
+        // Secure by default — no gRPC exposure without an explicit opt-in.
         let config = WorkerConfig::default();
         assert_eq!(config.grpc_bind_host, "127.0.0.1");
         assert_eq!(config.grpc_auth_token, None);

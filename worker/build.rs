@@ -46,14 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("cargo:rustc-link-lib=dylib=cudart");
             println!("cargo:rustc-link-lib=dylib=cublas");
 
-            // NCCL is a MULTI-GPU collective-communication library. Linking it
-            // unconditionally broke every single-GPU CUDA box that does not
-            // ship it — notably DGX Spark, whose CUDA 13 toolkit has cudart and
-            // cublas but no libnccl, giving `cannot find -lnccl` only at the
-            // final link, after ~10 minutes of CUDA compilation.
-            //
-            // Probe the same directories we just added to the link search path,
-            // plus the multiarch system dir, and link it only if present.
+            // Link NCCL only if present — some CUDA hosts (e.g. DGX Spark)
+            // ship cudart/cublas without libnccl. See docs/deployment.md.
             let candidates = [
                 format!("{}/lib64", cuda_path),
                 format!("{}/lib", cuda_path),
