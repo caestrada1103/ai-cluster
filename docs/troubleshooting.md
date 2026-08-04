@@ -41,7 +41,13 @@ rocm-smi                      # AMD
 - Docker Desktop on Windows/WSL2 + NVIDIA: no Vulkan ICD is injected — the
   universal image falls back to CPU. Build the CUDA variant
   (`--build-arg BACKEND=cuda`, see docker/Dockerfile.worker header).
-- Wrong reported VRAM? Set `GPU_VRAM_GB` (used when vendor tools can't report).
+- Wrong reported VRAM? Set `GPU_VRAM_GB` (overrides detection outright).
+- Available memory looks too low on unified-memory hardware (DGX Spark and
+  similar) — the vendor "free" figure counts reclaimable page cache as
+  used, understating what's really available by tens of GB. The worker
+  falls back to a headroom-adjusted share of system RAM instead; tune it
+  with `GPU_MEMORY_HEADROOM_PERCENT` (default `15`). See
+  [configuration.md](configuration.md).
 
 ## Model load fails
 
@@ -109,6 +115,32 @@ rocm-smi                      # AMD
 - **Agent sees garbled/empty tool-call `arguments`** — your `llama-server` build
   predates the mid-March-2026 fix (llama.cpp issue #20198 / PR #20213). Rebuild
   at the pinned tag (**b9941** or newer); the Docker image already pins it.
+- **`message.content` is empty on a reasoning model** (e.g. Qwen3.6) — this
+  is expected while the model is thinking: a reasoning model streams its
+  chain-of-thought into `message.reasoning_content` and leaves `content`
+  empty until thinking finishes. A short prompt can burn the entire
+  `max_tokens` budget on thinking and return empty `content` with
+  `finish_reason="length"` if a client only reads `content`. Fix at the
+  process level with `extra_args = "--reasoning off"` in the model's
+  `[models.X.llamaserver]` block (what the shipped `qwen3.6-35b-a3b-gguf`
+  entry does), or per-request via
+  `{"chat_template_kwargs": {"enable_thinking": false}}`.
+- **`llamaserver.extra_args: flag '...' is not on the allowlist`** — the
+  load was rejected before spawning `llama-server`. Flags with filesystem,
+  network, or credential semantics (`--path`, `--log-file`, `--host`,
+  `--api-key-file`, `--lora`, …) and flags that duplicate a typed field
+  (`-np`/`--parallel`, `-c`, `-m`, `-ngl`, `-ncmoe`, `-ctk`/`-ctv`) are never
+  allowed in `extra_args`; use the typed field (`instances`, `n_ctx`,
+  `n_gpu_layers`, `n_cpu_moe`, `cache_type_k`/`cache_type_v`) instead. See
+  [configuration.md](configuration.md).
+- **Load fails with a resource-exhausted / out-of-memory error before
+  `llama-server` even spawns** — the worker reads the GGUF header and
+  reserves KV + compute buffers for the requested `instances` (conversation
+  slot) count ahead of spawning; raising `instances`, or a caller-supplied
+  `instances` override on `POST /v1/models/load`, multiplies that
+  reservation. Lower `instances`, lower `n_ctx`, add `n_cpu_moe` offload, or
+  use `cache_type_k`/`cache_type_v = "q8_0"` to shrink the per-slot KV
+  footprint. See [configuration.md](configuration.md#sizing-examples-measured-on-real-hardware).
 
 ## Monitoring gaps
 
