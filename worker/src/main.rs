@@ -22,8 +22,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 pub mod backend;
 mod config;
 mod error;
+mod gguf_meta;
 mod gpu_manager;
 mod grpc_auth;
+mod kv_estimate;
 #[cfg(feature = "llamacpp")]
 mod llamacpp_engine;
 mod llamaserver_process;
