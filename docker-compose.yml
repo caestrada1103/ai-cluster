@@ -66,7 +66,7 @@ services:
     image: ai-worker:latest
     environment: &worker-common-env
       - GPU_INDEX=${GPU_INDEX:-0}
-      - GPU_VRAM_GB=${GPU_VRAM_GB:-6}
+      - GPU_VRAM_GB=${GPU_VRAM_GB:-}
       - WORKER_ID=${WORKER_ID:-}
       - GRPC_BASE_PORT=${GRPC_BASE_PORT:-50051}
       - METRICS_BASE_PORT=${METRICS_BASE_PORT:-9091}
@@ -79,6 +79,10 @@ services:
       # required once this worker's ports are published (expose-ports.yml)
       # or reached from another host.
       - WORKER_GRPC_AUTH_TOKEN=${WORKER_GRPC_AUTH_TOKEN:-}
+      # Containers bind the Compose network, not loopback; the worker's
+      # own default stays 127.0.0.1 for bare-metal runs.
+      - WORKER_GRPC_BIND_HOST=${WORKER_GRPC_BIND_HOST:-0.0.0.0}
+      - LLAMASERVER_BIND_HOST=${LLAMASERVER_BIND_HOST:-0.0.0.0}
     volumes: &worker-common-volumes
       - ./config:/app/config:ro
       - ./models:/app/models
