@@ -3,8 +3,14 @@
 ## Coordinator won't start
 
 - **`ModuleNotFoundError` / import errors** — start from the REPO ROOT:
-  `uvicorn coordinator.main:app --host 0.0.0.0 --port 8000` (running `uvicorn main:app`
+  `uvicorn coordinator.main:app --host 127.0.0.1 --port 8000` (running `uvicorn main:app`
   from inside `coordinator/` breaks package imports).
+- **`RuntimeError: Refusing to start: COORDINATOR_HOST='0.0.0.0' is not
+  loopback-only and COORDINATOR_API_KEYS is unset`** — this is intentional
+  (C4, secure by default): a non-loopback bind with no API keys means every
+  route is reachable with zero credentials. Either use `--host 127.0.0.1`
+  for local-only, or set `COORDINATOR_API_KEYS` (comma-separated secrets)
+  before binding to `0.0.0.0`/a LAN address. See `.env.example`.
 - **Settings validation error at startup** — the message names the bad
   `COORDINATOR_*` variable; see docs/configuration.md for the full table.
   `COORDINATOR_DISCOVERY_METHOD` other than `static` fails fast (mdns/broadcast/consul are planned).
