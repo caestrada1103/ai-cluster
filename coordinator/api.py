@@ -104,6 +104,11 @@ class LoadModelRequest(BaseModel):
     model_name: str
     worker_id: Optional[str] = None
     quantization: str = "none"  # only "none" is accepted by workers today; others are planned
+    # Concurrent conversation slots for an engine="llamaserver" model, overriding
+    # the registry's `instances`/`parallel` value for this load only. Costs
+    # memory (worker refuses the load if it doesn't fit) — not applicable to
+    # other engines.
+    instances: Optional[int] = Field(default=None, ge=1)
 
 
 class LoadModelResponse(BaseModel):
@@ -1038,7 +1043,7 @@ async def load_model(body: LoadModelRequest, request: Request) -> LoadModelRespo
     """Load a model onto a worker."""
     coordinator = _get_coordinator(request)
 
-    from coordinator.models import Quantization
+    from coordinator.models import ModelRegistry, Quantization
 
     try:
         quantization = Quantization(body.quantization)
@@ -1048,6 +1053,14 @@ async def load_model(body: LoadModelRequest, request: Request) -> LoadModelRespo
             detail=f"Invalid quantization '{body.quantization}'. "
             f"Valid values: {[q.value for q in Quantization]} (only 'none' is loadable today)",
         ) from exc
+
+    if body.instances is not None:
+        target_config = ModelRegistry.get_model(body.model_name)
+        if target_config is None or target_config.engine != "llamaserver":
+            raise HTTPException(
+                status_code=422,
+                detail="instances is only applicable to engine='llamaserver' models",
+            )
 
     try:
         if body.worker_id is not None:
@@ -1064,6 +1077,7 @@ async def load_model(body: LoadModelRequest, request: Request) -> LoadModelRespo
             worker_info,
             body.model_name,
             quantization=quantization,
+            instances=body.instances,
         )
 
         if success:
