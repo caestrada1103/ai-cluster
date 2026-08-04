@@ -79,16 +79,87 @@ class Settings(BaseSettings):
     )
 
     # CORS
+    # M3: secure by default — no explicit origins (`[]`), not `"*"`. Combined
+    # with `main.py`'s always-on loopback `allow_origin_regex`
+    # (`http(s)://(localhost|127.0.0.1)[:port]`), the DEFAULT deployment
+    # allows browser calls from the machine the coordinator itself runs on
+    # (matches this project's "local debug is permissive but opt-in" story —
+    # a developer hitting the API from a page served on localhost keeps
+    # working with zero config) while any other origin is rejected until an
+    # operator explicitly sets COORDINATOR_CORS_ORIGINS. Set it to `"*"` to
+    # restore the old wide-open behavior (still forces
+    # `allow_credentials=False`, same anti-pattern guard as before), or to a
+    # comma-separated/JSON list of specific origins for a real deployment.
     # NoDecode: pydantic-settings otherwise JSON-decodes any complex-typed env
     # value before our validator runs, which rejects non-JSON strings like "*".
     cors_origins: Annotated[List[str], NoDecode] = Field(
-        default_factory=lambda: ["*"],
-        description="Allowed CORS origins. Use specific origins in production.",
+        default_factory=list,
+        description=(
+            "Allowed CORS origins beyond the always-on loopback default. "
+            "Empty by default; set to '*' or specific origins to widen."
+        ),
     )
 
     # Per-worker concurrency limit
     max_concurrent_requests_per_worker: int = Field(
         10, description="Maximum concurrent requests per worker", ge=1
+    )
+
+    # C3 — POST /v1/workers/manual (unauthenticated arbitrary worker
+    # registration in the audit finding). Disabled by default: a rogue
+    # "worker" registered this way self-reports loaded_models and can be
+    # selected by find_worker_for_model for real routed traffic (prompt
+    # exfiltration + poisoned completions), and the address is also handed
+    # straight to grpc.aio.insecure_channel / the llamaserver proxy (SSRF).
+    # Opt in only for deployments that actually need runtime worker
+    # registration (most don't — COORDINATOR_STATIC_WORKERS covers the
+    # documented single-host/LAN-cluster setups).
+    allow_manual_worker_registration: bool = Field(
+        False,
+        description=(
+            "Enable POST /v1/workers/manual (env "
+            "COORDINATOR_ALLOW_MANUAL_WORKER_REGISTRATION). Off by default; the route "
+            "also independently requires a valid COORDINATOR_API_KEYS credential "
+            "regardless of whether global auth is enabled, and addresses are "
+            "shape-validated and capped."
+        ),
+    )
+    manual_worker_allowed_hosts: Annotated[List[str], NoDecode] = Field(
+        default_factory=list,
+        description=(
+            "Optional allowlist of hosts/CIDRs POST /v1/workers/manual may register "
+            "(comma-separated). Empty (default) means any well-formed host:port is "
+            "accepted once the feature is enabled and authenticated."
+        ),
+    )
+
+    # H4 — an unregistered model_name sent to POST /v1/models/load is passed
+    # to the worker as an arbitrary HuggingFace repo id to download and load
+    # (coordinator.py: "If unknown, it's a HuggingFace pull"). Off by
+    # default: only models in config/models.toml are loadable unless a
+    # deployment explicitly wants ad hoc HF pulls.
+    allow_unregistered_model_pull: bool = Field(
+        False,
+        description=(
+            "Allow POST /v1/models/load for a model_name absent from the registry "
+            "(env COORDINATOR_ALLOW_UNREGISTERED_MODEL_PULL) — the worker treats it "
+            "as an arbitrary HuggingFace repo id to download. Off by default."
+        ),
+    )
+
+    # H5: no request-body size cap previously existed anywhere on the HTTP
+    # surface (api.py's _read_json_body buffers the whole body via
+    # request.body()); this also covers the engine="llamaserver" proxy path,
+    # which has no max_tokens/queue admission control of its own. 25 MB is
+    # generous for a real chat/agentic request (long conversation history,
+    # embedded code, tool results) while still bounding worst-case memory use
+    # per request. See coordinator/body_limit.py.
+    max_request_body_bytes: int = Field(
+        25_000_000,
+        description=(
+            "Maximum HTTP request body size in bytes (env COORDINATOR_MAX_REQUEST_BODY_BYTES)"
+        ),
+        ge=1,
     )
 
     # Request routing (consumed by coordinator.router.RequestRouter)
@@ -184,6 +255,14 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             # Parse comma-separated list
             return [addr.strip() for addr in v.split(",") if addr.strip()]
+        return v
+
+    @field_validator("manual_worker_allowed_hosts", mode="before")
+    @classmethod
+    def validate_manual_worker_allowed_hosts(cls, v: Union[str, List[str]]) -> List[str]:
+        """Accept a comma-separated env-var string or a list."""
+        if isinstance(v, str):
+            return [h.strip() for h in v.split(",") if h.strip()]
         return v
 
     @field_validator("context_compression_techniques", mode="before")
