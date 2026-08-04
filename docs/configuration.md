@@ -13,8 +13,9 @@ keys are ignored, so the shared `.env` can also carry worker variables.
 
 | Variable | Default | Description |
 |---|---|---|
-| `COORDINATOR_HOST` | `0.0.0.0` | Bind address |
+| `COORDINATOR_HOST` | `0.0.0.0` | Bind address. **C4: the coordinator refuses to start when this is not loopback (`127.0.0.1`/`::1`/`localhost`) AND `COORDINATOR_API_KEYS` is unset** — secure by default. |
 | `COORDINATOR_PORT` | `8000` | HTTP port |
+| `COORDINATOR_API_KEYS` | *(unset)* | Comma-separated API keys gating the whole HTTP surface (except `/health`/`/metrics`); `Authorization: Bearer <key>` or `x-api-key: <key>`. Empty = open (only safe with a loopback `COORDINATOR_HOST`). |
 | `COORDINATOR_DISCOVERY_METHOD` | `static` | Only `static` is implemented (`mdns`/`broadcast`/`consul` are planned and fail fast) |
 | `COORDINATOR_STATIC_WORKERS` | `[]` | Comma-separated `host:port` list (or JSON array) |
 | `COORDINATOR_DISCOVERY_INTERVAL` | `30` | Discovery loop seconds (min 5) |
@@ -23,8 +24,12 @@ keys are ignored, so the shared `.env` can also carry worker variables.
 | `COORDINATOR_MAX_FAILURES` | `3` | Consecutive failures before UNHEALTHY |
 | `COORDINATOR_REQUEST_TIMEOUT` | `300` | End-to-end inference timeout seconds |
 | `COORDINATOR_MAX_QUEUE_SIZE` | `1000` | Request queue bound |
+| `COORDINATOR_MAX_REQUEST_BODY_BYTES` | `25000000` | Max HTTP request body size in bytes (H5) |
 | `COORDINATOR_MODELS_CONFIG` | `config/models.toml` | Registry path |
-| `COORDINATOR_CORS_ORIGINS` | `*` | `*`, comma-separated list, or JSON array |
+| `COORDINATOR_ALLOW_UNREGISTERED_MODEL_PULL` | `false` | Allow `POST /v1/models/load` for a `model_name` absent from the registry (otherwise sent to the worker as an arbitrary HF repo id — H4) |
+| `COORDINATOR_ALLOW_MANUAL_WORKER_REGISTRATION` | `false` | Enable `POST /v1/workers/manual` (C3) — also always requires a valid `COORDINATOR_API_KEYS` credential regardless of global auth state |
+| `COORDINATOR_MANUAL_WORKER_ALLOWED_HOSTS` | `[]` | Optional host/CIDR allowlist for `POST /v1/workers/manual`; empty accepts any well-formed address once the feature above is enabled |
+| `COORDINATOR_CORS_ORIGINS` | `[]` | `*`, comma-separated list, or JSON array — beyond the always-on loopback allowance (M3) |
 | `COORDINATOR_MAX_CONCURRENT_REQUESTS_PER_WORKER` | `10` | Per-worker in-flight cap |
 | `COORDINATOR_ROUTING_STRATEGY` | `least_load` | `least_load` / `round_robin` / `random` / `affinity` / `power_of_two` |
 | `COORDINATOR_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Failures before a worker's circuit opens |
@@ -51,7 +56,9 @@ Precedence for `worker_id` / `grpc_port` / `metrics_port` / `gpu_ids`:
 | `--log-json` | `LOG_JSON` | off | JSON log output |
 
 Additional env: `RUST_LOG`, `RUST_BACKTRACE`, `HF_TOKEN` (gated model downloads),
-`GPU_VRAM_GB` (VRAM hint when the vendor tool can't report it — code default 8).
+`GPU_VRAM_GB` (VRAM hint when the vendor tool can't report it — code default 8),
+`WORKER_GRPC_AUTH_TOKEN` (C1 — shared-secret gRPC auth; wins over
+`worker.toml`'s `grpc_auth_token`), `LLAMASERVER_BINARY_PATH`.
 Docker replicas also use `GPU_INDEX`, `GRPC_BASE_PORT`, `METRICS_BASE_PORT`
 (entrypoint computes port = base + index).
 
@@ -59,6 +66,7 @@ Docker replicas also use `GPU_INDEX`, `GRPC_BASE_PORT`, `METRICS_BASE_PORT`
 
 ```toml
 # worker_id = "my-worker"
+grpc_bind_host = "127.0.0.1"  # C1: secure by default — 0.0.0.0 is an explicit opt-in
 grpc_port = 50051
 metrics_port = 9091
 gpu_ids = [0]
@@ -69,6 +77,12 @@ max_concurrent_requests = 32
 request_timeout_secs = 120
 # hf_token = "hf_..."          # HF_TOKEN env var wins
 # hf_cache_dir = "/models/hf"
+# grpc_auth_token = "..."      # C1: WORKER_GRPC_AUTH_TOKEN env var wins
+# llamaserver_bind_host = "127.0.0.1"          # H1: secure by default
+# llamaserver_enable_slots_endpoint = false    # H1: /slots can leak another job's prompt
+# llamaserver_port_min = 1024                  # C2: allowed llamaserver.port range
+# llamaserver_port_max = 65535
+# max_n_ctx = 262144                           # H2: ceiling on caller-supplied n_ctx
 ```
 
 ## Model registry: config/models.toml
