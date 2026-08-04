@@ -161,6 +161,17 @@ impl Worker for WorkerService {
                 let load_time = load_start.elapsed();
                 let memory_used = model_instance.memory_used();
 
+                // Drop our copies of anything the loader evicted to honor
+                // `max_loaded_models`. The loader owns the eviction decision but
+                // cannot reach this map; without this, the stale entry would keep
+                // the model reported as loaded AND (for the in-process llamacpp
+                // engine) hold the last Arc, so its weights would never be freed.
+                for evicted in self.model_loader.take_evicted().await {
+                    self.loaded_models.write().await.remove(&evicted);
+                    self.metrics.remove_model_metrics(&evicted);
+                    info!("Dropped evicted model {} from the service map", evicted);
+                }
+
                 // Store model
                 self.loaded_models
                     .write()
