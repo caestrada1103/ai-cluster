@@ -7,6 +7,22 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-latest-brightgreen.svg)](docs/architecture.md)
 
+## Run it
+
+One command, then open a browser:
+
+```bash
+./scripts/run-local.sh --ui
+```
+
+Chat UI at **http://localhost:8080**, API at **http://localhost:8000**. Ctrl-C
+stops everything. Pick a model in the UI's model dropdown; the coordinator
+loads it on first use.
+
+Without `--ui` it starts the API only. `--build` rebuilds the worker first,
+`--model NAME` preloads a model, `--help` lists everything. First-time setup
+is in [Installation](#installation); `--ui` also needs Docker.
+
 ## 📋 Table of Contents
 
 - [Overview](#overview)

@@ -50,6 +50,10 @@ ARG RUNTIME_IMAGE=ubuntu:24.04
 # PR #20213). Keep any bump at or beyond that fix.
 ARG LLAMASERVER_TAG=b9941
 
+# Selects which stage supplies /llama-server: the real build, or the stub.
+# Must be global — BuildKit rejects `COPY --from=${VAR}` for a stage-scoped ARG.
+ARG LLAMASERVER_SRC=llamaserver-build
+
 # ── Stage 1: Build ──────────────────────────────────────────────────────────
 FROM ${BUILDER_IMAGE} AS builder
 
@@ -185,6 +189,12 @@ RUN printf '#!/bin/sh\necho "llama-server not built into this image (LLAMASERVER
     && chmod +x /llama-server
 
 
+# Resolve LLAMASERVER_SRC to a concrete stage name so the runtime stage can
+# `COPY --from` a literal. BuildKit does not expand variables in `--from`.
+ARG LLAMASERVER_SRC
+FROM ${LLAMASERVER_SRC} AS llamaserver-selected
+
+
 # ── Stage 3: Runtime ────────────────────────────────────────────────────────
 FROM ${RUNTIME_IMAGE} AS runtime
 
@@ -235,8 +245,7 @@ COPY --from=builder --chown=worker:worker /build/target/release/ai-worker /usr/l
 # Statically linked, so the single binary is self-contained (it still uses the
 # Vulkan LOADER libvulkan1 + mesa-vulkan-drivers installed above, plus libgomp1).
 # LLAMASERVER_SRC selects the real build (default) or the no-op stub — see Stage 2.
-ARG LLAMASERVER_SRC=llamaserver-build
-COPY --from=${LLAMASERVER_SRC} /llama-server /usr/local/bin/llama-server
+COPY --from=llamaserver-selected /llama-server /usr/local/bin/llama-server
 # The worker spawns this per engine="llamaserver" model. Env wins over
 # worker.toml's llamaserver_binary_path (whose default is "llama-server" on PATH).
 ENV LLAMASERVER_BINARY_PATH=/usr/local/bin/llama-server
