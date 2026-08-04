@@ -733,6 +733,32 @@ impl ModelLoader {
         Ok(instance)
     }
 
+    /// Reserve `bytes` on every id in `gpu_ids`, appending each success to
+    /// `reserved`. Does not roll back its own partial work on failure — lets
+    /// callers chain multiple phases and unwind them all together.
+    async fn reserve_on_gpus(
+        &self,
+        gpu_ids: &[u32],
+        bytes: u64,
+        model_name: &str,
+        reserved: &mut Vec<usize>,
+    ) -> Result<(), WorkerError> {
+        for &gpu_id in gpu_ids {
+            self.gpu_manager
+                .allocate_memory(gpu_id as usize, bytes, model_name)
+                .await?;
+            reserved.push(gpu_id as usize);
+        }
+        Ok(())
+    }
+
+    /// Roll back every reservation in `reserved` for `model_name`.
+    async fn rollback_reservations(&self, reserved: &[usize], model_name: &str) {
+        for &g in reserved {
+            self.gpu_manager.free_memory(g, model_name).await;
+        }
+    }
+
     /// Supervise a `llama-server` child process for a `engine = "llamaserver"`
     /// model (Plan 13). Pure process management — no in-process weights, no
     /// `TextGeneration`; agentic inference is proxied to the child over HTTP by
@@ -797,22 +823,62 @@ impl ModelLoader {
             ),
         }
 
+        // Phase 1 — reserve the weights (the downloaded GGUF's total size).
         let mut reserved_gpus: Vec<usize> = Vec::new();
-        for &gpu_id in gpu_ids {
-            match self
-                .gpu_manager
-                .allocate_memory(gpu_id as usize, file_size, model_name)
-                .await
-            {
-                Ok(()) => reserved_gpus.push(gpu_id as usize),
-                Err(e) => {
-                    for &g in &reserved_gpus {
-                        self.gpu_manager.free_memory(g, model_name).await;
-                    }
-                    return Err(e);
-                }
-            }
+        if let Err(e) = self
+            .reserve_on_gpus(gpu_ids, file_size, model_name, &mut reserved_gpus)
+            .await
+        {
+            self.rollback_reservations(&reserved_gpus, model_name).await;
+            return Err(e);
         }
+
+        // Phase 2 — memory-aware admission for `spec.parallel` ("instances")
+        // concurrent slots: read just the downloaded GGUF's header (no
+        // llama.cpp dependency, no full load) for the architecture numbers
+        // the KV-cache estimate needs, then reserve KV + compute buffers for
+        // every slot. Refuses (and rolls back phase 1) rather than spawning
+        // a `llama-server` that would overcommit this host's memory.
+        let arch = {
+            let path = gguf_path.clone();
+            tokio::task::spawn_blocking(move || crate::gguf_meta::read_arch_meta(&path))
+                .await
+                .map_err(|e| WorkerError::Internal(format!("spawn_blocking join error: {e}")))
+        };
+        let arch = match arch {
+            Ok(Ok(arch)) => arch,
+            Ok(Err(e)) | Err(e) => {
+                self.rollback_reservations(&reserved_gpus, model_name).await;
+                return Err(e);
+            }
+        };
+        let n_ctx = u64::from(spec.n_ctx.unwrap_or(crate::kv_estimate::DEFAULT_N_CTX));
+        // is_hybrid is unknown without a full llama.cpp load; omitting the
+        // discount over-reserves for hybrid models rather than under-counting.
+        let kv_compute_bytes = crate::kv_estimate::kv_cache_bytes_raw(
+            n_ctx,
+            arch.n_layer,
+            arch.n_head_kv,
+            arch.head_dim(),
+            false,
+            spec.cache_type_k.as_deref(),
+            spec.cache_type_v.as_deref(),
+            spec.parallel,
+        );
+        if let Err(e) = self
+            .reserve_on_gpus(gpu_ids, kv_compute_bytes, model_name, &mut reserved_gpus)
+            .await
+        {
+            self.rollback_reservations(&reserved_gpus, model_name).await;
+            return Err(e);
+        }
+        info!(
+            "llama-server {} reserved {:.2} GiB weights + {:.2} GiB KV/compute for {} instance(s)",
+            model_name,
+            file_size as f64 / (1024.0 * 1024.0 * 1024.0),
+            kv_compute_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            spec.parallel,
+        );
 
         // Build argv + spawn. On failure roll back the reservations.
         let args = match spec.build_args(
@@ -822,9 +888,7 @@ impl ModelLoader {
         ) {
             Ok(args) => args,
             Err(e) => {
-                for &g in &reserved_gpus {
-                    self.gpu_manager.free_memory(g, model_name).await;
-                }
+                self.rollback_reservations(&reserved_gpus, model_name).await;
                 return Err(e);
             }
         };
@@ -833,9 +897,7 @@ impl ModelLoader {
         let mut process = match spawn_res {
             Ok(p) => p,
             Err(e) => {
-                for &g in &reserved_gpus {
-                    self.gpu_manager.free_memory(g, model_name).await;
-                }
+                self.rollback_reservations(&reserved_gpus, model_name).await;
                 return Err(e);
             }
         };
@@ -845,9 +907,7 @@ impl ModelLoader {
         let health_timeout = std::time::Duration::from_secs(self.llamaserver_health_timeout_secs);
         if let Err(e) = process.wait_until_healthy(health_timeout).await {
             let _ = process.start_kill();
-            for &g in &reserved_gpus {
-                self.gpu_manager.free_memory(g, model_name).await;
-            }
+            self.rollback_reservations(&reserved_gpus, model_name).await;
             return Err(e);
         }
 
@@ -1209,20 +1269,12 @@ impl ModelLoader {
         // loaded, so it is reserved in phase 2 below. Roll back on partial
         // failure, matching every sibling path.
         let mut reserved_gpus: Vec<usize> = Vec::new();
-        for &gpu_id in gpu_ids {
-            match self
-                .gpu_manager
-                .allocate_memory(gpu_id as usize, file_size, model_name)
-                .await
-            {
-                Ok(()) => reserved_gpus.push(gpu_id as usize),
-                Err(e) => {
-                    for &g in &reserved_gpus {
-                        self.gpu_manager.free_memory(g, model_name).await;
-                    }
-                    return Err(e);
-                }
-            }
+        if let Err(e) = self
+            .reserve_on_gpus(gpu_ids, file_size, model_name, &mut reserved_gpus)
+            .await
+        {
+            self.rollback_reservations(&reserved_gpus, model_name).await;
+            return Err(e);
         }
 
         // Model load is blocking (mmap + optional GPU upload) — one
@@ -1251,9 +1303,7 @@ impl ModelLoader {
         let engine = match engine {
             Ok(Ok(engine)) => engine,
             Ok(Err(e)) | Err(e) => {
-                for &g in &reserved_gpus {
-                    self.gpu_manager.free_memory(g, model_name).await;
-                }
+                self.rollback_reservations(&reserved_gpus, model_name).await;
                 return Err(e);
             }
         };
@@ -1263,22 +1313,14 @@ impl ModelLoader {
         // PER REQUEST (see `llamacpp_engine.rs`), and up to
         // `max_concurrent_requests` of those can be in flight at once (the
         // `infer_semaphore` in `worker.rs` is sized to exactly that), so the
-        // reservation must cover all of them — reserving for a single slot
-        // here (as before) undercounts real usage by up to
-        // `max_concurrent_requests`x on unified-memory hosts, where that is
-        // the Linux OOM killer, not a catchable CUDA allocation error.
+        // reservation must cover all of them.
         let kv_bytes = engine.kv_cache_bytes(self.max_concurrent_requests as u32);
-        for &gpu_id in gpu_ids {
-            if let Err(e) = self
-                .gpu_manager
-                .allocate_memory(gpu_id as usize, kv_bytes, model_name)
-                .await
-            {
-                for &g in &reserved_gpus {
-                    self.gpu_manager.free_memory(g, model_name).await;
-                }
-                return Err(e);
-            }
+        if let Err(e) = self
+            .reserve_on_gpus(gpu_ids, kv_bytes, model_name, &mut reserved_gpus)
+            .await
+        {
+            self.rollback_reservations(&reserved_gpus, model_name).await;
+            return Err(e);
         }
         info!(
             "GGUF {} reserved {:.2} GiB weights + {:.2} GiB KV cache",
@@ -2074,6 +2116,100 @@ mod tests {
         };
         let loader = ModelLoader::new(loader_config, gpu_manager).unwrap();
         (loader, dir)
+    }
+
+    // -----------------------------------------------------------------
+    // Memory-aware admission (instances): reserve_on_gpus/rollback_reservations
+    // are the exact primitives `load_llamaserver_model`/`load_llamacpp_model`
+    // use, so exercising them here proves the refuse-and-roll-back contract
+    // without a network download or a real llama-server binary.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reserve_on_gpus_refuses_and_rollback_restores_capacity() {
+        let gpu_manager = Arc::new(GPUManager::test_with_capacity(1_000));
+        let (loader, _dir) = test_loader(gpu_manager.clone());
+
+        let mut reserved: Vec<usize> = Vec::new();
+        loader
+            .reserve_on_gpus(&[0], 600, "m", &mut reserved)
+            .await
+            .unwrap();
+        assert_eq!(gpu_manager.get_available_memory(0).await, 400);
+
+        let err = loader
+            .reserve_on_gpus(&[0], 500, "m", &mut reserved)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkerError::OutOfMemory { .. }));
+
+        // The caller-visible contract: rolling back `reserved` (which still
+        // holds the successful phase-1 reservation) must restore capacity —
+        // a refused second phase must never leave a partial reservation.
+        loader.rollback_reservations(&reserved, "m").await;
+        assert_eq!(gpu_manager.get_available_memory(0).await, 1_000);
+    }
+
+    #[tokio::test]
+    async fn llamaserver_more_instances_needs_more_memory_and_can_be_refused() {
+        // Same architecture numbers a real GGUF header would yield.
+        let arch = crate::gguf_meta::GgufArchMeta {
+            n_layer: 48,
+            n_head: 8,
+            n_head_kv: 8,
+            n_embd: 1024,
+        };
+        let n_ctx = 4_096u64;
+        let per_instance = crate::kv_estimate::kv_cache_bytes_raw(
+            n_ctx,
+            arch.n_layer,
+            arch.n_head_kv,
+            arch.head_dim(),
+            false,
+            None,
+            None,
+            1,
+        );
+        let sixty_four_instances = crate::kv_estimate::kv_cache_bytes_raw(
+            n_ctx,
+            arch.n_layer,
+            arch.n_head_kv,
+            arch.head_dim(),
+            false,
+            None,
+            None,
+            64,
+        );
+        assert!(sixty_four_instances > per_instance * 32); // scales with instances
+
+        // Budget fits 1 instance's KV/compute comfortably but not 64.
+        let gpu_manager = Arc::new(GPUManager::test_with_capacity(per_instance * 4));
+        let (loader, _dir) = test_loader(gpu_manager.clone());
+
+        let mut reserved: Vec<usize> = Vec::new();
+        loader
+            .reserve_on_gpus(&[0], per_instance, "one-instance", &mut reserved)
+            .await
+            .unwrap();
+        loader
+            .rollback_reservations(&reserved, "one-instance")
+            .await;
+
+        let mut reserved64: Vec<usize> = Vec::new();
+        let err = loader
+            .reserve_on_gpus(
+                &[0],
+                sixty_four_instances,
+                "many-instances",
+                &mut reserved64,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkerError::OutOfMemory { .. }));
+        loader
+            .rollback_reservations(&reserved64, "many-instances")
+            .await;
+        assert_eq!(gpu_manager.get_available_memory(0).await, per_instance * 4);
     }
 
     #[tokio::test]
