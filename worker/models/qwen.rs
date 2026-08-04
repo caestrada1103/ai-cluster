@@ -312,11 +312,8 @@ pub struct Qwen<B: Backend> {
     #[module(ignore)]
     pub tokenizer: Ignored<Tokenizer>,
     /// EOS token ids read from the checkpoint's (generation_)config.json.
-    ///
-    /// NOTE: must come before `device` — burn_derive's `Module::to_device`/`fork`
-    /// codegen binds a `let device = ...;` when it processes a field literally
-    /// named `device`, shadowing the `&B::Device` parameter for every field
-    /// generated afterward. Keeping `device` last avoids the shadowing bug.
+    /// Must come before `device`: burn_derive's codegen shadows `&B::Device`
+    /// for every field after one literally named `device`.
     pub eos_token_ids: Ignored<std::collections::HashSet<u32>>,
     pub device: Ignored<B::Device>,
 }

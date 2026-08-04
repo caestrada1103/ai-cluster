@@ -303,11 +303,8 @@ pub struct Llama<B: Backend> {
     #[module(ignore)]
     pub tokenizer: Ignored<Tokenizer>,
     /// EOS token ids read from the checkpoint's (generation_)config.json.
-    ///
-    /// NOTE: must come before `device` — burn_derive's `Module::to_device`/`fork`
-    /// codegen binds a `let device = ...;` when it processes a field literally
-    /// named `device`, shadowing the `&B::Device` parameter for every field
-    /// generated afterward. Keeping `device` last avoids the shadowing bug.
+    /// Must come before `device`: burn_derive's codegen shadows `&B::Device`
+    /// for every field after one literally named `device`.
     pub eos_token_ids: Ignored<std::collections::HashSet<u32>>,
     pub device: Ignored<B::Device>,
 }
@@ -378,11 +375,9 @@ impl<B: Backend> Llama<B> {
         })
     }
 
-    /// Prefill: run the full forward pass on the prompt, return last-position logits
-    /// (as `Vec<f32>`, already on CPU) and the populated KV cache.
-    ///
-    /// The causal bias is computed once at this level and reused across all layers,
-    /// eliminating the per-layer O(seq²) allocation that existed in the old approach.
+    /// Prefill: run the full forward pass on the prompt, return last-position
+    /// logits (CPU) and the populated KV cache. Causal bias is computed once
+    /// here and reused across all layers.
     pub fn prefill(&self, input_ids: Tensor<B, 2>) -> (Vec<f32>, KvCache<B>) {
         let [_, seq_len] = input_ids.dims();
         let device = input_ids.device();
