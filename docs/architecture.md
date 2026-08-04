@@ -468,7 +468,11 @@ Micro-batching for efficiency:
 
 ### 2. Tensor Parallelism (Core Implemented — Service Wiring Pending)
 
-Splits individual tensors across multiple GPUs.
+Splits individual tensors across multiple GPUs. `num_shards == 1` is
+mathematically identical to the non-parallel forward pass. GQA requires
+`num_shards` to evenly divide `num_kv_heads`; a non-divisor request is
+silently clamped down to the nearest valid value (`clamp_shards`, which
+logs a warning on clamp).
 
 ```
                     Tensor Parallelism

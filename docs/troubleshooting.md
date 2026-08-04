@@ -6,8 +6,8 @@
   `uvicorn coordinator.main:app --host 127.0.0.1 --port 8000` (running `uvicorn main:app`
   from inside `coordinator/` breaks package imports).
 - **`RuntimeError: Refusing to start: COORDINATOR_HOST='0.0.0.0' is not
-  loopback-only and COORDINATOR_API_KEYS is unset`** — this is intentional
-  (C4, secure by default): a non-loopback bind with no API keys means every
+  loopback-only and COORDINATOR_API_KEYS is unset`** — this is intentional,
+  secure by default: a non-loopback bind with no API keys means every
   route is reachable with zero credentials. Either use `--host 127.0.0.1`
   for local-only, or set `COORDINATOR_API_KEYS` (comma-separated secrets)
   before binding to `0.0.0.0`/a LAN address. See `.env.example`.
@@ -67,6 +67,13 @@ rocm-smi                      # AMD
 
 ## Inference problems
 
+- **Reply contains a spurious extra turn** (e.g. a trailing `<|user|>` after
+  a correct answer) — a chat template built for a different model family was
+  applied (a Zephyr-style template on a Qwen checkpoint, observed on
+  hardware, replayed a fake next turn). `coordinator/api.py` selects the
+  prompt template per model family and truncates on the family's stop
+  sequence; if you add a new registry entry, make sure it maps to the right
+  template.
 - **504 Gateway Timeout** — generation exceeded `COORDINATOR_REQUEST_TIMEOUT`
   (default 300 s) or the worker's `request_timeout_secs`. Long prompts on CPU
   fallback are the usual cause — verify a real GPU is selected (worker log line

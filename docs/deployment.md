@@ -39,9 +39,8 @@ worker/Open-WebUI ports" below for the opt-in override):
 
 ### Exposing worker/Open-WebUI ports (opt in)
 
-Security-audit findings C1/H1/M11 made the base `docker-compose.yml`
-secure-by-default: no worker port or Open-WebUI's port is published to the
-host. That is correct for the common single-host case (coordinator and
+The base `docker-compose.yml` is secure-by-default: no worker port or
+Open-WebUI's port is published to the host. That is correct for the common single-host case (coordinator and
 worker(s) only need to reach each other over the private compose network).
 Layer `docker-compose.expose-ports.yml` when something OUTSIDE this compose
 project needs to reach one of these directly — e.g. a LAN cluster where the
@@ -87,7 +86,17 @@ per-vendor performance. Cargo features are `wgpu` (default) / `rocm` / `cuda`
 `13.0.3-runtime-ubuntu24.04` (bumped 2026-08 from 12.6.3, whose nvcc predates
 sm_121/Grace-Blackwell support) — both amd64 and arm64 manifests are
 published for these tags, so the same block builds on an RTX 3080 desktop
-(x86_64) or a DGX Spark (aarch64).
+(x86_64) or a DGX Spark (aarch64). `worker/build.rs` links NCCL (a
+multi-GPU collective-comm library) only when it's found on the link-search
+path — linking it unconditionally broke single-GPU CUDA hosts, notably DGX
+Spark, whose CUDA 13 toolkit ships `cudart`/`cublas` but no `libnccl`,
+failing only at final link after a long build.
+
+A worker's `max_loaded_models = 1` (see `config/worker.toml`) is meant for
+hosts with unified CPU+GPU memory like DGX Spark, where the operator wants
+only one model resident at a time — loading a new one evicts the
+oldest-loaded first. `0` (the default) is unlimited, for deployments with
+headroom to keep several models warm.
 
 #### Per-GPU quick start
 
@@ -164,8 +173,8 @@ python3 -m venv venv && source venv/bin/activate
 pip install -r coordinator/requirements.txt
 # Loopback-only, single-machine (secure by default — no COORDINATOR_API_KEYS needed):
 uvicorn coordinator.main:app --host 127.0.0.1 --port 8000
-# Reachable from elsewhere on your LAN — the coordinator now REFUSES to start with
-# a non-loopback --host and no COORDINATOR_API_KEYS configured (C4):
+# Reachable from elsewhere on your LAN — the coordinator refuses to start with
+# a non-loopback --host and no COORDINATOR_API_KEYS configured:
 export COORDINATOR_API_KEYS=$(openssl rand -hex 32)   # or set it in .env
 uvicorn coordinator.main:app --host 0.0.0.0 --port 8000
 
@@ -280,8 +289,8 @@ export LLAMASERVER_BINARY_PATH="$PWD/build/bin/llama-server"
 
 Each llamaserver model listens on its own coordinator-assigned `llamaserver_port`
 (`config/models.toml`: **8081** Devstral, **8082** Qwen3-Coder). The worker's
-`llamaserver_bind_host` now defaults to **`127.0.0.1`** (H1, secure by default —
-`/slots` can leak another job's prompt text, and this port has no auth at all).
+`llamaserver_bind_host` defaults to **`127.0.0.1`**, secure by default —
+`/slots` can leak another slot's prompt text, and this port has no auth at all.
 The coordinator proxies to `http://<worker_host>:<port>`; those TCP ports must
 therefore be **reachable from the coordinator host**:
 
@@ -299,12 +308,12 @@ therefore be **reachable from the coordinator host**:
   and open the ports in the worker host's firewall to the coordinator only.
 - **Trusted-LAN only:** that proxy hop is still plaintext and unauthenticated
   at the HTTP layer — never expose the llamaserver ports to an untrusted
-  network (see Plan 15). Also disable `/slots` unless you specifically need
-  it (`llamaserver_enable_slots_endpoint = false` is the new default).
+  network. Also disable `/slots` unless you specifically need it
+  (`llamaserver_enable_slots_endpoint = false` is the default).
 
 ### Windows
 
-Windows `llama-server` provisioning is deferred to **Plan 17**.
+Windows `llama-server` provisioning is not yet supported.
 
 ## 5. Health checks
 
