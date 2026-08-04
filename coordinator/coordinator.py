@@ -262,6 +262,13 @@ class ClusterCoordinator:
         )
         worker.state = WorkerState.HEALTHY
         worker.gpus = list(status.gpus)
+        # Adopt models already resident on the worker (e.g. the coordinator was
+        # restarted while the worker kept running with a model loaded). Without
+        # this, a freshly-connected WorkerInfo starts with an empty
+        # loaded_models dict and the model is unreachable via unload/list until
+        # the periodic health-check loop happens to catch up (see get_status(),
+        # which performs the same assignment on every poll).
+        worker.loaded_models = {m.model_name: m for m in status.loaded_models}
 
         async with self._workers_lock:
             # Re-check: another task may have connected the same address meanwhile.
@@ -561,6 +568,36 @@ class ClusterCoordinator:
             worker.active_requests -= 1
             self.active_requests_gauge.set(len(self.active_requests))
 
+    async def _refresh_worker_state(self, worker: WorkerInfo) -> None:
+        """Synchronously refresh one worker's ``gpus``/``loaded_models``.
+
+        Called right after a load/unload RPC completes so a client that just
+        hit ``POST /models/load`` or ``DELETE /models/{name}`` sees consistent
+        data on its very next ``GET /v1/workers`` or ``GET /v1/models`` call,
+        instead of waiting up to ``health_check_interval`` for the periodic
+        health-check loop to catch up (item 3). This also picks up any change
+        the worker made on its own as a side effect of the load/unload (e.g.
+        evicting another model to free VRAM), not just the model we touched.
+
+        Bounded by ``worker.health_check_timeout`` — the exact timeout
+        ``WorkerInfo.get_status()`` already uses for its gRPC call — so this
+        can never hang the load/unload request path longer than a normal
+        health check would. ``get_status()`` itself swallows/logs RPC errors
+        and updates failure bookkeeping rather than raising, so a worker that
+        is momentarily unreachable degrades to "stale until the next periodic
+        poll" rather than failing the load/unload response.
+
+        Deliberately never lets an exception escape: this is a best-effort
+        freshness refresh, not part of the load/unload contract itself — a
+        successful load/unload must still be reported as successful even if
+        this immediate refresh fails for any reason (the periodic health-check
+        loop remains the fallback source of truth).
+        """
+        try:
+            await worker.get_status()
+        except Exception as e:
+            logger.warning(f"Failed to refresh worker {worker.id} state after load/unload: {e}")
+
     async def _load_model_on_worker(
         self,
         worker: WorkerInfo,
@@ -623,13 +660,22 @@ class ClusterCoordinator:
                 parallelism=pb.ParallelismStrategy.AUTO,
             )
 
-            response = await worker.stub.LoadModel(request, timeout=300)  # 5 min timeout
+            # Deadline covers the worker's GGUF download, not just the load —
+            # see Settings.model_load_timeout for the sizing rationale.
+            response = await worker.stub.LoadModel(
+                request, timeout=self.settings.model_load_timeout
+            )
 
             if response.success:
                 logger.info(
                     f"Loaded {model_name} on worker {worker.id}, "
                     f"using {response.memory_used / 1e9:.2f}GB VRAM"
                 )
+                # Refresh loaded_models/gpus synchronously (item 3) instead of
+                # waiting on the periodic health-check loop, so callers of
+                # POST /models/load (and any load-on-demand caller) see
+                # up-to-date GET /v1/workers | /v1/models data immediately.
+                await self._refresh_worker_state(worker)
                 return True
             else:
                 logger.error(f"Failed to load model: {response.message}")
@@ -664,6 +710,10 @@ class ClusterCoordinator:
                 worker.loaded_models.pop(model_name, None)
                 unloaded_from.append(worker.id)
                 logger.info(f"Unloaded {model_name} from worker {worker.id}")
+                # Refresh synchronously (item 3): picks up freed GPU memory
+                # and any other change the worker made as part of unloading,
+                # rather than leaving it stale until the next health tick.
+                await self._refresh_worker_state(worker)
             except Exception as e:
                 logger.error(f"Failed to unload {model_name} from {worker.id}: {e}")
         if not unloaded_from:
