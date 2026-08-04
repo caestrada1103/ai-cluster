@@ -15,6 +15,8 @@ git clone https://github.com/caestrada1103/ai-cluster.git
 cd ai-cluster
 cp .env.example .env
 # REQUIRED: set GRAFANA_ADMIN_PASSWORD in .env (compose refuses to start Grafana without it)
+# REQUIRED: set COMPOSE_PROFILES in .env to match your GPU (see "GPU variants" below) —
+#   with no profile set, `docker compose up` starts everything EXCEPT a worker.
 # Set HF_TOKEN for gated models (Llama 3, ...)
 docker compose up -d --build
 curl http://localhost:8000/health
@@ -32,32 +34,78 @@ Services and host ports:
 
 ### GPU variants
 
-One parameterized `docker/Dockerfile.worker`:
+One parameterized `docker/Dockerfile.worker` builds five worker profiles in
+`docker-compose.yml` — no vendor is assumed by default, so pick the one
+profile matching your hardware via `COMPOSE_PROFILES` in `.env` (or
+`--profile <name>` on the CLI). Whichever one is active, it joins the compose
+network as both its own service name and the `worker` alias, so
+`COORDINATOR_STATIC_WORKERS=["worker:50051"]` keeps working unchanged. Only
+activate **one** single-GPU profile at a time (see "Multi-GPU hosts" below
+for running several workers at once).
 
-- **Universal wgpu/Vulkan** (default): AMD passthrough — `/dev/kfd` + `/dev/dri`,
-  `group_add: [video, render]`; NVIDIA — Container Toolkit injects the Vulkan ICD;
-  Intel — works out of the box (Mesa ANV).
-- **AMD native ROCm**: build arg `BACKEND=rocm` with the `rocm/dev-ubuntu-24.04:6.2.1` images.
-- **NVIDIA native CUDA**: build arg `BACKEND=cuda` with the `nvidia/cuda:12.6.3-*-ubuntu24.04` images.
+| Profile | Service | `BACKEND` | Vendor | GPU passthrough | Perf |
+|---|---|---|---|---|---|
+| `amd-vulkan` | `worker-amd-vulkan` | `wgpu` (default) | AMD | `/dev/kfd` + `/dev/dri`, `group_add: [video, render]` | good |
+| `nvidia-vulkan` | `worker-nvidia-vulkan` | `wgpu` (default) | NVIDIA | NVIDIA Container Toolkit (`deploy.resources.reservations.devices`) | good |
+| `intel-vulkan` | `worker-intel-vulkan` | `wgpu` (default) | Intel | `/dev/dri`, `group_add: [video, render]` (Mesa ANV — works out of the box) | good |
+| `rocm-native` | `worker-rocm-native` | `rocm` | AMD | `/dev/kfd` + `/dev/dri`, `group_add: [video, render]` | best |
+| `cuda-native` | `worker-cuda-native` | `cuda` | NVIDIA (incl. DGX Spark, sm_121) | NVIDIA Container Toolkit | best |
 
-See the commented blocks in `docker-compose.yml` for copy-paste service definitions.
-Cargo features are `wgpu` (default) / `rocm` / `cuda` — there is no `hip` feature.
+The three `*-vulkan` profiles all build the exact same universal wgpu/Vulkan
+image — Vulkan auto-detects the vendor at runtime — and differ only in which
+device nodes get passed through. `rocm-native`/`cuda-native` build the
+vendor's native Burn backend instead (`BACKEND=rocm|cuda`) for the best
+per-vendor performance. Cargo features are `wgpu` (default) / `rocm` / `cuda`
+— there is no `hip` feature.
+
+`cuda-native` builds on `nvidia/cuda:13.0.3-devel-ubuntu24.04` /
+`13.0.3-runtime-ubuntu24.04` (bumped 2026-08 from 12.6.3, whose nvcc predates
+sm_121/Grace-Blackwell support) — both amd64 and arm64 manifests are
+published for these tags, so the same block builds on an RTX 3080 desktop
+(x86_64) or a DGX Spark (aarch64).
+
+#### Per-GPU quick start
+
+```bash
+# RTX 3080 (NVIDIA, universal Vulkan image — good perf, simplest path)
+echo "COMPOSE_PROFILES=nvidia-vulkan" >> .env
+docker compose up -d --build
+
+# RTX 3080 (NVIDIA, native CUDA build — best perf)
+echo "COMPOSE_PROFILES=cuda-native" >> .env
+docker compose up -d --build
+
+# RX 9060XT (AMD, universal Vulkan image — good perf, simplest path)
+echo "COMPOSE_PROFILES=amd-vulkan" >> .env
+docker compose up -d --build
+
+# RX 9060XT (AMD, native ROCm build — best perf)
+echo "COMPOSE_PROFILES=rocm-native" >> .env
+docker compose up -d --build
+
+# DGX Spark (Grace-Blackwell, aarch64, sm_121) — native CUDA build recommended
+echo "COMPOSE_PROFILES=cuda-native" >> .env
+docker compose up -d --build
+# or, as a vendor-neutral fallback (also multi-arch, builds fine on aarch64):
+echo "COMPOSE_PROFILES=nvidia-vulkan" >> .env
+docker compose up -d --build
+```
 
 #### Enabling the llama.cpp/GGUF engine (recommended for consumer GPUs)
 
 The default image builds the Burn/wgpu path only. To also compile the
 llama.cpp engine — the one that actually loads quantized GGUF models — add
-the `WORKER_FEATURES` build arg:
+the `WORKER_FEATURES` build arg to whichever worker service matches your
+profile (e.g. `worker-nvidia-vulkan:` for `COMPOSE_PROFILES=nvidia-vulkan`):
 
 ```yaml
-# docker-compose.yml worker service, build.args:
+# docker-compose.yml, e.g. under the worker-nvidia-vulkan: service, build.args:
 build:
   context: .
   dockerfile: docker/Dockerfile.worker
   args:
     WORKER_FEATURES: "llamacpp,llamacpp-vulkan"   # Vulkan offload, NVIDIA or AMD
-    # or, on a CUDA base image:
-    # BACKEND: cuda
+    # or, under worker-cuda-native: (already BACKEND: cuda), just add:
     # WORKER_FEATURES: "llamacpp,llamacpp-cuda"
 ```
 
@@ -68,15 +116,22 @@ a GGUF file once the worker is built this way.
 
 ### Multi-GPU hosts
 
-Run one worker service per GPU (see the `worker-gpu-N` commented blocks):
-set `GPU_INDEX=N` per service (ports become 50051+N / 9091+N), give each its own
-GPU passthrough block, add each address to `COORDINATOR_STATIC_WORKERS`, and add
-each metrics target to `config/prometheus.yml`.
+Run one worker service per GPU (see the `worker-gpu-N` commented blocks,
+`profiles: ["multi-gpu"]`, brought up with
+`COMPOSE_PROFILES=multi-gpu docker compose up -d`): set `GPU_INDEX=N` per
+service (ports become 50051+N / 9091+N), give each its own GPU passthrough
+block (base it on whichever single-GPU profile above matches that card's
+vendor — mixed-vendor rigs just combine blocks of different `BACKEND`s), add
+each address to `COORDINATOR_STATIC_WORKERS`, and add each metrics target to
+`config/prometheus.yml`. Don't also activate one of the single-GPU profiles
+in the same project — both would fight over the shared `worker` network
+alias and the default GRPC/metrics ports.
 
 ## 2. Native (no Docker)
 
 Prerequisites: Python 3.10+, Rust 1.70+, `protobuf-compiler`, GPU drivers
-(ROCm 6.0+ / CUDA 12.1+ / any Vulkan driver for wgpu).
+(ROCm 6.0+ / CUDA 12.1+, or 13.0+ for sm_121 / Grace-Blackwell hosts like DGX
+Spark / any Vulkan driver for wgpu).
 
 ```bash
 # Coordinator — run from the REPO ROOT (module path matters)
@@ -146,6 +201,10 @@ Build `llama-server` once from the same pinned tag, then point the worker at it:
 sudo apt-get install -y build-essential cmake git libvulkan-dev glslc spirv-headers libcurl4-openssl-dev
 # Runtime deps (Vulkan loader + AMD/Intel Mesa drivers):
 sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+# Node.js 20.19+/22.12+ (NOT Ubuntu 24.04's apt nodejs, which is 18.x — too
+# old) — required by `-DLLAMA_BUILD_SERVER=ON` below, see the note underneath:
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
 
 git clone --depth 1 --branch b9941 https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
@@ -155,6 +214,18 @@ cmake --build build --target llama-server -j
 # Point the worker at the in-tree binary (simplest — keeps its shared libs):
 export LLAMASERVER_BINARY_PATH="$PWD/build/bin/llama-server"
 ```
+
+> **Node.js is required, not optional.** `-DLLAMA_BUILD_SERVER=ON` pulls in
+> llama.cpp's embedded Web UI unconditionally (`tools/CMakeLists.txt` does
+> `add_subdirectory(ui)` whenever `LLAMA_BUILD_SERVER=ON` — it does **not**
+> gate on `-DLLAMA_BUILD_UI`, and `tools/server/CMakeLists.txt` links the
+> resulting `llama-ui` static lib into the `llama-server` binary). The UI's
+> `package.json` pins vite 7, which needs Node 20.19+/22.12+. Without a
+> working npm, CMake falls through to downloading prebuilt UI assets from a
+> Hugging Face bucket instead — a network-dependent fallback with its own
+> failure modes — so installing Node as above is the reliable path. This is
+> exactly what `docker/Dockerfile.worker`'s Stage 2 does (copies a Node 22
+> binary in via multi-stage `COPY`) for the same reason.
 
 - NVIDIA hosts can build with `-DGGML_CUDA=ON` instead for CUDA offload; the
   Vulkan build above already covers AMD, NVIDIA, and Intel.
