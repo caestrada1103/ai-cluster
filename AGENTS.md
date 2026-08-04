@@ -23,8 +23,13 @@ docker compose down
 ```bash
 # Run from the REPO ROOT — `cd coordinator && uvicorn main:app` breaks package imports.
 pip install -r coordinator/requirements-dev.txt   # runtime+lint+test (runtime only: requirements.txt)
-uvicorn coordinator.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn coordinator.main:app --reload --host 127.0.0.1 --port 8000
 ```
+> Security note (C4): the coordinator now REFUSES to start with a non-loopback
+> `--host` (e.g. `0.0.0.0`) unless `COORDINATOR_API_KEYS` is set — secure by
+> default. For a LAN-reachable coordinator, set `COORDINATOR_API_KEYS` first
+> (comma-separated secrets, e.g. `openssl rand -hex 32`) and pass
+> `--host 0.0.0.0`. See `.env.example` and `docs/deployment.md`.
 
 ### Worker (Rust)
 `wgpu` (Burn engine, FP32) is the **default** cargo feature; add `llamacpp` for the **recommended** GGUF/quantized-inference engine on consumer GPUs.
