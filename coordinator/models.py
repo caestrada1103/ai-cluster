@@ -113,6 +113,13 @@ class ModelConfig:
     gguf_cache_type_k: Optional[str] = None
     gguf_cache_type_v: Optional[str] = None
 
+    # MoE expert offload: maps to llama.cpp's `--n-cpu-moe N`, which keeps the
+    # first N layers' expert tensors on the CPU. This is the lever that makes a
+    # large MoE fit a small consumer GPU (8-16 GB) — without it the only option
+    # is the blunter all-experts-on-CPU fallback. `None` (default) omits the
+    # flag entirely, preserving today's behavior.
+    gguf_n_cpu_moe: Optional[int] = None
+
     # llama-server engine (Plan 13 — agentic serving). The worker supervises a
     # `llama-server` child process per model; the coordinator proxies raw
     # OpenAI/Anthropic JSON+SSE straight to it (see coordinator/proxy.py), so
@@ -228,6 +235,8 @@ class ModelConfig:
             metadata["cache_type_k"] = self.gguf_cache_type_k
         if self.gguf_cache_type_v is not None:
             metadata["cache_type_v"] = self.gguf_cache_type_v
+        if self.gguf_n_cpu_moe is not None:
+            metadata["n_cpu_moe"] = str(self.gguf_n_cpu_moe)
         return metadata
 
     def _llamaserver_metadata(self) -> Dict[str, str]:
@@ -768,6 +777,7 @@ class ModelRegistry:
                     gguf_n_ctx=int(gguf["n_ctx"]) if "n_ctx" in gguf else None,
                     gguf_cache_type_k=gguf.get("cache_type_k"),
                     gguf_cache_type_v=gguf.get("cache_type_v"),
+                    gguf_n_cpu_moe=(int(gguf["n_cpu_moe"]) if "n_cpu_moe" in gguf else None),
                     llamaserver_port=(int(ls_port) if ls_port is not None else None),
                     llamaserver_parallel=(int(ls_parallel) if ls_parallel is not None else None),
                     llamaserver_extra_args=(str(ls_extra) if ls_extra is not None else None),
