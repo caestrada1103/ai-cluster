@@ -603,8 +603,13 @@ class ClusterCoordinator:
         worker: WorkerInfo,
         model_name: str,
         quantization: Quantization = Quantization.NONE,
+        instances: Optional[int] = None,
     ) -> bool:
-        """Load a model on a worker."""
+        """Load a model on a worker.
+
+        `instances` overrides the registry's llamaserver instance/slot count
+        for this load only; ignored for non-llamaserver models.
+        """
         model_config = ModelRegistry.get_model(model_name)
 
         # H4: an unregistered model_name falls through below to a raw
@@ -641,7 +646,7 @@ class ClusterCoordinator:
                     intermediate_size=model_config.intermediate_size,
                     # Engine routing (empty for burn models): the worker reads
                     # these string keys to select the llama.cpp GGUF path.
-                    metadata=model_config.grpc_metadata(),
+                    metadata=model_config.grpc_metadata(instances=instances),
                 )
                 if model_config.local_gpu_ids is not None:
                     # Level 1 — local multi-GPU split: send the exact GPU ids
