@@ -16,9 +16,36 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Configuration
-CUDA_VERSION="${CUDA_VERSION:-12.1}"  # Default CUDA version
+# Default bumped 12.1 -> 13.0 (2026-08): 12.1's nvcc predates sm_121 (compute
+# capability 12.1 — NVIDIA Grace-Blackwell GB10, e.g. DGX Spark) support;
+# nvcc 13.0 lists both compute_120/sm_120 and compute_121/sm_121. Confirmed
+# against the NVIDIA CUDA apt repo Packages index (developer.download.nvidia.com)
+# that the "cuda-13-0"/"cuda-toolkit-13-0" package names exist for both the
+# x86_64 and sbsa (arm64/Grace) repo paths.
+CUDA_VERSION="${CUDA_VERSION:-13.0}"  # Default CUDA version
 CUDA_VERSION_MAJOR=$(echo $CUDA_VERSION | cut -d. -f1)
 CUDA_VERSION_MINOR=$(echo $CUDA_VERSION | cut -d. -f2)
+
+# Architecture detection for NVIDIA's apt repo layout: their repo paths use
+# "x86_64" for amd64 and "sbsa" (Server Base System Architecture) for arm64 —
+# NOT "aarch64" (that name is reserved for NVIDIA's separate Jetson/Tegra repo,
+# which is a different, incompatible package set). This is what makes the
+# script usable on aarch64 NVIDIA hosts like DGX Spark (Grace-Blackwell), not
+# just x86_64 desktops/servers. Confirmed both repo paths exist and serve the
+# same cuda-keyring_1.1-1_all.deb filename.
+HOST_ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+case "$HOST_ARCH" in
+    amd64|x86_64)
+        NVIDIA_REPO_ARCH="x86_64"
+        ;;
+    arm64|aarch64)
+        NVIDIA_REPO_ARCH="sbsa"
+        ;;
+    *)
+        echo "Unsupported architecture for NVIDIA's CUDA apt repo: $HOST_ARCH (expected amd64/arm64)" >&2
+        exit 1
+        ;;
+esac
 INSTALL_DRIVER="${INSTALL_DRIVER:-yes}"
 INSTALL_DOCKER="${INSTALL_DOCKER:-yes}"
 INSTALL_CONTAINER_TOOLKIT="${INSTALL_CONTAINER_TOOLKIT:-yes}"
@@ -187,8 +214,8 @@ install_dependencies_ubuntu() {
 }
 
 install_cuda_ubuntu() {
-    print_header "Installing CUDA ${CUDA_VERSION}"
-    
+    print_header "Installing CUDA ${CUDA_VERSION} (${NVIDIA_REPO_ARCH})"
+
     # Map Ubuntu version to CUDA repository name
     case $UBUNTU_VERSION in
         20.04)
@@ -205,7 +232,15 @@ install_cuda_ubuntu() {
             exit 1
             ;;
     esac
-    
+
+    # CUDA 13.x dropped Ubuntu 20.04 (no cuda-13-0 package published under
+    # ubuntu2004 in NVIDIA's repo) — fail clearly instead of a confusing
+    # "Unable to locate package" deep inside apt.
+    if [ "$CUDA_VERSION_MAJOR" -ge 13 ] && [ "$UBUNTU_VERSION" = "20.04" ]; then
+        print_error "CUDA ${CUDA_VERSION} is not published for Ubuntu 20.04. Use CUDA_VERSION=12.x on 20.04, or upgrade to Ubuntu 22.04/24.04."
+        exit 1
+    fi
+
     # Check if CUDA is already installed
     if command -v nvcc &> /dev/null; then
         INSTALLED_VERSION=$(nvcc --version | grep "release" | awk '{print $6}' | cut -d, -f1)
@@ -221,9 +256,10 @@ install_cuda_ubuntu() {
     # Remove old CUDA GPG key if exists
     sudo rm -f /usr/share/keyrings/cuda-archive-keyring.gpg
     
-    # Download and install CUDA keyring
-    log "Adding CUDA repository..."
-    wget https://developer.download.nvidia.com/compute/cuda/repos/${UBUNTU_REPO}/x86_64/cuda-keyring_1.1-1_all.deb
+    # Download and install CUDA keyring (architecture-aware repo path — see
+    # NVIDIA_REPO_ARCH detection above: x86_64 vs sbsa/arm64)
+    log "Adding CUDA repository (${NVIDIA_REPO_ARCH})..."
+    wget https://developer.download.nvidia.com/compute/cuda/repos/${UBUNTU_REPO}/${NVIDIA_REPO_ARCH}/cuda-keyring_1.1-1_all.deb
     sudo dpkg -i cuda-keyring_1.1-1_all.deb
     rm cuda-keyring_1.1-1_all.deb
     
@@ -375,10 +411,16 @@ install_nvidia_container_toolkit() {
     sudo nvidia-ctk runtime configure --runtime=docker
     sudo systemctl restart docker
     
-    # Test
+    # Test. NVIDIA's nvidia/cuda Docker Hub tags are only published per exact
+    # patch version (e.g. "13.0.3-base-ubuntu24.04") — there is no floating
+    # "13.0-base-..." tag — so append ".0" for a CUDA_VERSION given as
+    # major.minor (matches the ${CUDA_VERSION//./-} apt package convention
+    # used elsewhere in this script). Confirmed via the Docker Hub registry
+    # API that both amd64 and arm64 manifests exist for the "*.0-base-*" tags
+    # of 12.8+/13.x on ubuntu22.04/ubuntu24.04.
     print_info "Testing NVIDIA Container Toolkit..."
-    docker run --rm --gpus all nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION} nvidia-smi
-    
+    docker run --rm --gpus all "nvidia/cuda:${CUDA_VERSION}.0-base-ubuntu${UBUNTU_VERSION}" nvidia-smi
+
     print_success "NVIDIA Container Toolkit installed"
 }
 
@@ -1270,7 +1312,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --cuda-version VERSION    CUDA version to install (default: 12.1)"
+            echo "  --cuda-version VERSION    CUDA version to install (default: 13.0)"
             echo "  --no-driver                Skip NVIDIA driver installation"
             echo "  --no-docker                 Skip Docker installation"
             echo "  --no-container-toolkit      Skip NVIDIA Container Toolkit"
