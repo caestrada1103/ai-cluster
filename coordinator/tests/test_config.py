@@ -176,6 +176,24 @@ def test_llamaserver_autoload_env_override(tmp_path: Path) -> None:
     assert s.llamaserver_autoload is False
 
 
+def test_model_load_timeout_default_covers_large_gguf_downloads() -> None:
+    """The LoadModel deadline must cover a multi-GB download, not just the load.
+
+    Regression guard for the previously hardcoded 300s, which capped
+    API-loadable models at roughly 3 GB on a 10 MB/s link and made every
+    DGX-Spark-tier model (22-73 GB) impossible to load through the API.
+    """
+    s = make_settings()
+    assert s.model_load_timeout >= 1800
+
+
+def test_model_load_timeout_is_overridable(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("COORDINATOR_MODEL_LOAD_TIMEOUT=7200\n")
+    s = Settings(_env_file=str(env_file))
+    assert s.model_load_timeout == 7200
+
+
 def test_dead_settings_fields_removed() -> None:
     s = make_settings()
     for dead in (
