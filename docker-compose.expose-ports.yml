@@ -1,0 +1,61 @@
+# docker-compose.expose-ports.yml
+# ================================
+# OPT-IN override: publishes the worker gRPC/metrics/llama-server ports and
+# the Open-WebUI port to the HOST, restoring the pre-audit behavior of the
+# base docker-compose.yml.
+#
+# Security audit findings C1/H1/M11 made the base file secure-by-default: no
+# worker or Open-WebUI port is published unless you explicitly layer this
+# file on top. That is correct for the common case (coordinator and worker(s)
+# on the SAME host — they only need to reach each other over the private
+# `ai-cluster-net` bridge, which this file has nothing to do with). Use this
+# override only when something OUTSIDE this compose project needs to reach
+# one of these ports directly, e.g.:
+#   - A LAN cluster: the coordinator runs on a DIFFERENT host than this
+#     worker, so it must reach 50051 (gRPC)/8081+8082 (llama-server) over the
+#     real network.
+#   - You want to hit a worker's Prometheus metrics (9091) directly instead
+#     of through the coordinator's monitoring stack.
+#   - You want to browse to Open-WebUI (8080) from another machine on your
+#     LAN instead of only from the Docker host itself.
+#
+# Usage — layer this on top of the base file with -f, activating whichever
+# worker profile matches your GPU:
+#   docker compose -f docker-compose.yml -f docker-compose.expose-ports.yml \
+#     --profile cuda-native up -d
+#
+# Before doing this on anything beyond a trusted LAN behind a firewall/VPN,
+# also set WORKER_GRPC_AUTH_TOKEN (worker gRPC has no other auth) and
+# COORDINATOR_API_KEYS (if the coordinator isn't already gated) in your
+# .env — see .env.example and docs/deployment.md.
+#
+# NOTE: only one of the *-vulkan/*-native worker services is normally active
+# at a time (via COMPOSE_PROFILES) — the extra `ports:` blocks below for
+# services you didn't activate are simply unused, same as in the base file.
+
+services:
+  worker-amd-vulkan:
+    ports: &worker-common-ports
+      - "${GRPC_PORT:-50051}:${GRPC_PORT:-50051}"
+      - "${METRICS_PORT:-9091}:${METRICS_PORT:-9091}"
+      # llama-server (Plan 13, engine="llamaserver") registry ports — one per
+      # llamaserver model in config/models.toml (8081/8082 today;
+      # coordinator-assigned, globally unique per model, not per-worker).
+      - "8081:8081"
+      - "8082:8082"
+
+  worker-nvidia-vulkan:
+    ports: *worker-common-ports
+
+  worker-intel-vulkan:
+    ports: *worker-common-ports
+
+  worker-rocm-native:
+    ports: *worker-common-ports
+
+  worker-cuda-native:
+    ports: *worker-common-ports
+
+  open-webui:
+    ports:
+      - "8080:8080"
