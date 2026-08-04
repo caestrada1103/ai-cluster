@@ -127,6 +127,129 @@ fn parse_kv_cache_type(name: &str) -> Result<KvCacheType, WorkerError> {
     }
 }
 
+/// Bytes per KV element for a ggml cache type.
+///
+/// Block-quantized types store 32 elements plus per-block scale/min metadata,
+/// so the per-element cost is fractional (e.g. `q8_0` = 34 bytes / 32 elements).
+/// `None` means llama.cpp's own default, which is `f16`. Any type outside the
+/// validated set falls back to the `f16` cost — deliberately the most
+/// pessimistic of the supported set, so an unknown type over-reserves rather
+/// than under-reserves.
+fn kv_cache_type_bytes(t: Option<KvCacheType>) -> f64 {
+    match t {
+        Some(KvCacheType::Q8_0) => 34.0 / 32.0,
+        Some(KvCacheType::Q5_1) => 24.0 / 32.0,
+        Some(KvCacheType::Q5_0) => 22.0 / 32.0,
+        Some(KvCacheType::Q4_1) => 20.0 / 32.0,
+        Some(KvCacheType::Q4_0) => 18.0 / 32.0,
+        _ => 2.0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KV-cache / compute-buffer sizing (Task: CLAUDE.md fix 3)
+// ---------------------------------------------------------------------------
+
+/// Discount applied to the attention-layer KV-cache estimate for
+/// hybrid-attention models (`LlamaModel::is_hybrid()` — Qwen3.5/3.6,
+/// Qwen3-Next "Gated DeltaNet", and similarly-shaped Jamba/Falcon-H1/
+/// Nemotron-H-style architectures). These interleave a minority of real
+/// full-attention layers with recurrent/SSM layers that hold a small
+/// **fixed-size** state buffer which does NOT scale with `n_ctx` — treating
+/// every layer as a full attention layer (the un-discounted formula) badly
+/// over-counts for them.
+///
+/// `llama-cpp-2 = 0.1.150` exposes no per-layer attention-type query and no
+/// recurrent-state-size query through its public API: `llama_model_n_head_kv`
+/// and `llama_model_n_swa` take no layer index, and this version's
+/// `llama.cpp` vendors no `llama_model_n_embd_k_s`/`_v_s`-style getter either
+/// (checked directly against the vendored C headers/source under
+/// `~/.cargo/registry/src/*/llama-cpp-sys-2-0.1.150/llama.cpp/`, specifically
+/// `include/llama.h` and `src/llama-model.cpp`'s `llm_arch_is_hybrid`/
+/// `hparams.is_recr(il)` machinery, which is internal and not exported). The
+/// only signal available through the crate is the boolean
+/// `LlamaModel::is_hybrid()` (`llama_model_is_hybrid`), derived from the
+/// GGUF's architecture id.
+///
+/// Measured on hardware for one hybrid model (Qwen3-family): treating every
+/// layer as a full attention layer estimated 2.66 GiB where llama.cpp
+/// actually allocated 1360 MiB — real:estimated ≈ 0.51. Different hybrid
+/// families interleave attention/recurrent layers at different ratios (per
+/// `llama-model.cpp`, Falcon-H1 layers carry BOTH an attention AND a
+/// recurrent component per layer; Nemotron-H's attention-layer fraction is
+/// much smaller than Qwen3.5/3.6's), so 0.51 is a data point, not a universal
+/// constant. We deliberately apply a discount ABOVE the one measured ratio
+/// (0.6 rather than 0.51) so this stays a safe OVER-estimate — under-counting
+/// KV-cache memory risks OOM-killing the process, which is the failure mode
+/// worth avoiding, whereas over-reserving only costs some admission headroom.
+///
+/// Residual risk: this is a single documented heuristic applied uniformly to
+/// every `is_hybrid()` model, not a per-architecture computation — it may
+/// still be too generous for a hybrid family whose real attention-layer
+/// fraction is far below 60% of the naive estimate (e.g. Nemotron-H-shaped
+/// models with very few attention layers), or (rarely) too tight for one
+/// where recurrent layers are unusually memory-heavy. Revisit if/when
+/// `llama-cpp-2` exposes a per-layer or per-architecture breakdown.
+const HYBRID_ATTENTION_DISCOUNT: f64 = 0.6;
+
+/// Linear fit for llama.cpp's own COMPUTE buffers (distinct from — and
+/// previously entirely ignored by — the KV-cache estimate). Measured on
+/// hardware for a 35B dense model: 493 MiB at `n_ctx=131072`, 820 MiB at
+/// `n_ctx=262144`. This is two data points' worth of slope/intercept for one
+/// model, not a per-architecture computation (compute-buffer size also
+/// depends on batch size, model width, and llama.cpp's own internal
+/// scheduling, none of which this function has access to) — treat it as a
+/// documented, better-than-zero approximation rather than an exact figure.
+fn compute_buffer_bytes(n_ctx: u64) -> u64 {
+    const N_CTX_LOW: f64 = 131_072.0;
+    const BYTES_LOW: f64 = 493.0 * 1024.0 * 1024.0;
+    const N_CTX_HIGH: f64 = 262_144.0;
+    const BYTES_HIGH: f64 = 820.0 * 1024.0 * 1024.0;
+    const SLOPE: f64 = (BYTES_HIGH - BYTES_LOW) / (N_CTX_HIGH - N_CTX_LOW);
+    const INTERCEPT: f64 = BYTES_LOW - N_CTX_LOW * SLOPE;
+
+    (INTERCEPT + n_ctx as f64 * SLOPE).max(0.0) as u64
+}
+
+/// Pure, weights-independent KV-cache + compute-buffer estimate for
+/// `slots` concurrent llama.cpp contexts. Factored out of
+/// [`LlamaCppEngine::kv_cache_bytes`] so it's unit-testable without a loaded
+/// `LlamaModel`.
+///
+/// `2 * n_ctx * n_layer * n_head_kv * head_dim * bytes_per_element` is the KV
+/// term (factor 2 covers K and V, budgeted separately since they can be
+/// quantized independently via `-ctk`/`-ctv`); `is_hybrid` applies
+/// [`HYBRID_ATTENTION_DISCOUNT`]; [`compute_buffer_bytes`] adds llama.cpp's
+/// compute buffers; the sum is multiplied by `slots` because the in-process
+/// engine builds one full `LlamaContext` (its own KV cache AND its own
+/// compute buffers) per generation call — see [`LlamaCppEngine::kv_cache_bytes`]'s
+/// doc comment for why `slots` must reflect worst-case concurrency, not `1`.
+#[allow(clippy::too_many_arguments)]
+fn kv_cache_bytes_raw(
+    n_ctx: u64,
+    n_layer: u64,
+    n_head_kv: u64,
+    head_dim: u64,
+    is_hybrid: bool,
+    cache_type_k: Option<KvCacheType>,
+    cache_type_v: Option<KvCacheType>,
+    slots: u32,
+) -> u64 {
+    let kv_elements = n_ctx
+        .saturating_mul(n_layer)
+        .saturating_mul(n_head_kv)
+        .saturating_mul(head_dim);
+    let per_element = kv_cache_type_bytes(cache_type_k) + kv_cache_type_bytes(cache_type_v);
+    let mut kv_bytes = (kv_elements as f64 * per_element) as u64;
+
+    if is_hybrid {
+        kv_bytes = (kv_bytes as f64 * HYBRID_ATTENTION_DISCOUNT) as u64;
+    }
+
+    let per_slot_bytes = kv_bytes.saturating_add(compute_buffer_bytes(n_ctx));
+    per_slot_bytes.saturating_mul(u64::from(slots.max(1)))
+}
+
 // ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
@@ -199,6 +322,71 @@ impl LlamaCppEngine {
             cache_type_k,
             cache_type_v,
         })
+    }
+
+    /// Estimated KV-cache + compute-buffer footprint in bytes for `slots`
+    /// concurrent contexts at this engine's configured window.
+    ///
+    /// # `slots` must be worst-case concurrency, not `1`
+    ///
+    /// The in-process engine (see this module's top-level doc comment) builds
+    /// a **fresh `LlamaContext` — its own KV cache AND its own compute
+    /// buffers — per generation call**, inside `spawn_blocking`; contexts are
+    /// never pooled or shared across requests. `slots` must therefore be the
+    /// number of generation calls that can be in flight simultaneously for
+    /// this model, not the number of models loaded. As of this writing the
+    /// only caller (`model_loader.rs::load_model`, which this module does not
+    /// own) passes a hardcoded `1`, reserving only a single context's worth
+    /// of memory even though the worker admits up to `max_concurrent_requests`
+    /// (32 by default, `worker.toml`) simultaneous in-flight requests — i.e.
+    /// the true worst case for one loaded model can be ~32x what gets
+    /// reserved today. Fixing that requires changing the call site to pass
+    /// the worker's real concurrency bound (or a per-model cap); see the repo
+    /// task notes for the precise call site and the alternative of bounding
+    /// admission by available memory instead of by a fixed slot count.
+    ///
+    /// # What changed vs. the naive formula
+    ///
+    /// * KV term: `2 * n_ctx * n_layer * n_head_kv * head_dim *
+    ///   bytes_per_element` (factor 2 covers K and V, budgeted separately
+    ///   since they can be quantized independently via `-ctk`/`-ctv`), now
+    ///   discounted by [`HYBRID_ATTENTION_DISCOUNT`] for hybrid-attention
+    ///   models (`is_hybrid()`) — see that constant's doc comment for why
+    ///   treating every layer as a full attention layer over-counts them by
+    ///   roughly 2x, and why a fixed discount rather than an exact
+    ///   computation is the best available option today.
+    /// * Compute buffers: previously ignored entirely; see
+    ///   [`compute_buffer_bytes`].
+    /// * Both terms scale with `slots`, matching the fresh-context-per-request
+    ///   reality above.
+    ///
+    /// The context window mirrors [`run_generation`]'s resolution exactly
+    /// (`n_ctx.unwrap_or(DEFAULT_N_CTX).min(n_ctx_train)`), so this predicts the
+    /// window that will actually be allocated rather than the requested one.
+    ///
+    /// This remains a weights-independent estimate (excludes allocator
+    /// fragmentation and any llama.cpp overhead beyond KV + compute buffers),
+    /// so treat it as an approximation, not an exact figure.
+    pub fn kv_cache_bytes(&self, slots: u32) -> u64 {
+        let n_ctx_train = self.model.n_ctx_train().max(1);
+        let n_ctx = u64::from(self.n_ctx.unwrap_or(DEFAULT_N_CTX).min(n_ctx_train));
+        let n_layer = u64::from(self.model.n_layer());
+        let n_head_kv = u64::from(self.model.n_head_kv());
+        // head_dim = n_embd / n_head; guard n_head to avoid a divide-by-zero on
+        // a malformed GGUF header.
+        let n_head = u64::from(self.model.n_head()).max(1);
+        let head_dim = (self.model.n_embd().max(0) as u64) / n_head;
+
+        kv_cache_bytes_raw(
+            n_ctx,
+            n_layer,
+            n_head_kv,
+            head_dim,
+            self.model.is_hybrid(),
+            self.cache_type_k,
+            self.cache_type_v,
+            slots,
+        )
     }
 }
 
@@ -366,6 +554,118 @@ impl TextGeneration for LlamaCppEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- fix 3b: compute_buffer_bytes ---------------------------------------
+
+    #[test]
+    fn compute_buffer_bytes_reproduces_the_two_measured_points() {
+        // Measured on hardware for a 35B model: 493 MiB @ n_ctx=131072,
+        // 820 MiB @ n_ctx=262144. The linear fit must reproduce both exactly
+        // (they're the two points that define it) modulo integer rounding.
+        let low = 493u64 * 1024 * 1024;
+        let high = 820u64 * 1024 * 1024;
+        assert!(compute_buffer_bytes(131_072).abs_diff(low) <= 1);
+        assert!(compute_buffer_bytes(262_144).abs_diff(high) <= 1);
+    }
+
+    #[test]
+    fn compute_buffer_bytes_grows_with_context() {
+        // Was ignored entirely before this fix (always 0) — must now scale
+        // with n_ctx, matching the observed growth from 493 MiB to 820 MiB.
+        assert!(compute_buffer_bytes(4_096) < compute_buffer_bytes(131_072));
+        assert!(compute_buffer_bytes(131_072) < compute_buffer_bytes(262_144));
+        assert!(compute_buffer_bytes(0) > 0, "fixed intercept must remain");
+    }
+
+    // --- fix 3a/3c: kv_cache_bytes_raw --------------------------------------
+
+    #[test]
+    fn hybrid_discount_strictly_reduces_the_kv_term() {
+        let non_hybrid = kv_cache_bytes_raw(131_072, 48, 8, 128, false, None, None, 1);
+        let hybrid = kv_cache_bytes_raw(131_072, 48, 8, 128, true, None, None, 1);
+        assert!(
+            hybrid < non_hybrid,
+            "hybrid models must not be estimated as if every layer were full attention"
+        );
+        // The discount only touches the KV term, not the (identical) compute
+        // buffer term, so it must land near HYBRID_ATTENTION_DISCOUNT of the
+        // KV-only delta rather than being unboundedly smaller.
+        let compute = compute_buffer_bytes(131_072);
+        let kv_non_hybrid = non_hybrid - compute;
+        let kv_hybrid = hybrid - compute;
+        let ratio = kv_hybrid as f64 / kv_non_hybrid as f64;
+        assert!(
+            (ratio - HYBRID_ATTENTION_DISCOUNT).abs() < 0.01,
+            "ratio {ratio} should match the documented discount"
+        );
+    }
+
+    #[test]
+    fn non_hybrid_models_are_unaffected_by_the_discount() {
+        // Guards against accidentally applying HYBRID_ATTENTION_DISCOUNT to
+        // ordinary dense models (the vast majority of GGUF checkpoints).
+        let bytes = kv_cache_bytes_raw(4_096, 32, 8, 128, false, None, None, 1);
+        let elements = 4_096u64 * 32 * 8 * 128;
+        let expected_kv = (elements as f64 * 4.0) as u64; // f16 K + f16 V = 2.0 + 2.0
+        assert_eq!(bytes, expected_kv + compute_buffer_bytes(4_096));
+    }
+
+    #[test]
+    fn slots_scales_both_kv_and_compute_terms() {
+        // Fix 3c: the in-process engine builds one full context (KV +
+        // compute buffers) PER REQUEST, so both terms must scale with
+        // `slots`, not just the KV term.
+        let one = kv_cache_bytes_raw(131_072, 48, 8, 128, false, None, None, 1);
+        let eight = kv_cache_bytes_raw(131_072, 48, 8, 128, false, None, None, 8);
+        assert_eq!(eight, one * 8);
+    }
+
+    #[test]
+    fn slots_zero_is_treated_as_one() {
+        let zero = kv_cache_bytes_raw(4_096, 32, 8, 128, false, None, None, 0);
+        let one = kv_cache_bytes_raw(4_096, 32, 8, 128, false, None, None, 1);
+        assert_eq!(zero, one);
+    }
+
+    #[test]
+    fn kv_cache_type_bytes_matches_ggml_block_layouts() {
+        // f16 is 2 bytes/element; the block types store 32 elements plus
+        // scale/min metadata, so they are strictly cheaper than f16.
+        assert_eq!(kv_cache_type_bytes(None), 2.0);
+        assert_eq!(kv_cache_type_bytes(Some(KvCacheType::F16)), 2.0);
+        assert_eq!(kv_cache_type_bytes(Some(KvCacheType::Q8_0)), 34.0 / 32.0);
+        assert_eq!(kv_cache_type_bytes(Some(KvCacheType::Q4_0)), 18.0 / 32.0);
+        for t in [
+            KvCacheType::Q8_0,
+            KvCacheType::Q5_1,
+            KvCacheType::Q5_0,
+            KvCacheType::Q4_1,
+            KvCacheType::Q4_0,
+        ] {
+            assert!(kv_cache_type_bytes(Some(t)) < kv_cache_type_bytes(None));
+        }
+    }
+
+    #[test]
+    fn kv_cache_type_bytes_orders_by_precision() {
+        // Fewer bits must never cost more memory.
+        assert!(
+            kv_cache_type_bytes(Some(KvCacheType::Q8_0))
+                > kv_cache_type_bytes(Some(KvCacheType::Q5_1))
+        );
+        assert!(
+            kv_cache_type_bytes(Some(KvCacheType::Q5_1))
+                > kv_cache_type_bytes(Some(KvCacheType::Q5_0))
+        );
+        assert!(
+            kv_cache_type_bytes(Some(KvCacheType::Q5_0))
+                > kv_cache_type_bytes(Some(KvCacheType::Q4_1))
+        );
+        assert!(
+            kv_cache_type_bytes(Some(KvCacheType::Q4_1))
+                > kv_cache_type_bytes(Some(KvCacheType::Q4_0))
+        );
+    }
 
     #[test]
     fn sampler_params_greedy_when_temperature_near_zero() {
