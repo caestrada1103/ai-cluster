@@ -81,14 +81,25 @@ def _request_timeout(stream: bool) -> httpx.Timeout:
     return httpx.Timeout(timeout, read=read)
 
 
+#: M2 — the coordinator's own auth credential (a client's ``Authorization``/
+#: ``x-api-key``, or any session ``Cookie``) must never leave the coordinator.
+#: llama-server has no concept of these — forwarding them upstream just leaks
+#: the caller's credential to a second process for no benefit, and (worse) a
+#: worker-local llama-server is reachable by anyone who can already reach the
+#: worker host, so a leaked credential there is a bigger blast radius than
+#: "unused header".
+_CREDENTIAL_HEADERS: frozenset[str] = frozenset({"authorization", "x-api-key", "cookie"})
+
+
 def filter_request_headers(headers: Mapping[str, str]) -> Dict[str, str]:
     """Build the forward set of REQUEST headers for the upstream llama-server.
 
     Forwards Content-Type (so llama-server parses the JSON body) and every other
-    client header except hop-by-hop ones, ``host`` and ``content-length`` (httpx
-    re-derives those for the upstream connection).
+    client header except hop-by-hop ones, ``host``/``content-length`` (httpx
+    re-derives those for the upstream connection), and credential headers (M2 —
+    see ``_CREDENTIAL_HEADERS``).
     """
-    dropped = _HOP_BY_HOP | {"host", "content-length"}
+    dropped = _HOP_BY_HOP | {"host", "content-length"} | _CREDENTIAL_HEADERS
     return {k: v for k, v in headers.items() if k.lower() not in dropped}
 
 
