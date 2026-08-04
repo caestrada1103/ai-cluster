@@ -25,9 +25,9 @@ docker compose down
 pip install -r coordinator/requirements-dev.txt   # runtime+lint+test (runtime only: requirements.txt)
 uvicorn coordinator.main:app --reload --host 127.0.0.1 --port 8000
 ```
-> Security note (C4): the coordinator now REFUSES to start with a non-loopback
-> `--host` (e.g. `0.0.0.0`) unless `COORDINATOR_API_KEYS` is set — secure by
-> default. For a LAN-reachable coordinator, set `COORDINATOR_API_KEYS` first
+> Security note: the coordinator refuses to start with a non-loopback `--host`
+> (e.g. `0.0.0.0`) unless `COORDINATOR_API_KEYS` is set — secure by default.
+> For a LAN-reachable coordinator, set `COORDINATOR_API_KEYS` first
 > (comma-separated secrets, e.g. `openssl rand -hex 32`) and pass
 > `--host 0.0.0.0`. See `.env.example` and `docs/deployment.md`.
 
