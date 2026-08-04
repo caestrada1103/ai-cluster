@@ -1,61 +1,12 @@
 # Root docker-compose.yml
 # =======================
-# Docker Compose configuration for the AI Cluster
-#
-# Worker image/backend selection is via Compose PROFILES, not by hand-editing
-# YAML. Exactly one worker service is meant to be active per compose project
-# (single-box, possibly multi-GPU rig) or per host (LAN cluster) — pick the
-# profile matching your GPU and set it in .env (COMPOSE_PROFILES=...) or pass
-# --profile on the CLI:
-#
-#   ┌────────────────────────────────────────────────────────────────────────────────┐
-#   │  Profile              Service                 Dockerfile BACKEND  Vendor  Perf  │
-#   │  amd-vulkan            worker-amd-vulkan        wgpu (default)     AMD     good  │
-#   │  nvidia-vulkan         worker-nvidia-vulkan      wgpu (default)     NVIDIA  good  │
-#   │  intel-vulkan          worker-intel-vulkan       wgpu (default)     Intel   good  │
-#   │  rocm-native           worker-rocm-native        rocm               AMD     best  │
-#   │  cuda-native            worker-cuda-native        cuda               NVIDIA  best  │
-#   └────────────────────────────────────────────────────────────────────────────────┘
-#
-# One parameterized docker/Dockerfile.worker covers all of these via
-# --build-arg BACKEND=wgpu|rocm|cuda (the *-vulkan profiles all build the same
-# universal wgpu image — Vulkan auto-detects AMD/NVIDIA/Intel — and differ only
-# in which device nodes get passed through). No profile is active by default:
-# `docker compose up -d` alone starts coordinator + monitoring + open-webui but
-# deliberately NO worker, so nothing silently assumes one vendor. Set
-# COMPOSE_PROFILES in .env to bring a worker up — see .env.example and
-# docs/deployment.md for the exact command per GPU (RTX 3080 / RX 9060XT / DGX
-# Spark / multi-GPU rig).
-#
-# Every worker service below joins ai-cluster-net under BOTH its own Compose
-# service name AND the network alias "worker" (see each service's `networks:`
-# block), so `COORDINATOR_STATIC_WORKERS=["worker:50051"]` keeps working no
-# matter which one profile is active. Only activate one single-worker profile
-# at a time — see "Multi-GPU hosts" further down for running several at once.
-#
-# SECURE BY DEFAULT / OPT IN TO EXPOSURE (security audit C1/H1/M11):
-# - No worker (`50051`/`9091`/`8081`/`8082`) or Open-WebUI (`8080`) port is
-#   published to the HOST by this file anymore — only the coordinator's own
-#   API port (`8000`) is. Every worker still binds `0.0.0.0` INSIDE its own
-#   container so the coordinator container can reach it over the private
-#   `ai-cluster-net` bridge (not the same thing as host/LAN exposure —
-#   nothing outside this compose project can reach an unpublished port).
-# - The worker's gRPC server additionally supports a shared-secret
-#   (`WORKER_GRPC_AUTH_TOKEN`, wired in below) — set it once any of these
-#   ports ARE published beyond this host.
-# - To reach a worker (or Open-WebUI) from ANOTHER host — the actual LAN
-#   multi-node cluster case this project targets — explicitly opt in with
-#   the override file: `docker-compose.expose-ports.yml`, e.g.:
-#     docker compose -f docker-compose.yml -f docker-compose.expose-ports.yml \
-#       --profile cuda-native up -d
-#   See that file's header comment and docs/deployment.md.
-# - The coordinator itself REFUSES to start when `COORDINATOR_HOST` is not
-#   loopback and `COORDINATOR_API_KEYS` is unset (see coordinator/main.py) —
-#   since this file's coordinator service DOES publish `8000` to the host by
-#   design (it's the REST API clients are meant to call), set
-#   `COORDINATOR_API_KEYS` in your `.env` before `docker compose up`, or the
-#   coordinator container will exit immediately with an explanatory error.
-#   See .env.example.
+# Worker backend/vendor selection is via Compose profiles (amd-vulkan,
+# nvidia-vulkan, intel-vulkan, rocm-native, cuda-native) — set COMPOSE_PROFILES
+# in .env or pass --profile; none is active by default (`docker compose up -d`
+# alone starts only coordinator + monitoring + open-webui). Only the
+# coordinator's port (8000) is published to the host — worker/Open-WebUI ports
+# require the docker-compose.expose-ports.yml override. Full profile table,
+# security posture, and per-GPU commands: docs/deployment.md, .env.example.
 
 services:
   # Coordinator
@@ -70,16 +21,10 @@ services:
       - COORDINATOR_PORT=8000
       - COORDINATOR_DISCOVERY_METHOD=static
       - COORDINATOR_STATIC_WORKERS=["worker:50051"]
-      # C4: was hardcoded to "*" here, unconditionally — this port IS
-      # published to the host below, so a wildcard-with-no-auth default was
-      # the real-world exposure the audit flagged. Default now comes from
-      # coordinator/config.py (empty + an always-on loopback allowance);
-      # override in .env only when a browser app on another origin needs it.
+      # Default comes from coordinator/config.py (empty + an always-on loopback
+      # allowance); override in .env only when another origin needs CORS.
       - COORDINATOR_CORS_ORIGINS=${COORDINATOR_CORS_ORIGINS:-}
-      # C4: previously not wired through AT ALL — COORDINATOR_API_KEYS could
-      # be set in the shell/.env forever and the coordinator process would
-      # never see it, silently leaving every route open. Empty by default;
-      # the coordinator now refuses to start with a non-loopback
+      # Empty by default; the coordinator refuses to start with a non-loopback
       # COORDINATOR_HOST (true here, since 8000 is published) and no keys —
       # set this in .env before `docker compose up`. See .env.example.
       - COORDINATOR_API_KEYS=${COORDINATOR_API_KEYS:-}
@@ -104,8 +49,7 @@ services:
       retries: 3
       start_period: 10s
     restart: unless-stopped
-    # M8: bound, not workload-dependent (unlike the GPU workers, whose
-    # memory need scales with whatever model is loaded) — safe to cap.
+    # Fixed, unlike the GPU workers whose memory need scales with the loaded model.
     mem_limit: ${COORDINATOR_MEM_LIMIT:-2g}
     pids_limit: 512
 
@@ -131,12 +75,9 @@ services:
       - RUST_LOG=${RUST_LOG:-info}
       - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
       - HF_TOKEN=${HF_TOKEN:-}
-      # C1: shared-secret gRPC auth (worker/src/grpc_auth.rs). Empty by
-      # default — this compose network doesn't publish the gRPC port (see
-      # the file header), so loopback-equivalent trust already applies
-      # inside the bridge network. REQUIRED once you publish this worker's
-      # ports via docker-compose.expose-ports.yml or run it as a standalone
-      # LAN-cluster node the coordinator reaches from another host.
+      # Shared-secret gRPC auth (worker/src/grpc_auth.rs). Empty by default;
+      # required once this worker's ports are published (expose-ports.yml)
+      # or reached from another host.
       - WORKER_GRPC_AUTH_TOKEN=${WORKER_GRPC_AUTH_TOKEN:-}
     volumes: &worker-common-volumes
       - ./config:/app/config:ro
@@ -146,12 +87,8 @@ services:
       ai-cluster-net:
         aliases:
           - worker
-    # H1/C1: no ports published here by default (was 50051/9091/8081/8082) —
-    # see the file header comment and docker-compose.expose-ports.yml for the
-    # explicit opt-in (LAN cluster / coordinator-on-another-host case). The
-    # worker container still binds these ports on 0.0.0.0 INSIDE its own
-    # network namespace so sibling containers (the coordinator) can reach it
-    # via the "worker" alias — that is not the same as host/LAN exposure.
+    # No ports published by default — see the file header comment and
+    # docker-compose.expose-ports.yml for the explicit opt-in.
     logging: *default-logging
     depends_on:
       coordinator:
@@ -164,20 +101,13 @@ services:
       - video
       - render
     restart: unless-stopped
-    # M8: no mem_limit here (unlike coordinator/monitoring) — model size
-    # varies per deployment (a few GB up to 100+ GB unified memory on a DGX
-    # Spark), so a fixed cap would break legitimate large-model configs.
-    # pids_limit is safe regardless of model size (guards against a runaway
-    # fork bomb, not legitimate memory use).
+    # No mem_limit here (unlike coordinator/monitoring) — model size varies
+    # too widely across deployments; pids_limit alone guards against a runaway fork bomb.
     pids_limit: 2048
 
   # ==========================================================================
   # Worker — Universal wgpu/Vulkan, NVIDIA device passthrough (same image as
-  # above — Vulkan auto-detects the vendor). RTX 3080 and other NVIDIA cards,
-  # including DGX Spark (Grace-Blackwell, aarch64) as a vendor-neutral fallback
-  # if you'd rather not build the native CUDA variant.
-  # Requires the NVIDIA Container Toolkit:
-  #   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+  # above — Vulkan auto-detects the vendor). Requires the NVIDIA Container Toolkit.
   #   COMPOSE_PROFILES=nvidia-vulkan docker compose up -d
   # ==========================================================================
   worker-nvidia-vulkan:
@@ -192,7 +122,7 @@ services:
       ai-cluster-net:
         aliases:
           - worker
-    # H1/C1: not published by default — see the file header comment.
+    # Not published by default — see the file header comment.
     logging: *default-logging
     deploy:
       resources:
@@ -208,10 +138,8 @@ services:
     pids_limit: 2048
 
   # ==========================================================================
-  # Worker — Universal wgpu/Vulkan, Intel device passthrough. Works out of the
-  # box via the Mesa ANV Vulkan driver already in the default image — no
-  # BACKEND build arg needed, just the /dev/dri device node (no /dev/kfd —
-  # that's AMD/ROCm-specific and doesn't exist on an Intel-only host).
+  # Worker — Universal wgpu/Vulkan, Intel device passthrough (Mesa ANV
+  # driver, default image, no BACKEND build arg needed).
   #   COMPOSE_PROFILES=intel-vulkan docker compose up -d
   # ==========================================================================
   worker-intel-vulkan:
@@ -226,7 +154,7 @@ services:
       ai-cluster-net:
         aliases:
           - worker
-    # H1/C1: not published by default — see the file header comment.
+    # Not published by default — see the file header comment.
     logging: *default-logging
     depends_on:
       coordinator:
@@ -261,18 +189,14 @@ services:
       ai-cluster-net:
         aliases:
           - worker
-    # H1/C1: not published by default — see the file header comment.
+    # Not published by default — see the file header comment.
     logging: *default-logging
     devices:
       - /dev/kfd
       - /dev/dri
-    # M7: seccomp=unconfined removed — device passthrough + group_add
-    # (video/render) is the modern, narrower way to grant ROCm/KFD access on
-    # current Docker/kernel versions; unconfined disables seccomp filtering
-    # entirely (every syscall allowed), which is broader than this actually
-    # needs. If your ROCm build hits an EPERM/ENOSYS from a blocked syscall
-    # on your kernel, re-add `security_opt: [seccomp=unconfined]` locally as
-    # an explicit, documented exception rather than carrying it by default.
+    # Device passthrough + group_add (video/render) grants ROCm/KFD access
+    # without seccomp=unconfined. If your kernel hits an EPERM/ENOSYS from a
+    # blocked syscall, re-add `security_opt: [seccomp=unconfined]` locally.
     group_add:
       - video
       - render
@@ -284,11 +208,8 @@ services:
 
   # ==========================================================================
   # Worker — NVIDIA native CUDA (burn/cuda, maximum NVIDIA performance).
-  # CUDA 13.0.3 devel+runtime (bumped from 12.6.3 — 12.6's nvcc predates sm_121
-  # / Grace-Blackwell GB10 support; confirmed via the Docker Hub registry API
-  # that 13.0.3-{devel,runtime}-ubuntu24.04 publish both linux/amd64 and
-  # linux/arm64 manifests, so this same block covers an RTX 3080 desktop AND a
-  # DGX Spark). Requires the NVIDIA Container Toolkit.
+  # CUDA 13.0.3 devel+runtime (needed for sm_121/Grace-Blackwell GB10 support);
+  # publishes both linux/amd64 and linux/arm64. Requires the NVIDIA Container Toolkit.
   #   COMPOSE_PROFILES=cuda-native docker compose up -d
   # ==========================================================================
   worker-cuda-native:
@@ -309,7 +230,7 @@ services:
       ai-cluster-net:
         aliases:
           - worker
-    # H1/C1: not published by default — see the file header comment.
+    # Not published by default — see the file header comment.
     logging: *default-logging
     deploy:
       resources:
@@ -325,13 +246,10 @@ services:
     pids_limit: 2048
 
   # ==========================================================================
-  # Multi-GPU example: uncomment and adjust for machines with multiple GPUs
-  # (or several GPUs of different vendors in one box). Each worker gets a
-  # unique GPU_INDEX and port pair, its OWN Compose service name (not the
-  # shared "worker" alias — with N workers there is no single "worker" to
-  # alias to), and its own profile so `docker compose up -d` still starts none
-  # of them by default. Base each block on whichever single-GPU service above
-  # matches that particular card's vendor (copy its devices/deploy block too).
+  # Multi-GPU example: uncomment and adjust for machines with multiple GPUs.
+  # Each worker needs its own GPU_INDEX, port pair, and Compose service name
+  # (not the shared "worker" alias). Base each block on the matching
+  # single-GPU service above (copy its devices/deploy block too).
   # ==========================================================================
   # worker-gpu-0:
   #   profiles: ["multi-gpu"]
@@ -377,28 +295,12 @@ services:
   #   depends_on:
   #     - coordinator
 
-  # NOTE for multi-GPU: each extra worker needs (a) its own GPU passthrough block
-  # (devices/group_add for AMD or deploy.resources.reservations.devices for NVIDIA),
-  # (b) an entry in COORDINATOR_STATIC_WORKERS, e.g. ["worker-gpu-0:50051","worker-gpu-1:50052"],
-  # (c) a matching target in config/prometheus.yml (workers job). Bring these up
-  # with `COMPOSE_PROFILES=multi-gpu docker compose up -d` — do NOT also activate
-  # one of the single-GPU profiles above in the same project, since both would
-  # try to claim the "worker" network alias and the default GRPC/metrics ports.
-  #
-  # NOTE for engine="llamaserver" (Plan 13): the multi-GPU example above omits
-  # the llamaserver port publishes for brevity — copy the `- "8081:8081"` /
-  # `- "8082:8082"` lines from one of the single-GPU worker services above if
-  # the coordinator is on another host. Those ports are per-MODEL and globally
-  # unique (not per-worker), so one publish covers whichever worker loads that
-  # model. See docs/deployment.md "llama-server for agentic serving".
-  #
-  # NOTE for LAN clusters (a worker per separate PC): run this same
-  # docker-compose.yml on each worker host with only that host's worker
-  # service targeted and --no-deps (so it doesn't also spin up a local
-  # coordinator), e.g. on a DGX Spark acting as one node in a cluster:
-  #   COMPOSE_PROFILES=cuda-native docker compose up -d --no-deps worker-cuda-native
-  # then point the coordinator (run once, on its own host) at every worker
-  # host:port via COORDINATOR_STATIC_WORKERS. See docs/deployment.md section 3.
+  # Multi-GPU also needs: (a) GPU passthrough per worker, (b) an entry in
+  # COORDINATOR_STATIC_WORKERS per worker, (c) a matching target in
+  # config/prometheus.yml. Do not also activate a single-GPU profile in the
+  # same project — both would claim the "worker" alias and default ports.
+  # For LAN clusters (a worker per host) and llamaserver port publishing,
+  # see docs/deployment.md.
 
   # Monitoring Stack
   prometheus:
@@ -443,12 +345,8 @@ services:
     mem_limit: ${GRAFANA_MEM_LIMIT:-1g}
     pids_limit: 256
 
-  # Open-WebUI (Chat Interface). M11: WEBUI_AUTH now defaults to True (was
-  # False — "disable login screen for local network", but this service DOES
-  # publish 8080 by default... except it no longer does either, see below)
-  # and the host port is opt-in via docker-compose.expose-ports.yml, same as
-  # the worker ports — set WEBUI_AUTH=False yourself only if you've deliberately
-  # decided this instance never leaves a trusted LAN.
+  # Open-WebUI (Chat Interface). WEBUI_AUTH defaults to True; set it False
+  # yourself only if this instance never leaves a trusted LAN.
   open-webui:
     image: ghcr.io/open-webui/open-webui:v0.6.5
     container_name: ai-open-webui
@@ -461,9 +359,7 @@ services:
       - open-webui-data:/app/backend/data
     networks:
       - ai-cluster-net
-    # M11: not published by default — opt in via docker-compose.expose-ports.yml
-    # (adds "8080:8080") once you actually want to browse to this from
-    # outside the host running Docker.
+    # Not published by default — opt in via docker-compose.expose-ports.yml (adds "8080:8080").
     depends_on:
       coordinator:
         condition: service_healthy

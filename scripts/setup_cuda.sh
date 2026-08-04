@@ -16,23 +16,14 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Configuration
-# Default bumped 12.1 -> 13.0 (2026-08): 12.1's nvcc predates sm_121 (compute
-# capability 12.1 — NVIDIA Grace-Blackwell GB10, e.g. DGX Spark) support;
-# nvcc 13.0 lists both compute_120/sm_120 and compute_121/sm_121. Confirmed
-# against the NVIDIA CUDA apt repo Packages index (developer.download.nvidia.com)
-# that the "cuda-13-0"/"cuda-toolkit-13-0" package names exist for both the
-# x86_64 and sbsa (arm64/Grace) repo paths.
+# 13.0 (not 12.1): 12.1's nvcc predates sm_121 (Grace-Blackwell GB10, e.g. DGX Spark) support.
 CUDA_VERSION="${CUDA_VERSION:-13.0}"  # Default CUDA version
 CUDA_VERSION_MAJOR=$(echo $CUDA_VERSION | cut -d. -f1)
 CUDA_VERSION_MINOR=$(echo $CUDA_VERSION | cut -d. -f2)
 
-# Architecture detection for NVIDIA's apt repo layout: their repo paths use
-# "x86_64" for amd64 and "sbsa" (Server Base System Architecture) for arm64 —
-# NOT "aarch64" (that name is reserved for NVIDIA's separate Jetson/Tegra repo,
-# which is a different, incompatible package set). This is what makes the
-# script usable on aarch64 NVIDIA hosts like DGX Spark (Grace-Blackwell), not
-# just x86_64 desktops/servers. Confirmed both repo paths exist and serve the
-# same cuda-keyring_1.1-1_all.deb filename.
+# NVIDIA's apt repo uses "x86_64"/"sbsa" (not "aarch64", which is the
+# separate, incompatible Jetson/Tegra repo) — this is what makes the script
+# work on aarch64 hosts like DGX Spark, not just x86_64.
 HOST_ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
 case "$HOST_ARCH" in
     amd64|x86_64)
@@ -411,13 +402,8 @@ install_nvidia_container_toolkit() {
     sudo nvidia-ctk runtime configure --runtime=docker
     sudo systemctl restart docker
     
-    # Test. NVIDIA's nvidia/cuda Docker Hub tags are only published per exact
-    # patch version (e.g. "13.0.3-base-ubuntu24.04") — there is no floating
-    # "13.0-base-..." tag — so append ".0" for a CUDA_VERSION given as
-    # major.minor (matches the ${CUDA_VERSION//./-} apt package convention
-    # used elsewhere in this script). Confirmed via the Docker Hub registry
-    # API that both amd64 and arm64 manifests exist for the "*.0-base-*" tags
-    # of 12.8+/13.x on ubuntu22.04/ubuntu24.04.
+    # nvidia/cuda tags are only published per exact patch version (no
+    # floating "13.0-base-..." tag), so append ".0" for a major.minor CUDA_VERSION.
     print_info "Testing NVIDIA Container Toolkit..."
     docker run --rm --gpus all "nvidia/cuda:${CUDA_VERSION}.0-base-ubuntu${UBUNTU_VERSION}" nvidia-smi
 

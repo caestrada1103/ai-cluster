@@ -20,44 +20,27 @@
 #       --build-arg RUNTIME_IMAGE=nvidia/cuda:13.0.3-runtime-ubuntu24.04 \
 #       --build-arg BUILDER_EXTRA_PKGS="" \
 #       --build-arg RUNTIME_EXTRA_PKGS="libcublas-13-0" .
-#     ⚠ CUDA version note: bumped from 12.6.3 -> 13.0.3 (2026-08) because 12.6's
-#     nvcc predates sm_121 (compute capability 12.1 — NVIDIA Grace-Blackwell
-#     GB10, e.g. DGX Spark) support; nvcc 13.0 lists both compute_120/sm_120 and
-#     compute_121/sm_121. 13.0.x devel+runtime tags were confirmed (via the
-#     Docker Hub registry HTTP API, 2026-08-03) to publish BOTH linux/amd64 and
-#     linux/arm64 manifests, so this stays multi-arch — RTX 3080 (x86_64) and
-#     DGX Spark (aarch64) build from the exact same tags. `libcublas-13-0` is
-#     the matching apt package name (confirmed against the NVIDIA CUDA apt repo
-#     Packages index — the `-12-6`-style suffix tracks the CUDA major.minor,
-#     not the image patch version). This does not affect the default wgpu/
-#     Vulkan image or the AMD ROCm variant.
+#     CUDA 13.0.3 (not 12.6): 12.6's nvcc predates sm_121 (Grace-Blackwell GB10,
+#     e.g. DGX Spark) support. 13.0.x devel+runtime tags are multi-arch
+#     (linux/amd64 + linux/arm64), so RTX 3080 and DGX Spark share the same tags.
 #
 # GPU passthrough (unchanged conventions):
 #   AMD    → mount /dev/kfd + /dev/dri, group_add: [video, render]
 #   NVIDIA → deploy.resources.reservations.devices (NVIDIA Container Toolkit)
 #   Intel  → works with the default image via Mesa ANV
 #
-# ⚠ Docker Desktop on Windows (WSL2) NVIDIA limitation: the WSL2 driver exposes
-#   CUDA but injects no Vulkan ICD — wgpu falls back to llvmpipe (CPU). Use the
-#   BACKEND=cuda variant there. On native Linux the NVIDIA Container Toolkit
-#   injects the Vulkan ICD and the default image uses the real GPU.
+# Docker Desktop on Windows (WSL2) NVIDIA limitation: the WSL2 driver exposes
+# CUDA but injects no Vulkan ICD — wgpu falls back to llvmpipe (CPU). Use the
+# BACKEND=cuda variant there.
 #
-# llama-server (agentic serving, Plan 13 — engine="llamaserver"): ALL variants
-# also bake in a `llama-server` binary (Stage 2), built with the Vulkan backend
-# from a PINNED llama.cpp release, at /usr/local/bin/llama-server with
-# ENV LLAMASERVER_BINARY_PATH set. This is what the worker spawns per
-# engine="llamaserver" model (Devstral, Qwen3-Coder — see config/models.toml) to
-# get real OpenAI/Anthropic tool calling; the in-process llama.cpp engine cannot,
-# and cargo does not build it. The default universal image already ships the
-# Vulkan LOADER (libvulkan1 + mesa-vulkan-drivers), so it runs as-is; the vendor
-# ROCm/CUDA variants (RUNTIME_EXTRA_PKGS="") must add "libvulkan1
-# mesa-vulkan-drivers" for GPU offload. To build a pure-Burn / CPU-only image
-# WITHOUT the (heavy) llama.cpp compile, pass --build-arg
-# LLAMASERVER_SRC=llamaserver-none. See docs/deployment.md.
+# llama-server (agentic serving, engine="llamaserver"): all variants also bake
+# in a `llama-server` binary (Stage 2), built with the Vulkan backend from a
+# pinned llama.cpp release, for real tool calling that the in-process
+# llama.cpp engine can't do. To skip the (heavy) llama.cpp compile, pass
+# --build-arg LLAMASERVER_SRC=llamaserver-none. See docs/deployment.md.
 #
-# ⚠ Node.js is required to build Stage 2 (verified on real DGX Spark hardware,
-# 2026-08-03 — see Stage 2 comments below for why `-DLLAMA_BUILD_UI=OFF` does
-# NOT avoid this).
+# Node.js is required to build Stage 2 (see Stage 2 comments for why
+# -DLLAMA_BUILD_UI=OFF alone doesn't avoid this).
 
 ARG BUILDER_IMAGE=ubuntu:24.04
 ARG RUNTIME_IMAGE=ubuntu:24.04
@@ -133,47 +116,21 @@ COPY worker/models ./models/
 RUN touch src/main.rs && cargo build --release --features="${BACKEND}${WORKER_FEATURES:+,${WORKER_FEATURES}}"
 
 
-# ── Stage 2: llama-server (agentic serving, Plan 13 — engine="llamaserver") ──
-# Builds ONLY the `llama-server` target from the PINNED llama.cpp tag with the
-# Vulkan backend. CMake flags verified against this tag on 2026-07-10 (upstream
-# renames options occasionally):
-#   -DGGML_VULKAN=ON        Vulkan backend (the old LLAMA_VULKAN was renamed to
-#                           GGML_VULKAN when ggml split out of llama.cpp).
+# ── Stage 2: llama-server (agentic serving, engine="llamaserver") ──
+# Builds ONLY the `llama-server` target from the PINNED llama.cpp tag, Vulkan backend:
+#   -DGGML_VULKAN=ON        Vulkan backend
 #   -DLLAMA_BUILD_SERVER=ON gate for the tools/server `llama-server` target
-#                           (defined by set(TARGET llama-server) there).
-#   -DBUILD_SHARED_LIBS=OFF standalone llama.cpp defaults this ON, which would
-#                           emit libllama.so/libggml*.so that the binary needs at
-#                           runtime; OFF links them statically so we can copy ONE
-#                           self-contained binary into the runtime image.
-#   -DLLAMA_CURL=OFF        the worker always passes a local `-m <gguf path>`, so
-#                           llama-server never fetches by URL — drops the libcurl
-#                           build+runtime dep (CURL is required-by-default when
-#                           ON and would otherwise fail this build).
-#   -DGGML_NATIVE=OFF       no -march=native, so the image is portable across the
-#                           fleet's CPUs (matches llama.cpp's own vulkan.Dockerfile).
-#   -DLLAMA_BUILD_TESTS=OFF only the server target is needed.
+#   -DBUILD_SHARED_LIBS=OFF static link, so one self-contained binary can be copied out
+#   -DLLAMA_CURL=OFF        worker always passes a local -m <gguf path>; drops the libcurl dep
+#   -DGGML_NATIVE=OFF       no -march=native, so the image is portable across the fleet's CPUs
+#   -DLLAMA_BUILD_TESTS=OFF only the server target is needed
 #
-# ── Node.js requirement (verified on real DGX Spark hardware, 2026-08-03) ────
-# tools/CMakeLists.txt unconditionally does `add_subdirectory(ui)` whenever
-# LLAMA_BUILD_SERVER=ON (it does NOT gate on LLAMA_BUILD_UI — that option only
-# controls what ui/CMakeLists.txt does *once entered*), and
-# tools/server/CMakeLists.txt links the resulting `llama-ui` static lib into
-# the `llama-server` target. So the embedded Web UI is a HARD dependency of
-# this build — confirmed against the b9941 source itself (and unchanged on
-# upstream master). Passing `-DLLAMA_BUILD_UI=OFF` does NOT skip it: it merely
-# skips the npm step inside ui/CMakeLists.txt, which then falls through to
-# downloading prebuilt assets from a Hugging Face bucket — a network-dependent
-# fallback with its own failure modes (version/bucket resolution, HF
-# reachability) that we do not want to depend on for a reproducible build.
-# tools/ui/package.json pins vite 7.3.5, which requires Node 20.19+ or
-# 22.12+ — Ubuntu 24.04's apt `nodejs` is 18.x and too old, and Debian/Ubuntu
-# does not backport newer majors. Fix: provision a real Node 22 via
-# multi-stage COPY from the official `node` image (deterministic, no piping a
-# vendor install script into a root shell, works identically across the
-# ubuntu/rocm/cuda BUILDER_IMAGE variants since they're all glibc-compatible
-# Ubuntu 24.04 bases). This makes the npm path (CMake's own first-choice
-# provisioning method) succeed directly, so the fragile HF-bucket fallback is
-# never needed.
+# Node.js is required: tools/CMakeLists.txt always builds the embedded Web UI
+# when LLAMA_BUILD_SERVER=ON (-DLLAMA_BUILD_UI=OFF does not skip it — it just
+# falls back to a network-dependent HF-bucket download we don't want to rely
+# on). vite 7 needs Node 20.19+/22.12+, newer than Ubuntu 24.04's apt nodejs;
+# provisioned instead via multi-stage COPY from the official `node` image.
+# Full rationale: docs/deployment.md.
 FROM node:22-bookworm-slim AS node-toolchain
 
 FROM ${BUILDER_IMAGE} AS llamaserver-build
@@ -181,10 +138,8 @@ FROM ${BUILDER_IMAGE} AS llamaserver-build
 ARG DEBIAN_FRONTEND=noninteractive
 ARG LLAMASERVER_TAG
 
-# Vulkan build deps (Ubuntu 24.04, main/universe): glslc + spirv-headers compile
-# the Vulkan compute shaders, libvulkan-dev links the loader. No GPU is needed to
-# build (shaders are cross-compiled). build-essential provides gcc/strip/OpenMP
-# (also satisfies Node's runtime needs for libstdc++/libgcc_s below).
+# glslc + spirv-headers compile the Vulkan compute shaders (no GPU needed to
+# build); libvulkan-dev links the loader.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
@@ -195,11 +150,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libvulkan-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Node 22 (>=22.12, satisfies vite 7's engines requirement) for the embedded
-# Web UI's npm build — see the block comment above Stage 2 for why this is
-# unavoidable at this llama.cpp tag. Copied in from the official Node image
-# rather than an apt/NodeSource repo so the exact binary is content-addressed
-# by the base image digest and identical across BACKEND=wgpu/rocm/cuda builds.
+# Node 22 for the embedded Web UI's npm build (see the Stage 2 comment above).
 COPY --from=node-toolchain /usr/local/bin/node /usr/local/bin/node
 COPY --from=node-toolchain /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
@@ -280,7 +231,7 @@ WORKDIR /app
 
 COPY --from=builder --chown=worker:worker /build/target/release/ai-worker /usr/local/bin/
 
-# llama-server for agentic serving (Plan 13, engine="llamaserver"), from Stage 2.
+# llama-server for agentic serving (engine="llamaserver"), from Stage 2.
 # Statically linked, so the single binary is self-contained (it still uses the
 # Vulkan LOADER libvulkan1 + mesa-vulkan-drivers installed above, plus libgomp1).
 # LLAMASERVER_SRC selects the real build (default) or the no-op stub — see Stage 2.
@@ -304,12 +255,10 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
 
 EXPOSE 50051-50058
 EXPOSE 9091-9098
-# llama-server (Plan 13) registry ports: one per engine="llamaserver" model in
-# config/models.toml (8081 Devstral, 8082 Qwen3-Coder; 8083-8085 reserved for the
-# commented-out DGX Spark tier). The coordinator — possibly on another host —
-# proxies agentic HTTP inference to worker_host:<port>, so these must be published
-# and reachable across the LAN (firewall to the trusted LAN; that hop is
-# unauthenticated — see docs/deployment.md and Plan 15).
+# llama-server registry ports: one per engine="llamaserver" model in
+# config/models.toml. The coordinator — possibly on another host — proxies
+# agentic HTTP inference to worker_host:<port>; that hop is unauthenticated,
+# so restrict exposure to the trusted LAN. See docs/deployment.md.
 EXPOSE 8081-8085
 
 ENTRYPOINT ["/app/entrypoint.sh"]

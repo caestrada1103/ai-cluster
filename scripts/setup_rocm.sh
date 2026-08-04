@@ -13,21 +13,15 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-# Default bumped 6.0 -> 6.2.1 to match the rocm/dev-ubuntu-24.04:6.2.1 image
-# already used by docker-compose.yml / docker/Dockerfile.worker's BACKEND=rocm
-# variant, so a bare-metal ROCm install and the Docker ROCm build target the
-# same ROCm release.
+# 6.2.1 matches the rocm/dev-ubuntu-24.04:6.2.1 image used by
+# docker-compose.yml / Dockerfile.worker's BACKEND=rocm variant.
 ROCM_VERSION="${ROCM_VERSION:-6.2.1}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/rocm}"
 GPU_IDS="${GPU_IDS:-0}"  # Comma-separated list of GPU IDs to use
 
-# AMD's apt repo (repo.radeon.com) only publishes amd64 packages as of this
-# writing (confirmed: binary-arm64/ 404s under dists/<codename>/main/ for
-# 6.2.1) — ROCm on AMD discrete/APU GPUs is an x86_64-only path in this
-# project today. This is a real vendor-side limitation, not something this
-# script can work around; fail clearly instead of limping into confusing apt
-# errors on an arm64 host (e.g. don't run this on a DGX Spark — use
-# scripts/setup_cuda.sh or the Vulkan path there instead).
+# AMD's apt repo only publishes amd64 packages — ROCm is x86_64-only here.
+# Fail clearly on arm64 instead of confusing apt errors (use setup_cuda.sh's
+# Vulkan path on e.g. a DGX Spark).
 HOST_ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
 if [ "$HOST_ARCH" != "amd64" ] && [ "$HOST_ARCH" != "x86_64" ]; then
     echo "ROCm's apt repository (repo.radeon.com) does not publish packages for architecture '$HOST_ARCH' (ROCm is x86_64-only here). Use scripts/setup_cuda.sh (NVIDIA) or the Vulkan path (any vendor) instead." >&2
@@ -104,16 +98,8 @@ install_rocm_ubuntu() {
     print_info "Adding ROCm repository..."
     wget -q -O - https://repo.radeon.com/rocm/rocm.gpg.key | sudo apt-key add -
     
-    # [arch=amd64]: hardcoded here deliberately (not just left over) — the
-    # HOST_ARCH guard above already proved this is an x86_64 host and apt's
-    # [arch=...] tag wants Debian's architecture name ("amd64"), not whatever
-    # spelling uname/dpkg happened to report ("x86_64" would be silently
-    # rejected by apt as an unknown architecture). Ubuntu 24.04 ("noble") is
-    # now included below — repo.radeon.com/rocm/apt/${ROCM_VERSION}/dists/
-    # confirmed to serve a noble/ tree; the original script only knew jammy
-    # (22.04) and focal (20.04), which meant the default Ubuntu 24.04 target
-    # used elsewhere in this project (rocm/dev-ubuntu-24.04 in
-    # docker-compose.yml) had no matching bare-metal path here.
+    # [arch=amd64] is deliberate: apt's [arch=...] tag wants Debian's
+    # architecture name, not uname's "x86_64".
     if [ "$VERSION" = "24.04" ]; then
         echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main" | sudo tee /etc/apt/sources.list.d/rocm.list
     elif [ "$VERSION" = "22.04" ]; then

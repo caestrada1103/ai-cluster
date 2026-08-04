@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-"""Validate a live coordinator's agentic-serving surface (Plan 13 Phase 2 Task 8).
+"""Validate a live coordinator's agentic-serving surface end to end.
 
-Run this against a real, running coordinator (+ at least one worker with a
+Run against a real, running coordinator (+ at least one worker with an
 ``engine = "llamaserver"`` model loaded, see ``config/models.toml``) to sanity
-check the OpenAI- and Anthropic-compatible endpoints end to end: model
-listing, chat completions (streaming + non-streaming), tool calling, the
-Anthropic ``/v1/messages`` surface, and opt-in API-key auth.
+check the OpenAI- and Anthropic-compatible endpoints: model listing, chat
+completions (streaming + non-streaming), tool calling, the Anthropic
+``/v1/messages`` surface, and opt-in API-key auth.
 
-Deliberately **stdlib-only** (``urllib``/``json``/``argparse``, no
-``httpx``/``requests``) so the owner can run it on any machine with Python
-3.10+ and no ``pip install`` step — see ``scripts/requirements-scripts.txt``
-for the (heavier) convention other scripts in this directory follow; this one
-does not need it.
+Stdlib-only (no ``httpx``/``requests``) so it runs on any machine with
+Python 3.10+ and no ``pip install`` step.
 
 Usage:
     python scripts/validate_agentic.py
@@ -34,29 +31,19 @@ import urllib.request
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 DEFAULT_BASE_URL = "http://localhost:8000"
-# Generous default: a CPU-offloaded MoE model (e.g. qwen3-coder-30b-a3b with
-# --n-cpu-moe) can take a while to first token on real hardware. This is a
-# per-socket-operation timeout (each read must complete within this window),
-# not a hard cap on total generation time, so a large value is safe even on
-# fast hardware.
+# Per-socket-operation timeout, not a total-generation cap — a CPU-offloaded
+# MoE model can take a while to first token, so this stays generous.
 DEFAULT_TIMEOUT = 120.0
-# Small generation budgets keep this script fast to run repeatedly while
-# still exercising streaming/tool-call code paths meaningfully.
+# Small generation budgets keep this script fast to run repeatedly.
 CHAT_MAX_TOKENS = 64
 TOOLS_MAX_TOKENS = 256
 
-# Keep in sync with config/models.toml's `engine = "llamaserver"` entries.
-# GET /v1/models does not currently expose each model's engine (see
-# coordinator/api.py::ModelInfo / coordinator/coordinator.py::list_models),
-# so this script cannot ask the API "which model is llamaserver" directly.
-# Used only as a *default-selection* fallback when --model is omitted: an
-# "engine" field in the API response is honored first (see check_models),
-# in case a future coordinator change starts exposing it.
+# Fallback for default model selection when --model is omitted and the API
+# response doesn't expose an "engine" field (which is honored first).
 KNOWN_LLAMASERVER_MODELS: Tuple[str, ...] = (
     "devstral-small-2-24b-instruct-gguf",
     "qwen3-coder-30b-a3b-instruct-gguf",
-    # DGX Spark tier (Plan 16). Keep this list in sync with the
-    # `engine = "llamaserver"` entries in config/models.toml.
+    # DGX Spark tier — keep in sync with config/models.toml's llamaserver entries.
     "qwen3.6-35b-a3b-gguf",
 )
 
@@ -521,7 +508,7 @@ def check_tools(
 
     finish_reason_note = ""
     if finish_reason == "tool":
-        finish_reason_note = " (non-standard but accepted - see Plan 13 'Honest risks')"
+        finish_reason_note = " (non-standard but accepted)"
     elif finish_reason != "tool_calls":
         finish_reason_note = " (unexpected finish_reason, informational only)"
     detail = f"{len(tool_calls)} tool_call(s), finish_reason={finish_reason!r}{finish_reason_note}"
@@ -670,10 +657,10 @@ def check_timing(stream_stats: Optional[Dict[str, Any]], report: Report) -> None
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate a live AI Cluster coordinator's agentic-serving surface "
-            "(Plan 13 Phase 2 Task 8): models list, chat completions (stream + "
-            "non-stream), tool calling, Anthropic /v1/messages, and optional "
-            "API-key auth. Stdlib-only - no pip install required."
+            "Validate a live AI Cluster coordinator's agentic-serving surface: "
+            "models list, chat completions (stream + non-stream), tool calling, "
+            "Anthropic /v1/messages, and optional API-key auth. Stdlib-only - "
+            "no pip install required."
         )
     )
     parser.add_argument(
