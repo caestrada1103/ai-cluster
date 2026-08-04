@@ -320,6 +320,62 @@ def test_load_from_dict_parses_gguf_section() -> None:
     assert cfg.gguf_n_ctx == 4096
 
 
+def test_gguf_n_cpu_moe_forwarded_to_worker_metadata() -> None:
+    """`gguf.n_cpu_moe` must reach the worker as an `n_cpu_moe` metadata key.
+
+    The worker's llamaserver path supports `--n-cpu-moe` (MoE expert offload —
+    the lever that fits a large MoE on an 8-16 GB consumer GPU), but the
+    coordinator previously never forwarded the field, so the only way to set it
+    was the untyped `llamaserver.extra_args` escape hatch.
+    """
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "moe-offload-test": {
+                    "family": "qwen",
+                    "parameters": "30B",
+                    "min_memory_gb": 16,
+                    "recommended_gpus": 1,
+                    "max_gpus": 1,
+                    "engine": "llamacpp",
+                    "gguf": {
+                        "repo_id": "org/repo",
+                        "file": "model.gguf",
+                        "n_cpu_moe": 40,
+                    },
+                }
+            }
+        }
+    )
+    model = ModelRegistry.get_model("moe-offload-test")
+    assert model is not None
+    assert model.gguf_n_cpu_moe == 40
+    assert model.grpc_metadata()["n_cpu_moe"] == "40"
+
+
+def test_gguf_n_cpu_moe_omitted_when_unset() -> None:
+    """Absent `n_cpu_moe` must emit no metadata key (preserves prior behavior)."""
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "moe-offload-unset": {
+                    "family": "qwen",
+                    "parameters": "30B",
+                    "min_memory_gb": 16,
+                    "recommended_gpus": 1,
+                    "max_gpus": 1,
+                    "engine": "llamacpp",
+                    "gguf": {"repo_id": "org/repo", "file": "model.gguf"},
+                }
+            }
+        }
+    )
+    model = ModelRegistry.get_model("moe-offload-unset")
+    assert model is not None
+    assert model.gguf_n_cpu_moe is None
+    assert "n_cpu_moe" not in model.grpc_metadata()
+
+
 def test_grpc_metadata_for_llamacpp_model() -> None:
     ModelRegistry.load_from_dict(
         {

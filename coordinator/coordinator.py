@@ -103,6 +103,8 @@ class RequestContext:
     target_worker_id: Optional[str] = None
     error: Optional[str] = None
     tokens_generated: int = 0
+    # Real worker-reported prompt token count; None if the worker never sent one.
+    prompt_tokens: Optional[int] = None
 
     # Streaming
     token_queue: "asyncio.Queue[Any]" = field(default_factory=asyncio.Queue)
@@ -510,6 +512,9 @@ class ClusterCoordinator:
 
             async for response in response_stream:
                 ctx.tokens_generated = response.tokens_generated
+                # Constant per request; only set when the worker actually reported one.
+                if response.HasField("prompt_tokens"):
+                    ctx.prompt_tokens = response.prompt_tokens
 
                 # Accumulate text
                 ctx.accumulated_text += response.text
@@ -755,6 +760,7 @@ class ClusterCoordinator:
             "request_id": ctx.id,
             "text": ctx.accumulated_text,
             "tokens_generated": ctx.tokens_generated,
+            "prompt_tokens": ctx.prompt_tokens,
             "processing_time_ms": (
                 (ctx.completed_at - ctx.created_at) * 1000 if ctx.completed_at else 0.0
             ),

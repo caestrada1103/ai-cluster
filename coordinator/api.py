@@ -96,6 +96,8 @@ class CompletionResponse(BaseModel):
     tokens_generated: int
     processing_time_ms: float
     worker_id: Optional[str] = None
+    # Real worker-reported prompt token count; null if the worker couldn't report one.
+    prompt_tokens: Optional[int] = None
 
 
 class LoadModelRequest(BaseModel):
@@ -693,18 +695,23 @@ def _truncate_at_stop(text: str, stop_sequences: List[str]) -> str:
     return text if cut is None else text[:cut]
 
 
-def _build_flat_response(result: Dict[str, Any], model: str, prompt: str) -> Dict[str, Any]:
+def _build_flat_response(result: Dict[str, Any], model: str) -> Dict[str, Any]:
     """Build a standard OpenAI-compatible chat completion response.
 
-    ``prompt_tokens`` is estimated (the in-process gRPC path has no real
-    token count) using the same heuristic as context-compression's budget
-    check, so ``total_tokens`` stays internally consistent. The proxied
-    ``llamaserver`` path is unaffected — llama-server counts real tokens.
+    ``prompt_tokens`` is the worker's real tokenized prompt length; when the
+    worker couldn't report one, ``prompt_tokens``/``total_tokens`` are omitted
+    rather than guessed (see docs/api_reference.md).
     """
-    from coordinator.context_compression.tokenizer import estimate_tokens
-
-    prompt_tokens = estimate_tokens(prompt)
+    prompt_tokens = result.get("prompt_tokens")
     completion_tokens = result["tokens_generated"]
+    if prompt_tokens is not None:
+        usage: Dict[str, int] = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+    else:
+        usage = {"completion_tokens": completion_tokens}
     return {
         "id": result["request_id"],
         "object": "chat.completion",
@@ -717,11 +724,7 @@ def _build_flat_response(result: Dict[str, Any], model: str, prompt: str) -> Dic
                 "finish_reason": "stop",
             }
         ],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
+        "usage": usage,
     }
 
 
@@ -863,7 +866,7 @@ async def create_chat_completion(
             session_id=body.session_id,
         )
         result = dict(result, text=_truncate_at_stop(result["text"], stop_sequences))
-        return _build_flat_response(result, body.model, prompt)
+        return _build_flat_response(result, body.model)
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except RuntimeError as exc:

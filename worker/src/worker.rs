@@ -290,6 +290,9 @@ impl Worker for WorkerService {
         let model_name = req.model_name.clone();
         let req_id = request_id.clone();
 
+        // Real tokenized prompt length, computed once; None if unobtainable.
+        let prompt_tokens = model.count_prompt_tokens(&req.prompt);
+
         // Create response stream
         let stream = try_stream! {
             let _permit = permit;           // released when the stream is dropped/finished
@@ -335,6 +338,7 @@ impl Worker for WorkerService {
                                     finished: false,
                                     finish_reason: 0,
                                     processing_time_ms: start_time.elapsed().as_millis() as u64,
+                                    prompt_tokens,
                                 };
                             }
                             Ok(Some(Err(e))) => {
@@ -365,6 +369,7 @@ impl Worker for WorkerService {
                         finished: true,
                         finish_reason: finish_reason as i32,
                         processing_time_ms: start_time.elapsed().as_millis() as u64,
+                        prompt_tokens,
                     };
 
                     // Record metrics
@@ -390,6 +395,7 @@ impl Worker for WorkerService {
                         finished: true,
                         finish_reason: FinishReason::Error as i32,
                         processing_time_ms: start_time.elapsed().as_millis() as u64,
+                        prompt_tokens,
                     };
                 }
                 Err(_) => {
@@ -402,6 +408,7 @@ impl Worker for WorkerService {
                         finished: true,
                         finish_reason: FinishReason::Timeout as i32,
                         processing_time_ms: timeout_duration.as_millis() as u64,
+                        prompt_tokens,
                     };
                 }
             }

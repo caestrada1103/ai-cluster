@@ -107,6 +107,8 @@ message InferenceResponse {
     bool finished = 4;                           // Whether generation is complete
     FinishReason finish_reason = 5;               // Why generation stopped
     uint64 processing_time_ms = 6;                 // Time spent on this chunk
+    // Real tokenized prompt length; absent when the engine cannot report one.
+    optional uint32 prompt_tokens = 7;
 }
 
 // Reasons why generation finished

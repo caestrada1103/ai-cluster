@@ -91,6 +91,11 @@ pub trait TextGeneration: Send {
         top_k: usize,
         seed: Option<u64>,
     ) -> Result<TextStream, WorkerError>;
+
+    /// Real tokenized prompt length; None when the engine has no tokenizer.
+    fn count_prompt_tokens(&self, _prompt: &str) -> Option<u32> {
+        None
+    }
 }
 
 /// A loaded model instance with metadata for lifecycle management.
@@ -173,6 +178,13 @@ impl ModelInstance {
         self.inference_count.load(Ordering::Relaxed)
     }
 
+    /// Real tokenized prompt length; None if no model or the lock is poisoned.
+    pub fn count_prompt_tokens(&self, prompt: &str) -> Option<u32> {
+        let model = self.model.as_ref()?;
+        let guard = model.lock().ok()?;
+        guard.count_prompt_tokens(prompt)
+    }
+
     /// Generate text (delegates to underlying model)
     pub async fn generate(
         &self,
@@ -208,5 +220,34 @@ impl ModelInstance {
                 self.name
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal engine with no tokenizer; only `generate` is implemented.
+    struct DummyEngine;
+
+    impl TextGeneration for DummyEngine {
+        fn generate(
+            &self,
+            _prompt: &str,
+            _max_tokens: usize,
+            _temperature: f32,
+            _top_p: f32,
+            _top_k: usize,
+            _seed: Option<u64>,
+        ) -> Result<TextStream, WorkerError> {
+            Err(WorkerError::Internal("not called in this test".into()))
+        }
+    }
+
+    /// An engine that cannot count must report absence, not a guess.
+    #[test]
+    fn text_generation_default_prompt_token_count_is_none() {
+        let engine = DummyEngine;
+        assert_eq!(engine.count_prompt_tokens("hello world"), None);
     }
 }

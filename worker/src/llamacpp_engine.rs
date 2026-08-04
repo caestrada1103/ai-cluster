@@ -379,6 +379,16 @@ impl TextGeneration for LlamaCppEngine {
         };
         Ok(Box::pin(stream))
     }
+
+    fn count_prompt_tokens(&self, prompt: &str) -> Option<u32> {
+        match self.model.str_to_token(prompt, AddBos::Always) {
+            Ok(tokens) => Some(tokens.len() as u32),
+            Err(e) => {
+                debug!("llama.cpp count_prompt_tokens tokenize error: {e}");
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -517,6 +527,21 @@ mod tests {
             assert!(
                 !text.trim().is_empty(),
                 "expected non-empty generated text, got: {text:?}"
+            );
+
+            // Real tokenizer count: positive, grows with prompt length, deterministic.
+            let short = engine
+                .count_prompt_tokens("Once upon a time")
+                .expect("tokenizer count for short prompt");
+            assert!(short > 0);
+            let long = engine
+                .count_prompt_tokens("Once upon a time, in a land far, far away, there lived a")
+                .expect("tokenizer count for long prompt");
+            assert!(long > short, "longer prompt should yield more tokens");
+            let short_again = engine.count_prompt_tokens("Once upon a time").unwrap();
+            assert_eq!(
+                short, short_again,
+                "same prompt should count deterministically"
             );
         });
     }
