@@ -67,6 +67,16 @@ class Settings(BaseSettings):
     models_config: Path = Field(
         Path("config/models.toml"), description="Path to models configuration"
     )
+    model_load_timeout: int = Field(
+        3600,
+        description=(
+            "LoadModel gRPC deadline (seconds). Covers the worker's GGUF "
+            "download, so it must exceed weight_size / link_speed: a 22 GB "
+            "model over a 10 MB/s link needs ~37 min. The previous hardcoded "
+            "300s capped API-loadable models at roughly 3 GB."
+        ),
+        ge=1,
+    )
 
     # CORS
     # NoDecode: pydantic-settings otherwise JSON-decodes any complex-typed env
