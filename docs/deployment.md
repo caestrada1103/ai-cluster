@@ -52,9 +52,15 @@ docker compose -f docker-compose.yml -f docker-compose.expose-ports.yml \
   --profile cuda-native up -d
 ```
 
-Set `WORKER_GRPC_AUTH_TOKEN` in `.env` before doing this beyond a trusted
-LAN behind a firewall/VPN — the worker gRPC port has no other authentication
-(see `worker/src/grpc_auth.rs`).
+Every worker service in `docker-compose.yml` already sets
+`WORKER_GRPC_BIND_HOST=${WORKER_GRPC_BIND_HOST:-0.0.0.0}` and
+`LLAMASERVER_BIND_HOST=${LLAMASERVER_BIND_HOST:-0.0.0.0}` — that's what lets
+the coordinator container reach a worker container over the private network
+even before this overlay publishes anything to the host; layering
+`docker-compose.expose-ports.yml` only changes what's reachable from OUTSIDE
+docker. Set `WORKER_GRPC_AUTH_TOKEN` in `.env` before doing this beyond a
+trusted LAN behind a firewall/VPN — the worker gRPC port has no other
+authentication (see `worker/src/grpc_auth.rs`).
 
 ### GPU variants
 
@@ -189,8 +195,10 @@ cargo build --release --features cuda,llamacpp,llamacpp-cuda    # llama.cpp CUDA
 # worker.toml, or the built-in default when no config file is present).
 ./target/release/ai-worker --port 50051 --gpu-ids 0
 # Coordinator on a DIFFERENT host: set grpc_bind_host = "0.0.0.0" (and
-# llamaserver_bind_host, for engine="llamaserver" models) in worker.toml, and set
-# WORKER_GRPC_AUTH_TOKEN — the worker gRPC port has no other authentication.
+# llamaserver_bind_host, for engine="llamaserver" models) in worker.toml —
+# or export WORKER_GRPC_BIND_HOST=0.0.0.0 / LLAMASERVER_BIND_HOST=0.0.0.0,
+# which win over the file — and set WORKER_GRPC_AUTH_TOKEN, since the worker
+# gRPC port has no other authentication.
 ```
 
 `wgpu` is the default Burn backend feature (`rocm`/`cuda` are the native
