@@ -73,3 +73,6 @@ coordinator/*_pb2_grpc.py
 pending-work/
 .claude/skills/
 !.claude/skills/commit/
+
+# Local .env backups (may contain secrets) — never commit
+.env.bak*
