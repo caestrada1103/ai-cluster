@@ -3,7 +3,7 @@
 import json
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Union, cast
+from typing import Annotated, Any, Dict, List, Optional, Union, cast
 
 import toml
 import yaml
@@ -62,6 +62,12 @@ class Settings(BaseSettings):
     # Request routing
     request_timeout: int = Field(300, description="Request timeout (seconds)", ge=1)
     max_queue_size: int = Field(1000, description="Maximum queued requests", ge=1)
+
+    # Per-key identity (coordinator/identity.py reads this env var directly,
+    # live/uncached; the field exists so it's discoverable alongside the rest).
+    api_key_file: Optional[Path] = Field(
+        None, description="Path to a TOML file assigning role/model identity to API keys"
+    )
 
     # Model management
     models_config: Path = Field(
@@ -161,6 +167,14 @@ class Settings(BaseSettings):
         description=(
             "Auto-load an unloaded engine=llamaserver model on demand before proxying "
             "(env COORDINATOR_LLAMASERVER_AUTOLOAD)"
+        ),
+    )
+
+    llamaserver_slot_affinity: bool = Field(
+        True,
+        description=(
+            "Pin a resolved caller to a consistent llama-server conversation slot "
+            "(env COORDINATOR_LLAMASERVER_SLOT_AFFINITY)"
         ),
     )
 

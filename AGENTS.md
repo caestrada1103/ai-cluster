@@ -97,6 +97,11 @@ Client (REST) → Coordinator (FastAPI) → Workers (Rust: llama.cpp + Burn) →
 - `models.py` — Model registry and lifecycle
 - `config.py` — `Settings` (pydantic-settings), reads `COORDINATOR_*` env vars / `.env` only (no YAML config exists)
 - `monitoring.py` — Prometheus metrics definitions and helpers
+- `auth.py` — Minimal opt-in API-key auth middleware for the HTTP surface (`COORDINATOR_API_KEYS`/`COORDINATOR_API_KEY_FILE`)
+- `identity.py` — Key -> caller identity resolution (role, model scope) backing `auth.py`
+- `audit.py` — Append-only single-line JSON audit log for management actions; never logs prompts, bodies, or key material
+- `proxy.py` — Transparent HTTP proxy to worker-local `llama-server` instances for `engine == "llamaserver"` models
+- `body_limit.py` — ASGI middleware enforcing a maximum HTTP request body size
 
 **Worker modules** (`worker/src/`):
 - `main.rs` — CLI entry point (clap), tokio runtime, gRPC server startup

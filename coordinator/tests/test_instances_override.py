@@ -56,7 +56,9 @@ class _FakeLoadStub:
 def _fake_worker(stub: _FakeLoadStub) -> WorkerInfo:
     return cast(
         WorkerInfo,
-        SimpleNamespace(id="worker-test", gpus=[SimpleNamespace(id=0)], stub=stub),
+        SimpleNamespace(
+            id="worker-test", gpus=[SimpleNamespace(id=0)], stub=stub, loaded_models={}
+        ),
     )
 
 

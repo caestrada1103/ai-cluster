@@ -8,18 +8,20 @@ Endpoints:
     GET  /workers      - List connected workers
 """
 import asyncio
+import hashlib
 import ipaddress
 import json
 import logging
 import re
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional, Type, TypeVar, Union
+from typing import Any, AsyncGenerator, Dict, FrozenSet, List, Optional, Type, TypeVar, Union
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from coordinator import auth, proxy
+from coordinator import audit, auth, identity, proxy
+from coordinator.identity import Caller
 from coordinator.models import ModelConfig, ModelRegistry
 
 logger = logging.getLogger(__name__)
@@ -164,6 +166,36 @@ def _get_coordinator(request: Request) -> Any:  # type: ignore[type-arg]
     if coordinator is None:
         raise HTTPException(status_code=503, detail="Coordinator not initialized")
     return coordinator
+
+
+# ---------------------------------------------------------------------------
+# Caller identity / scope enforcement
+# ---------------------------------------------------------------------------
+
+
+def _caller(request: Request) -> Caller:  # type: ignore[type-arg]
+    """The resolved Caller for `request` (thin wrapper over auth.caller_from_request)."""
+    return auth.caller_from_request(request)
+
+
+def _require_admin(request: Request, action: str, *, model: Optional[str] = None) -> Caller:  # type: ignore[type-arg]
+    """403 (with a denied audit record) unless the caller is an admin."""
+    caller = _caller(request)
+    if not caller.is_admin:
+        audit.record(action, caller=caller.id, outcome=audit.OUTCOME_DENIED, model=model)
+        raise HTTPException(status_code=403, detail="This action requires an admin API key")
+    return caller
+
+
+def _require_model_access(request: Request, model_string: Any) -> None:  # type: ignore[type-arg]
+    """403 (never 404 — same message either way) when the caller may not use this model."""
+    if not isinstance(model_string, str):
+        return
+    name, _ = _parse_model_and_worker(model_string)
+    if not _caller(request).may_use_model(name):
+        raise HTTPException(
+            status_code=403, detail=f"Model '{name}' is not accessible with this API key"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +365,9 @@ def _not_loaded_detail(model_name: str) -> str:
     )
 
 
-async def _resolve_llamaserver_worker(coordinator: Any, model_cfg: ModelConfig) -> Any:
+async def _resolve_llamaserver_worker(
+    coordinator: Any, model_cfg: ModelConfig, caller_id: str
+) -> Any:
     """Find — or, when auto-load is on, load — a worker serving ``model_cfg``.
 
     When no worker reports the model loaded, ``settings.llamaserver_autoload``
@@ -349,7 +383,7 @@ async def _resolve_llamaserver_worker(coordinator: Any, model_cfg: ModelConfig) 
         raise HTTPException(status_code=404, detail=_not_loaded_detail(model_cfg.name))
 
     try:
-        return await coordinator.ensure_llamaserver_model_loaded(model_cfg.name)
+        return await coordinator.ensure_llamaserver_model_loaded(model_cfg.name, caller=caller_id)
     except HTTPException:
         raise
     except Exception as exc:
@@ -385,6 +419,48 @@ def _validate_proxy_envelope(data: Dict[str, Any]) -> None:
         raise HTTPException(status_code=422, detail="'stream' must be a boolean")
 
 
+#: Routes where an `id_slot` hint is meaningful (both funnel into llama-server's
+#: shared completions handler).
+_SLOT_AFFINITY_PATHS: FrozenSet[str] = frozenset({"/v1/chat/completions", "/v1/completions"})
+
+
+def _slot_for_caller(caller_id: str, slots: int) -> int:
+    """Stable slot index for `caller_id` (sha256, not the salted builtin hash)."""
+    digest = hashlib.sha256(caller_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % slots
+
+
+def _apply_slot_affinity(
+    request: Request,  # type: ignore[type-arg]
+    coordinator: Any,
+    model_cfg: ModelConfig,
+    raw_body: bytes,
+    data: Optional[Dict[str, Any]],
+    path: str,
+) -> bytes:
+    """Re-serialize with an `id_slot` hint added, but only when that's worth the cost.
+
+    Every other case returns ``raw_body`` unchanged, preserving the byte-exact
+    passthrough guarantee.
+    """
+    settings = getattr(coordinator, "settings", None)
+    if not bool(getattr(settings, "llamaserver_slot_affinity", True)):
+        return raw_body
+    if not identity.has_declared_identities():
+        return raw_body
+    if _caller(request) is identity.UNRESTRICTED:
+        return raw_body
+    if path not in _SLOT_AFFINITY_PATHS:
+        return raw_body
+    slots = model_cfg.llamaserver_parallel
+    if slots is None or slots < 2:
+        return raw_body
+    if data is None or "id_slot" in data:
+        return raw_body
+    slot = _slot_for_caller(_caller(request).id, slots)
+    return json.dumps({**data, "id_slot": slot}).encode("utf-8")
+
+
 async def _proxy_to_llamaserver(
     request: Request,  # type: ignore[type-arg]
     coordinator: Any,
@@ -406,7 +482,7 @@ async def _proxy_to_llamaserver(
     """
     if data is not None:
         _validate_proxy_envelope(data)
-    worker = await _resolve_llamaserver_worker(coordinator, model_cfg)
+    worker = await _resolve_llamaserver_worker(coordinator, model_cfg, _caller(request).id)
     if model_cfg.llamaserver_port is None:  # defensive: validated at registry load
         raise HTTPException(
             status_code=500,
@@ -416,7 +492,8 @@ async def _proxy_to_llamaserver(
     path = upstream_path if upstream_path is not None else request.url.path
     url = f"http://{host}:{model_cfg.llamaserver_port}{path}"
     headers = proxy.filter_request_headers(request.headers)
-    result = await proxy.proxy_request(request.method, url, raw_body, headers, stream)
+    body = _apply_slot_affinity(request, coordinator, model_cfg, raw_body, data, path)
+    result = await proxy.proxy_request(request.method, url, body, headers, stream)
     return _proxy_response(result)
 
 
@@ -442,13 +519,15 @@ def _require_llamaserver_model(model_string: Any, *, surface: str = "this endpoi
     return model_cfg
 
 
-async def _resolve_single_loaded_llamaserver(coordinator: Any) -> ModelConfig:
+async def _resolve_single_loaded_llamaserver(coordinator: Any, caller: Caller) -> ModelConfig:
     """Resolve ``/infill`` when the body omits ``model``.
 
-    Uses the sole llamaserver model currently loaded; 400s asking the client
-    to specify ``model`` when zero or more than one are loaded.
+    Uses the sole llamaserver model currently loaded that `caller` may use;
+    400s asking the client to specify ``model`` when zero or more than one
+    are loaded (never naming a model outside the caller's scope).
     """
-    loaded = await coordinator.loaded_llamaserver_models()
+    all_loaded = await coordinator.loaded_llamaserver_models()
+    loaded = [name for name in all_loaded if caller.may_use_model(name)]
     if len(loaded) == 1:
         cfg = ModelRegistry.get_model(loaded[0])
         if cfg is not None:
@@ -474,6 +553,7 @@ async def create_completion(request: Request) -> Any:  # type: ignore[type-arg]
     coordinator = _get_coordinator(request)
 
     raw_body, data = await _read_json_body(request)
+    _require_model_access(request, data.get("model"))
     model_cfg = _lookup_engine_model(data.get("model"))
     if model_cfg is not None and model_cfg.engine == "llamaserver":
         return await _proxy_to_llamaserver(
@@ -807,6 +887,7 @@ async def create_chat_completion(
     coordinator = _get_coordinator(request)
 
     raw_body, data = await _read_json_body(request)
+    _require_model_access(request, data.get("model"))
     model_cfg = _lookup_engine_model(data.get("model"))
     if model_cfg is not None and model_cfg.engine == "llamaserver":
         return await _proxy_to_llamaserver(
@@ -889,6 +970,7 @@ async def create_message(request: Request) -> Response:  # type: ignore[type-arg
     """
     coordinator = _get_coordinator(request)
     raw_body, data = await _read_json_body(request)
+    _require_model_access(request, data.get("model"))
     model_cfg = _require_llamaserver_model(
         data.get("model"), surface="the Anthropic /v1/messages API"
     )
@@ -906,6 +988,7 @@ async def count_message_tokens(request: Request) -> Response:  # type: ignore[ty
     """
     coordinator = _get_coordinator(request)
     raw_body, data = await _read_json_body(request)
+    _require_model_access(request, data.get("model"))
     model_cfg = _require_llamaserver_model(
         data.get("model"), surface="the Anthropic /v1/messages/count_tokens API"
     )
@@ -922,6 +1005,7 @@ async def create_embeddings(request: Request) -> Response:  # type: ignore[type-
     """
     coordinator = _get_coordinator(request)
     raw_body, data = await _read_json_body(request)
+    _require_model_access(request, data.get("model"))
     model_cfg = _require_llamaserver_model(data.get("model"), surface="the /v1/embeddings API")
     return await _proxy_to_llamaserver(request, coordinator, model_cfg, raw_body, False, data=data)
 
@@ -940,9 +1024,10 @@ async def create_infill(request: Request) -> Response:  # type: ignore[type-arg]
     raw_body, data = await _read_json_body(request)
     model_field = data.get("model")
     if model_field is not None:
+        _require_model_access(request, model_field)
         model_cfg = _require_llamaserver_model(model_field, surface="the /infill API")
     else:
-        model_cfg = await _resolve_single_loaded_llamaserver(coordinator)
+        model_cfg = await _resolve_single_loaded_llamaserver(coordinator, _caller(request))
     return await _proxy_to_llamaserver(
         request,
         coordinator,
@@ -958,11 +1043,15 @@ async def create_infill(request: Request) -> Response:  # type: ignore[type-arg]
 async def list_models(request: Request) -> ModelsResponse:  # type: ignore[type-arg]
     """List all available models in OpenAI-compatible format."""
     coordinator = _get_coordinator(request)
+    caller = _caller(request)
     custom_models = await coordinator.list_models()
 
-    # Convert custom format to OpenAI compatible format
+    # Convert custom format to OpenAI compatible format, filtered to the
+    # caller's scope (unrestricted callers see everything, as today).
     openai_models = []
     for model in custom_models:
+        if not caller.may_use_model(model["name"]):
+            continue
         openai_models.append(
             ModelInfo(
                 id=model["name"],
@@ -981,6 +1070,8 @@ async def list_models(request: Request) -> ModelsResponse:  # type: ignore[type-
 async def load_model(body: LoadModelRequest, request: Request) -> LoadModelResponse:  # type: ignore[type-arg]
     """Load a model onto a worker."""
     coordinator = _get_coordinator(request)
+    caller = _require_admin(request, audit.ACTION_MODEL_LOAD, model=body.model_name)
+    _require_model_access(request, body.model_name)
 
     from coordinator.models import ModelRegistry, Quantization
 
@@ -1017,14 +1108,30 @@ async def load_model(body: LoadModelRequest, request: Request) -> LoadModelRespo
             body.model_name,
             quantization=quantization,
             instances=body.instances,
+            caller=caller.id,
         )
 
         if success:
+            audit.record(
+                audit.ACTION_MODEL_LOAD,
+                caller=caller.id,
+                outcome=audit.OUTCOME_SUCCESS,
+                model=body.model_name,
+                worker=worker_info.id,
+            )
             return LoadModelResponse(
                 status="loaded",
                 model_name=body.model_name,
                 worker_id=worker_info.id,
             )
+        audit.record(
+            audit.ACTION_MODEL_LOAD,
+            caller=caller.id,
+            outcome=audit.OUTCOME_FAILURE,
+            model=body.model_name,
+            worker=worker_info.id,
+            detail="worker reported failure",
+        )
         return LoadModelResponse(
             status="failed",
             model_name=body.model_name,
@@ -1034,10 +1141,24 @@ async def load_model(body: LoadModelRequest, request: Request) -> LoadModelRespo
         raise
     except ValueError as exc:
         # model_name absent from the registry with pull-through disabled.
+        audit.record(
+            audit.ACTION_MODEL_LOAD,
+            caller=caller.id,
+            outcome=audit.OUTCOME_FAILURE,
+            model=body.model_name,
+            detail="ValueError",
+        )
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception:
         # Never echo a raw exception string to the client.
         logger.exception("Model load failed")
+        audit.record(
+            audit.ACTION_MODEL_LOAD,
+            caller=caller.id,
+            outcome=audit.OUTCOME_FAILURE,
+            model=body.model_name,
+            detail="internal_error",
+        )
         raise HTTPException(status_code=500, detail="Internal server error") from None
 
 
@@ -1047,14 +1168,37 @@ async def unload_model(
 ) -> Dict[str, Any]:
     """Unload a model and free its GPU memory (all workers, or one via ?worker_id=)."""
     coordinator = _get_coordinator(request)
+    caller = _require_admin(request, audit.ACTION_MODEL_UNLOAD, model=model_name)
+    _require_model_access(request, model_name)
     try:
         unloaded_from = await coordinator.unload_model(model_name, worker_id=worker_id)
     except KeyError as exc:
+        audit.record(
+            audit.ACTION_MODEL_UNLOAD,
+            caller=caller.id,
+            outcome=audit.OUTCOME_FAILURE,
+            model=model_name,
+            detail="KeyError",
+        )
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception:
         # Never echo a raw exception string to the client.
         logger.exception("Model unload failed")
+        audit.record(
+            audit.ACTION_MODEL_UNLOAD,
+            caller=caller.id,
+            outcome=audit.OUTCOME_FAILURE,
+            model=model_name,
+            detail="internal_error",
+        )
         raise HTTPException(status_code=500, detail="Internal server error") from None
+    audit.record(
+        audit.ACTION_MODEL_UNLOAD,
+        caller=caller.id,
+        outcome=audit.OUTCOME_SUCCESS,
+        model=model_name,
+        worker=",".join(unloaded_from),
+    )
     return {"status": "unloaded", "model_name": model_name, "workers": unloaded_from}
 
 
@@ -1109,6 +1253,8 @@ async def add_manual_worker(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    caller = _require_admin(request, audit.ACTION_WORKER_REGISTER)
+
     if len(addresses) > _MAX_MANUAL_WORKERS_PER_REQUEST:
         raise HTTPException(
             status_code=422,
@@ -1129,6 +1275,18 @@ async def add_manual_worker(
         worker = await coordinator._connect_worker(address)
         if worker:
             results.append({"address": address, "status": "connected", "id": worker.id})
+            audit.record(
+                audit.ACTION_WORKER_REGISTER,
+                caller=caller.id,
+                outcome=audit.OUTCOME_SUCCESS,
+                worker=address,
+            )
         else:
             results.append({"address": address, "status": "failed"})
+            audit.record(
+                audit.ACTION_WORKER_REGISTER,
+                caller=caller.id,
+                outcome=audit.OUTCOME_FAILURE,
+                worker=address,
+            )
     return {"results": results}

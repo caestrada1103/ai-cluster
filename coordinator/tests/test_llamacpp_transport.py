@@ -63,7 +63,9 @@ def _fake_worker(stub: _FakeLoadStub) -> WorkerInfo:
     """Duck-typed WorkerInfo carrying only the attributes the loader touches."""
     return cast(
         WorkerInfo,
-        SimpleNamespace(id="worker-test", gpus=[SimpleNamespace(id=0)], stub=stub),
+        SimpleNamespace(
+            id="worker-test", gpus=[SimpleNamespace(id=0)], stub=stub, loaded_models={}
+        ),
     )
 
 
@@ -135,6 +137,7 @@ def _fake_worker_with_gpus(stub: _FakeLoadStub, gpu_ids: List[int]) -> WorkerInf
             id="worker-multi-gpu",
             gpus=[SimpleNamespace(id=i) for i in gpu_ids],
             stub=stub,
+            loaded_models={},
         ),
     )
 

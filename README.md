@@ -186,6 +186,10 @@ Everything binds to loopback until you explicitly open it up:
   address with no token configured.
 - The coordinator refuses to start bound to a non-loopback address unless
   `COORDINATOR_API_KEYS` is set.
+- Individual keys can carry a role (`admin`/`user`) and a model scope via
+  `COORDINATOR_API_KEY_FILE`, layered on top of `COORDINATOR_API_KEYS`. See
+  [Configuration Guide](docs/configuration.md) for the TOML shape and the
+  compatibility guarantee for deployments that don't set it.
 - `docker compose up` publishes only the coordinator (8000), Grafana (3000),
   and Prometheus (9099) — worker gRPC/metrics, `llama-server`, and
   Open-WebUI ports stay off the host. Opt in with

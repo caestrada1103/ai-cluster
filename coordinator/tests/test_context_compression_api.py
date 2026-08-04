@@ -47,7 +47,7 @@ def _fake_request(coordinator: _FakeCoordinator, body: Any) -> Any:
 
     app_state = SimpleNamespace(coordinator=coordinator)
     app = SimpleNamespace(state=app_state)
-    return SimpleNamespace(app=app, body=_body)
+    return SimpleNamespace(app=app, state=SimpleNamespace(), body=_body)
 
 
 @pytest.mark.asyncio
