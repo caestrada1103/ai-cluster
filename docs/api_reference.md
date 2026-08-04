@@ -2,12 +2,18 @@
 
 Base URL: `http://<coordinator-host>:8000`
 
-There is **no authentication** today — the API is open. API keys / rate
-limiting are planned; do not expose the coordinator to untrusted networks.
+Secure by default: the coordinator refuses to start on a non-loopback bind
+with no `COORDINATOR_API_KEYS` set. When keys are configured, every route
+except `/health` and `/metrics` requires `Authorization: Bearer <key>` or
+`x-api-key: <key>`; with no keys set (loopback-only use), the API is open.
+See [configuration.md](configuration.md) and [deployment.md](deployment.md).
+Rate limiting is still planned, not implemented.
 Interactive docs: `/docs` (Swagger UI), `/redoc`, schema at `/openapi.json`.
 
 Errors use FastAPI's standard shape — `{"detail": "<message>"}` — with status
-codes 200, 404, 422 (validation), 500, 503 (no workers / not ready), 504 (timeout).
+codes 200, 401 (missing/bad API key), 404, 413 (request body over
+`COORDINATOR_MAX_REQUEST_BODY_BYTES`, 25 MB default), 422 (validation), 500,
+503 (no workers / not ready), 504 (timeout).
 
 ## Endpoints
 
@@ -76,12 +82,16 @@ that's already quantized (e.g. Q4_K_M) regardless of this field; see
 
 ### POST /v1/models/load
 
-Request: `{"model_name": "<registry key or HF repo id>", "worker_id": null, "quantization": "none"}`
+Request: `{"model_name": "<registry key or HF repo id>", "worker_id": null, "quantization": "none", "instances": null}`
 — the `quantization` field only accepts `"none"` today (other values are
 422/rejected by workers). It applies to the Burn engine's FP32 loader only;
 it is not how GGUF models get quantized — for those, quantization comes from
 the GGUF file picked in the registry entry (`engine = "llamacpp"`), and this
-field stays `"none"` regardless.
+field stays `"none"` regardless. `instances` (integer, >= 1) overrides the
+registry's `[models.X.llamaserver] instances` value for this load only — it
+only applies to `engine = "llamaserver"` models (422 otherwise) and sets the
+number of concurrent conversation slots; see
+[configuration.md](configuration.md).
 Response: `{"status": "loaded"|"failed", "model_name": "...", "worker_id": "...", "memory_used_gb": null, "message": null}`
 
 ### DELETE /v1/models/{model_name}
@@ -178,6 +188,6 @@ curl -X DELETE "http://localhost:8000/v1/models/TinyLlama%2FTinyLlama-1.1B-Chat-
 
 ## Planned (not implemented)
 
-API-key auth + rate limiting, batch endpoint (`/v1/completions/batch`),
-per-worker/per-model detail endpoints, WebSocket streaming, client SDKs
-(`pip install ai-cluster-client` does not exist yet).
+Rate limiting, batch endpoint (`/v1/completions/batch`), per-worker/per-model
+detail endpoints, WebSocket streaming, client SDKs (`pip install
+ai-cluster-client` does not exist yet).
