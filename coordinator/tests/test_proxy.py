@@ -19,6 +19,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from coordinator import proxy
 from coordinator.api import (
+    _validate_proxy_envelope,
     count_message_tokens,
     create_chat_completion,
     create_embeddings,
@@ -182,14 +183,65 @@ def test_filter_request_headers_strips_hop_by_hop_keeps_content_type() -> None:
             "host": "coordinator:8000",
             "content-length": "42",
             "connection": "keep-alive",
-            "authorization": "Bearer secret",
         }
     )
     assert filtered["content-type"] == "application/json"
-    assert filtered["authorization"] == "Bearer secret"
     assert "host" not in filtered
     assert "content-length" not in filtered
     assert "connection" not in filtered
+
+
+def test_filter_request_headers_strips_credentials() -> None:
+    """M2: the coordinator's own auth credential must never reach a
+    worker-local llama-server — it has no use for it, and a leaked
+    credential there has a bigger blast radius than an unused header."""
+    filtered = proxy.filter_request_headers(
+        {
+            "content-type": "application/json",
+            "authorization": "Bearer secret",
+            "x-api-key": "another-secret",
+            "cookie": "session=abc123",
+            "Authorization": "Bearer also-cased-differently",
+        }
+    )
+    assert filtered == {"content-type": "application/json"}
+
+
+# ---------------------------------------------------------------------------
+# H5: minimal envelope validation on the llamaserver proxy path
+# ---------------------------------------------------------------------------
+
+
+def test_validate_proxy_envelope_accepts_absent_and_valid_fields() -> None:
+    _validate_proxy_envelope({})  # no raise
+    _validate_proxy_envelope({"max_tokens": 512, "stream": True})  # no raise
+
+
+def test_validate_proxy_envelope_rejects_non_numeric_max_tokens() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_proxy_envelope({"max_tokens": "a lot"})
+    assert exc_info.value.status_code == 422
+
+
+def test_validate_proxy_envelope_rejects_bool_max_tokens() -> None:
+    """bool is a subclass of int in Python — must not sneak past the numeric check."""
+    with pytest.raises(HTTPException):
+        _validate_proxy_envelope({"max_tokens": True})
+
+
+def test_validate_proxy_envelope_rejects_out_of_range_max_tokens() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_proxy_envelope({"max_tokens": 0})
+    assert exc_info.value.status_code == 422
+
+    with pytest.raises(HTTPException):
+        _validate_proxy_envelope({"max_tokens": 10_000_000})
+
+
+def test_validate_proxy_envelope_rejects_non_bool_stream() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_proxy_envelope({"stream": "yes"})
+    assert exc_info.value.status_code == 422
 
 
 # ---------------------------------------------------------------------------
