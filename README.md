@@ -232,7 +232,9 @@ cargo run --release --features cuda
 # 5. Start the Coordinator locally
 # In the original python terminal:
 # From the repo root (module path matters — cd coordinator breaks imports):
-uvicorn coordinator.main:app --host 0.0.0.0 --port 8000
+# Loopback-only is the secure-by-default choice for local use; the coordinator
+# refuses --host 0.0.0.0 unless COORDINATOR_API_KEYS is set (see below).
+uvicorn coordinator.main:app --host 127.0.0.1 --port 8000
 
 # 6. Run your first inference (Model will auto-download and load)
 curl -X POST http://localhost:8000/v1/completions \
@@ -606,7 +608,7 @@ mkdir -p models
 
 # Start coordinator
 # From the repo root (module path matters — cd coordinator breaks imports):
-uvicorn coordinator.main:app --host 0.0.0.0 --port 8000
+uvicorn coordinator.main:app --host 127.0.0.1 --port 8000
 
 # In another terminal, start worker
 cd worker
@@ -643,6 +645,8 @@ The coordinator is configured exclusively via `COORDINATOR_*` environment
 variables (or `.env`). Key settings:
 
 ```bash
+# 0.0.0.0 requires COORDINATOR_API_KEYS to be set too — the coordinator refuses
+# to bind non-loopback with no auth configured. Use 127.0.0.1 for local-only.
 COORDINATOR_HOST=0.0.0.0
 COORDINATOR_PORT=8000
 COORDINATOR_DISCOVERY_METHOD=static          # static only today (mdns/consul planned)
