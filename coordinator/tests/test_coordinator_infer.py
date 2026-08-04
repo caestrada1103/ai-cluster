@@ -197,6 +197,77 @@ async def test_connect_worker_adopts_resident_loaded_models(
 
 
 @pytest.mark.asyncio
+async def test_load_model_on_worker_rejects_unregistered_model_by_default() -> None:
+    """H4: an unregistered model_name must never reach the worker as an
+    implicit HuggingFace-repo pull unless explicitly opted into."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from coordinator.coordinator import WorkerInfo, WorkerState
+
+    settings = make_settings()
+    assert settings.allow_unregistered_model_pull is False
+    coord = ClusterCoordinator(settings)
+    worker = WorkerInfo(id="w1", address="127.0.0.1:1", channel=AsyncMock(), stub=MagicMock())
+    worker.state = WorkerState.HEALTHY
+    worker.stub.LoadModel = AsyncMock()
+
+    with pytest.raises(ValueError, match="not in the registry"):
+        await coord._load_model_on_worker(worker, "totally-unregistered-model-xyz")
+
+    # The critical assertion: the worker was never even asked to load it.
+    worker.stub.LoadModel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_load_model_on_worker_allows_unregistered_when_opted_in() -> None:
+    """The opt-in (COORDINATOR_ALLOW_UNREGISTERED_MODEL_PULL) restores the
+    original ad hoc HF-pull behavior."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    import coordinator.proto.cluster_pb2 as pb
+    from coordinator.coordinator import WorkerInfo, WorkerState
+
+    settings = make_settings(allow_unregistered_model_pull=True)
+    coord = ClusterCoordinator(settings)
+    worker = WorkerInfo(id="w1", address="127.0.0.1:1", channel=AsyncMock(), stub=MagicMock())
+    worker.state = WorkerState.HEALTHY
+    worker.stub.LoadModel = AsyncMock(
+        return_value=pb.LoadModelResponse(success=True, memory_used=1)
+    )
+    worker.stub.GetStatus = AsyncMock(
+        return_value=pb.WorkerStatus(worker_id="w1", gpus=[], loaded_models=[])
+    )
+
+    ok = await coord._load_model_on_worker(worker, "some-org/some-arbitrary-repo")
+    assert ok is True
+    worker.stub.LoadModel.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_load_model_on_worker_allows_registered_model_by_default() -> None:
+    """Registered models (config/models.toml) are unaffected by H4's gate."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    import coordinator.proto.cluster_pb2 as pb
+    from coordinator.coordinator import WorkerInfo, WorkerState
+
+    settings = make_settings()
+    coord = ClusterCoordinator(settings)
+    worker = WorkerInfo(id="w1", address="127.0.0.1:1", channel=AsyncMock(), stub=MagicMock())
+    worker.state = WorkerState.HEALTHY
+    worker.stub.LoadModel = AsyncMock(
+        return_value=pb.LoadModelResponse(success=True, memory_used=1)
+    )
+    worker.stub.GetStatus = AsyncMock(
+        return_value=pb.WorkerStatus(worker_id="w1", gpus=[], loaded_models=[])
+    )
+
+    ok = await coord._load_model_on_worker(worker, "deepseek-7b")
+    assert ok is True
+    worker.stub.LoadModel.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_infer_pops_context_on_error() -> None:
     settings = make_settings(request_timeout=30)
     coord = ClusterCoordinator(settings)
