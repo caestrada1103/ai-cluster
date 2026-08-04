@@ -35,7 +35,103 @@ use half::f16;
 use hf_hub::{api::tokio::Api, Repo, RepoType};
 use safetensors::SafeTensors;
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+/// Resolve a model's attention `head_dim`: an explicit `config.json` value
+/// wins; otherwise `hidden_size / num_attention_heads`.
+///
+/// H3: the previous call site used `config.head_dim.unwrap_or(hidden_size /
+/// num_attention_heads)` — `unwrap_or`'s argument is EAGERLY evaluated even
+/// when `head_dim` is `Some` and the division is never used, and
+/// `num_attention_heads` comes from `load_model_config`'s
+/// `json["num_attention_heads"].as_u64().unwrap_or(0)`, i.e. a value an
+/// attacker-influenceable `config.json` (a malicious/corrupt HF repo) can
+/// set to `0`. That combination made a division-by-zero PANIC reachable from
+/// remote input — not just an `Err`. This function only divides when
+/// `head_dim` is actually absent AND the divisor is non-zero, turning the
+/// invalid-config case into an ordinary, catchable `Err`.
+fn resolve_head_dim(config: &ModelConfig) -> Result<usize, WorkerError> {
+    if let Some(head_dim) = config.head_dim {
+        return Ok(head_dim);
+    }
+    if config.num_attention_heads == 0 {
+        return Err(WorkerError::ModelLoad(
+            "config.json reports num_attention_heads = 0 (and no explicit head_dim) — cannot \
+             compute head_dim; this repo's config.json is invalid or was tampered with"
+                .to_string(),
+        ));
+    }
+    Ok(config.hidden_size / config.num_attention_heads)
+}
+
+/// RAII guard releasing GPU memory reservations tracked via [`Self::track`]
+/// if dropped without [`Self::commit`] being called first (H3) — including
+/// during a PANIC unwind, which the historical "free on the `Err` arm only"
+/// pattern elsewhere in this module does not cover: a panic unwinds straight
+/// past that `Err` arm, permanently leaking the reservation.
+///
+/// `GPUManager::free_memory` does no `.await`-suspending work of its own
+/// (`DashMap`/`AtomicU64` bookkeeping only — see `gpu_manager.rs`), so
+/// running it from a spawned task on `Drop` is safe and fast; `Drop` itself
+/// cannot be `async`, hence the `tokio::spawn`.
+struct ReservationGuard {
+    gpu_manager: Arc<GPUManager>,
+    gpu_ids: Vec<usize>,
+    tag: String,
+    committed: bool,
+}
+
+impl ReservationGuard {
+    fn new(gpu_manager: Arc<GPUManager>, tag: &str) -> Self {
+        Self {
+            gpu_manager,
+            gpu_ids: Vec::new(),
+            tag: tag.to_string(),
+            committed: false,
+        }
+    }
+
+    /// Record that `gpu_id` now holds a reservation under this guard's tag.
+    fn track(&mut self, gpu_id: usize) {
+        self.gpu_ids.push(gpu_id);
+    }
+
+    /// The tracked reservation(s) now belong to something else (a
+    /// successfully loaded model) — do not release them on drop.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if self.committed || self.gpu_ids.is_empty() {
+            return;
+        }
+        let gpu_manager = self.gpu_manager.clone();
+        let gpu_ids = std::mem::take(&mut self.gpu_ids);
+        let tag = std::mem::take(&mut self.tag);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    for gpu_id in gpu_ids {
+                        gpu_manager.free_memory(gpu_id, &tag).await;
+                    }
+                });
+            }
+            Err(_) => {
+                // No runtime available (e.g. dropped during process
+                // shutdown) — nothing more can be done; log loudly rather
+                // than silently leaking.
+                error!(
+                    "ReservationGuard for '{}' dropped with no tokio runtime available — \
+                     GPU reservation(s) on device(s) {:?} were NOT released",
+                    tag, gpu_ids
+                );
+            }
+        }
+    }
+}
 
 /// Model loader configuration
 #[derive(Debug, Clone)]
@@ -62,6 +158,18 @@ pub struct ModelLoaderConfig {
     /// Maximum number of models kept resident at once (0 = unlimited). See
     /// `WorkerConfig::max_loaded_models` in config/worker.toml.
     pub max_loaded_models: usize,
+    /// Ceiling for any caller-supplied per-slot `n_ctx` (H2). See
+    /// `WorkerConfig::max_n_ctx`.
+    pub max_n_ctx: u32,
+    /// Worker's `max_concurrent_requests` — used to size the in-process
+    /// `llamacpp` engine's KV-cache reservation (H2).
+    pub max_concurrent_requests: usize,
+    /// Whether spawned `llama-server` children expose `/slots` (H1). See
+    /// `WorkerConfig::llamaserver_enable_slots_endpoint`.
+    pub llamaserver_enable_slots_endpoint: bool,
+    /// Allowed `llamaserver.port` range, inclusive (C2).
+    pub llamaserver_port_min: u16,
+    pub llamaserver_port_max: u16,
 }
 
 impl Default for ModelLoaderConfig {
@@ -75,9 +183,14 @@ impl Default for ModelLoaderConfig {
             llamacpp_n_threads: 0,
             llamacpp_default_n_gpu_layers: -1,
             llamaserver_binary_path: "llama-server".to_string(),
-            llamaserver_bind_host: "0.0.0.0".to_string(),
+            llamaserver_bind_host: "127.0.0.1".to_string(),
             llamaserver_health_timeout_secs: 120,
             max_loaded_models: 0,
+            max_n_ctx: 262_144,
+            max_concurrent_requests: 32,
+            llamaserver_enable_slots_endpoint: false,
+            llamaserver_port_min: 1024,
+            llamaserver_port_max: 65535,
         }
     }
 }
@@ -121,6 +234,25 @@ pub struct ModelLoader {
     /// load would exceed this, `load_model` evicts the oldest-loaded model(s)
     /// first via `unload`.
     max_loaded_models: usize,
+    /// H7 — loader-wide lock serializing the "evict victim(s) then insert"
+    /// decision across CONCURRENT loads of different model names. See the
+    /// call sites ([`Self::load_model`]'s pre-load pass and
+    /// [`Self::evict_to_fit_and_insert`]) for why two phases are needed.
+    eviction_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Ceiling applied to any caller-supplied per-slot `n_ctx` before it
+    /// sizes a KV-cache reservation or reaches `llama-server -c` (H2).
+    max_n_ctx: u32,
+    /// Slots used for the in-process `llamacpp` engine's KV-cache
+    /// reservation (H2) — the worker's `max_concurrent_requests`, since the
+    /// in-process engine builds one full-`n_ctx` context PER concurrent
+    /// request, not one total.
+    #[allow(dead_code)] // read only when built with --features llamacpp
+    max_concurrent_requests: usize,
+    /// Whether spawned `llama-server` children expose `/slots` (H1).
+    llamaserver_enable_slots_endpoint: bool,
+    /// Allowed `llamaserver.port` range, inclusive (C2).
+    llamaserver_port_min: u16,
+    llamaserver_port_max: u16,
 }
 
 impl ModelLoader {
@@ -164,7 +296,71 @@ impl ModelLoader {
             llamaserver_bind_host: config.llamaserver_bind_host,
             llamaserver_health_timeout_secs: config.llamaserver_health_timeout_secs,
             max_loaded_models: config.max_loaded_models,
+            eviction_lock: Arc::new(tokio::sync::Mutex::new(())),
+            max_n_ctx: config.max_n_ctx,
+            max_concurrent_requests: config.max_concurrent_requests,
+            llamaserver_enable_slots_endpoint: config.llamaserver_enable_slots_endpoint,
+            llamaserver_port_min: config.llamaserver_port_min,
+            llamaserver_port_max: config.llamaserver_port_max,
         })
+    }
+
+    /// Evict the oldest-loaded model(s) (excluding `exclude`) until
+    /// `loaded_models.len() < max_loaded_models`, or until there is no more
+    /// eligible victim. No-op when `max_loaded_models == 0` (unlimited).
+    /// Callers MUST hold `eviction_lock` — see [`Self::load_model`]'s
+    /// pre-load pass and [`Self::evict_to_fit_and_insert`] (H7).
+    async fn evict_to_fit(&self, exclude: &str) {
+        while self.max_loaded_models > 0 && self.loaded_models.len() >= self.max_loaded_models {
+            // Find the oldest-loaded entry that isn't the model we're about
+            // to load. Collect the victim's name into an owned String and
+            // drop the DashMap iterator before awaiting `unload` — holding a
+            // DashMap ref/iterator across an `.await` on another shard can
+            // deadlock.
+            let victim = self
+                .loaded_models
+                .iter()
+                .filter(|entry| entry.key() != exclude)
+                .min_by_key(|entry| entry.value().loaded_at())
+                .map(|entry| entry.key().clone());
+
+            let Some(victim) = victim else {
+                // No eviction candidate (e.g. every remaining entry is the
+                // target itself) — break rather than spinning forever.
+                break;
+            };
+
+            info!(
+                "Evicting {} (max_loaded_models = {}) to make room for {}",
+                victim, self.max_loaded_models, exclude
+            );
+            self.unload(&victim).await;
+            // Hand the name to the gRPC layer so it drops its own copy too.
+            self.evicted_pending.lock().await.push(victim);
+        }
+    }
+
+    /// Atomically make room for (if needed) and register `instance` under
+    /// `model_name` (H7).
+    ///
+    /// This — not the pre-load pass in [`Self::load_model`] — is what
+    /// actually guarantees `loaded_models.len() <= max_loaded_models`: it
+    /// re-evaluates the cap and evicts again if necessary, then inserts,
+    /// all under ONE acquisition of the loader-wide `eviction_lock`. Two
+    /// concurrent loads calling this for different model names are fully
+    /// serialized against EACH OTHER here, so the second one to run always
+    /// sees the first one's insert and evicts accordingly — the exact race
+    /// (`both evict the same victim, both insert, cap exceeded`) the
+    /// pre-load-only version allowed.
+    ///
+    /// The heavy download/build work happens BETWEEN the pre-load pass and
+    /// this call, deliberately outside any lock, so a resident cap does not
+    /// serialize unrelated models' multi-GB downloads against each other —
+    /// only the cheap evict+insert bookkeeping is serialized.
+    async fn evict_to_fit_and_insert(&self, model_name: &str, instance: ModelInstance) {
+        let _evict_guard = self.eviction_lock.lock().await;
+        self.evict_to_fit(model_name).await;
+        self.loaded_models.insert(model_name.to_string(), instance);
     }
 
     /// Load a model
@@ -211,32 +407,24 @@ impl ModelLoader {
         // Resident-model cap: evict the oldest-loaded model(s) to make room
         // before starting this load. `max_loaded_models == 0` means
         // unlimited (no eviction, preserves prior behavior).
-        while self.max_loaded_models > 0 && self.loaded_models.len() >= self.max_loaded_models {
-            // Find the oldest-loaded entry that isn't the model we're about
-            // to load. Collect the victim's name into an owned String and
-            // drop the DashMap iterator before awaiting `unload` — holding a
-            // DashMap ref/iterator across an `.await` on another shard can
-            // deadlock.
-            let victim = self
-                .loaded_models
-                .iter()
-                .filter(|entry| entry.key() != model_name)
-                .min_by_key(|entry| entry.value().loaded_at())
-                .map(|entry| entry.key().clone());
-
-            let Some(victim) = victim else {
-                // No eviction candidate (e.g. every remaining entry is the
-                // target itself) — break rather than spinning forever.
-                break;
-            };
-
-            info!(
-                "Evicting {} (max_loaded_models = {}) to make room for {}",
-                victim, self.max_loaded_models, model_name
-            );
-            self.unload(&victim).await;
-            // Hand the name to the gRPC layer so it drops its own copy too.
-            self.evicted_pending.lock().await.push(victim);
+        //
+        // H7: this pre-load pass is guarded by `eviction_lock` — a
+        // loader-WIDE lock, unlike `_model_guard` above (which only
+        // serializes loads of THIS SAME model name). Without it, two
+        // concurrent loads of DIFFERENT model names each pass their own
+        // `_model_guard`, both observe the cap as full under their own
+        // independent view, both pick (and evict) the SAME victim, and both
+        // then insert — exceeding `max_loaded_models`. This pass exists so
+        // the victim's GPU memory is freed BEFORE this load's own
+        // `allocate_memory` call runs (needed for the load to even fit);
+        // the AUTHORITATIVE, race-proof check happens again immediately
+        // before every `loaded_models.insert` below, in
+        // [`Self::evict_to_fit_and_insert`] — see that method's doc for why
+        // this two-phase split (rather than one lock held across the whole,
+        // possibly multi-GB, load) is still race-free.
+        {
+            let _evict_guard = self.eviction_lock.lock().await;
+            self.evict_to_fit(model_name).await;
         }
 
         let _permit =
@@ -276,10 +464,13 @@ impl ModelLoader {
         // Engine routing: GGUF/llama.cpp models bypass the entire
         // safetensors + config.json path below (GGUF repos often ship no
         // config.json; llama.cpp reads architecture from GGUF metadata).
-        if let Some(spec) = gguf_spec_from_metadata(
+        if let Some(mut spec) = gguf_spec_from_metadata(
             model_config.map(|c| &c.metadata),
             self.llamacpp_default_n_gpu_layers,
         )? {
+            // H2: clamp any caller-supplied n_ctx before it can size the
+            // KV-cache reservation or reach the loaded context.
+            spec.n_ctx = spec.n_ctx.map(|n| n.min(self.max_n_ctx));
             return self
                 .load_llamacpp_model(model_name, spec, gpu_ids, quantization, parallelism)
                 .await;
@@ -292,22 +483,26 @@ impl ModelLoader {
             .await?;
 
         let memory_used = self.calculate_memory_usage(&config);
-        let mut reserved_gpus: Vec<usize> = Vec::new();
+        // H3: a `ReservationGuard`, not manual match/rollback bookkeeping —
+        // its `Drop` releases every reservation tracked so far if this
+        // function returns (via `?`) OR panics before `commit()` runs. That
+        // second case matters here specifically: `head_dim` below used to be
+        // computed with an EAGERLY-evaluated `unwrap_or(hidden_size /
+        // num_attention_heads)`, and `num_attention_heads` comes from
+        // `config.json` (`as_u64().unwrap_or(0)` in `load_model_config`) —
+        // an attacker-influenceable value a malicious/corrupt repo could set
+        // to `0`, causing a division-by-zero PANIC that unwound straight
+        // past the old `Err`-arm-only rollback below, permanently leaking
+        // the reservation on every occurrence. `resolve_head_dim` below
+        // turns that into an ordinary `Err`; this guard is the second half
+        // of the fix — it also covers any OTHER panic in the build path
+        // (e.g. a Burn tensor shape mismatch), not just this one bug.
+        let mut reservation = ReservationGuard::new(self.gpu_manager.clone(), model_name);
         for &gpu_id in gpu_ids {
-            match self
-                .gpu_manager
+            self.gpu_manager
                 .allocate_memory(gpu_id as usize, memory_used as u64, model_name)
-                .await
-            {
-                Ok(()) => reserved_gpus.push(gpu_id as usize),
-                Err(e) => {
-                    // Roll back reservations made so far — no leak on partial failure.
-                    for &g in &reserved_gpus {
-                        self.gpu_manager.free_memory(g, model_name).await;
-                    }
-                    return Err(e);
-                }
-            }
+                .await?;
+            reservation.track(gpu_id as usize);
         }
 
         let build_result: Result<Arc<Mutex<dyn TextGeneration + Send>>, WorkerError> = async {
@@ -345,9 +540,7 @@ impl ModelLoader {
                         num_layers: config.num_layers,
                         num_attention_heads: config.num_attention_heads,
                         num_kv_heads: config.num_kv_heads,
-                        head_dim: config
-                            .head_dim
-                            .unwrap_or(config.hidden_size / config.num_attention_heads),
+                        head_dim: resolve_head_dim(&config)?,
                         intermediate_size: config.intermediate_size,
                         vocab_size: config.vocab_size,
                         max_seq_len: config.max_seq_len,
@@ -369,9 +562,7 @@ impl ModelLoader {
                         num_layers: config.num_layers,
                         num_attention_heads: config.num_attention_heads,
                         num_kv_heads: config.num_kv_heads,
-                        head_dim: config
-                            .head_dim
-                            .unwrap_or(config.hidden_size / config.num_attention_heads),
+                        head_dim: resolve_head_dim(&config)?,
                         intermediate_size: config.intermediate_size,
                         vocab_size: config.vocab_size,
                         max_seq_len: config.max_seq_len,
@@ -388,9 +579,7 @@ impl ModelLoader {
                     Arc::new(Mutex::new(model))
                 }
                 "deepseek" => {
-                    let head_dim = config
-                        .head_dim
-                        .unwrap_or(config.hidden_size / config.num_attention_heads);
+                    let head_dim = resolve_head_dim(&config)?;
                     let has_expert_weights =
                         weights.contains_key("model.layers.0.mlp.experts.0.gate_proj.weight");
 
@@ -448,15 +637,11 @@ impl ModelLoader {
         }
         .await;
 
-        let model = match build_result {
-            Ok(m) => m,
-            Err(e) => {
-                for &g in &reserved_gpus {
-                    self.gpu_manager.free_memory(g, model_name).await;
-                }
-                return Err(e);
-            }
-        };
+        // `?` here relies on `reservation`'s `Drop` for cleanup on the `Err`
+        // path (and, unlike the manual match this replaces, on a panic
+        // unwind too) — see the guard's construction above for why that
+        // matters.
+        let model = build_result?;
 
         let instance = ModelInstance::new(
             model_name.to_string(),
@@ -466,9 +651,12 @@ impl ModelLoader {
             parallelism as i32,
             Some(model),
         );
+        // Ownership of the reservation transfers to the now-loaded instance
+        // — do not release it on drop.
+        reservation.commit();
 
-        self.loaded_models
-            .insert(model_name.to_string(), instance.clone());
+        self.evict_to_fit_and_insert(model_name, instance.clone())
+            .await;
         info!("Model {} loaded successfully", model_name);
 
         Ok(instance)
@@ -534,8 +722,8 @@ impl ModelLoader {
             None,
         );
 
-        self.loaded_models
-            .insert(model_name.to_string(), instance.clone());
+        self.evict_to_fit_and_insert(model_name, instance.clone())
+            .await;
         info!(
             "rpc_server peer stub {} registered ({} bytes reserved across {} GPU(s))",
             model_name,
@@ -557,11 +745,22 @@ impl ModelLoader {
     async fn load_llamaserver_model(
         &self,
         model_name: &str,
-        spec: crate::llamaserver_process::LlamaServerSpec,
+        mut spec: crate::llamaserver_process::LlamaServerSpec,
         gpu_ids: &[u32],
         quantization: crate::cluster::Quantization,
         parallelism: crate::cluster::ParallelismStrategy,
     ) -> Result<ModelInstance, WorkerError> {
+        // C2: constrain the coordinator-assigned port to the configured
+        // range, and H2: clamp any caller-supplied per-slot n_ctx before it
+        // drives `-c`/the KV-cache footprint. Both fail fast, before any
+        // download/spawn work.
+        crate::llamaserver_process::validate_llamaserver_port(
+            spec.port,
+            self.llamaserver_port_min,
+            self.llamaserver_port_max,
+        )?;
+        spec.n_ctx = spec.n_ctx.map(|n| n.min(self.max_n_ctx));
+
         info!(
             "Loading model {} via llama-server (port {}, {}/{})",
             model_name, spec.port, spec.repo_id, spec.file
@@ -616,7 +815,11 @@ impl ModelLoader {
         }
 
         // Build argv + spawn. On failure roll back the reservations.
-        let args = match spec.build_args(&gguf_path, &self.llamaserver_bind_host) {
+        let args = match spec.build_args(
+            &gguf_path,
+            &self.llamaserver_bind_host,
+            self.llamaserver_enable_slots_endpoint,
+        ) {
             Ok(args) => args,
             Err(e) => {
                 for &g in &reserved_gpus {
@@ -668,8 +871,8 @@ impl ModelLoader {
             parallelism as i32,
             None,
         );
-        self.loaded_models
-            .insert(model_name.to_string(), instance.clone());
+        self.evict_to_fit_and_insert(model_name, instance.clone())
+            .await;
         info!(
             "Model {} loaded via llama-server on port {}",
             model_name, spec.port
@@ -929,19 +1132,49 @@ impl ModelLoader {
 
     /// Honest accounting: every weight is loaded as FP32 today (4 bytes/param),
     /// and MoE models replicate the FFN per expert.
+    ///
+    /// M4: `config.*` is ultimately sourced from an attacker-influenceable
+    /// `config.json` (`as_u64().unwrap_or(0) as usize` in
+    /// `load_model_config`), and release builds use Rust's default
+    /// `overflow-checks = false` — a plain `usize` multiply chain here would
+    /// silently WRAP on a crafted huge value, producing a small
+    /// `memory_used` that then under-reserves GPU memory instead of failing
+    /// the load. Every multiply/add below runs in `u128` (wide enough that
+    /// overflow is unreachable from any `u64`-sourced input) and the result
+    /// saturates to `usize::MAX` rather than wrapping, so a bogus config
+    /// makes the subsequent `allocate_memory` call fail loudly (not enough
+    /// available memory) instead of silently under-reserving.
     fn calculate_memory_usage(&self, config: &ModelConfig) -> usize {
-        let embed = config.vocab_size * config.hidden_size;
-        let attn = config.num_layers * 4 * config.hidden_size * config.hidden_size;
+        let vocab_size = config.vocab_size as u128;
+        let hidden_size = config.hidden_size as u128;
+        let num_layers = config.num_layers as u128;
+        let intermediate_size = config.intermediate_size as u128;
         let expert_factor = if config.is_moe {
-            config.num_experts.unwrap_or(1).max(1)
+            config.num_experts.unwrap_or(1).max(1) as u128
         } else {
-            1
+            1u128
         };
-        let ffn =
-            config.num_layers * 3 * config.hidden_size * config.intermediate_size * expert_factor;
-        let norm = (config.num_layers * 2 + 1) * config.hidden_size;
-        let params = embed + attn + ffn + norm;
-        params * 4
+
+        let embed = vocab_size.saturating_mul(hidden_size);
+        let attn = num_layers
+            .saturating_mul(4)
+            .saturating_mul(hidden_size)
+            .saturating_mul(hidden_size);
+        let ffn = num_layers
+            .saturating_mul(3)
+            .saturating_mul(hidden_size)
+            .saturating_mul(intermediate_size)
+            .saturating_mul(expert_factor);
+        let norm = num_layers
+            .saturating_mul(2)
+            .saturating_add(1)
+            .saturating_mul(hidden_size);
+        let params = embed
+            .saturating_add(attn)
+            .saturating_add(ffn)
+            .saturating_add(norm);
+
+        params.saturating_mul(4).min(usize::MAX as u128) as usize
     }
 
     /// Load a GGUF model via the llama.cpp engine (feature `llamacpp`).
@@ -1026,10 +1259,15 @@ impl ModelLoader {
         };
 
         // Phase 2 — reserve the KV cache now that the model's dimensions are
-        // known. The in-process engine builds one context per request, so a
-        // single slot is the honest per-load figure; concurrent requests are
-        // separately bounded by `max_concurrent_requests`.
-        let kv_bytes = engine.kv_cache_bytes(1);
+        // known. H2: the in-process engine builds a FRESH full-n_ctx context
+        // PER REQUEST (see `llamacpp_engine.rs`), and up to
+        // `max_concurrent_requests` of those can be in flight at once (the
+        // `infer_semaphore` in `worker.rs` is sized to exactly that), so the
+        // reservation must cover all of them — reserving for a single slot
+        // here (as before) undercounts real usage by up to
+        // `max_concurrent_requests`x on unified-memory hosts, where that is
+        // the Linux OOM killer, not a catchable CUDA allocation error.
+        let kv_bytes = engine.kv_cache_bytes(self.max_concurrent_requests as u32);
         for &gpu_id in gpu_ids {
             if let Err(e) = self
                 .gpu_manager
@@ -1063,8 +1301,8 @@ impl ModelLoader {
             Some(model),
         );
 
-        self.loaded_models
-            .insert(model_name.to_string(), instance.clone());
+        self.evict_to_fit_and_insert(model_name, instance.clone())
+            .await;
         info!(
             "GGUF model {} loaded successfully via llama.cpp",
             model_name
@@ -1911,6 +2149,199 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(instance.gpu_ids(), &[0]);
+    }
+
+    // -----------------------------------------------------------------
+    // H3: resolve_head_dim (div-by-zero panic on attacker-influenced
+    // config.json) and ReservationGuard (release-on-unwind).
+    // -----------------------------------------------------------------
+
+    fn base_model_config() -> ModelConfig {
+        ModelConfig {
+            architecture: "llama".to_string(),
+            num_layers: 2,
+            hidden_size: 64,
+            num_attention_heads: 8,
+            num_kv_heads: 8,
+            vocab_size: 100,
+            max_seq_len: 128,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            head_dim: None,
+            attention_bias: false,
+            is_moe: false,
+            num_experts: None,
+            num_experts_per_tok: None,
+        }
+    }
+
+    #[test]
+    fn resolve_head_dim_divides_when_absent() {
+        let config = base_model_config();
+        assert_eq!(resolve_head_dim(&config).unwrap(), 8); // 64 / 8
+    }
+
+    #[test]
+    fn resolve_head_dim_prefers_explicit_value_without_dividing() {
+        let mut config = base_model_config();
+        config.num_attention_heads = 0; // would panic on division if this were used
+        config.head_dim = Some(16);
+        assert_eq!(resolve_head_dim(&config).unwrap(), 16);
+    }
+
+    #[test]
+    fn resolve_head_dim_errors_instead_of_panicking_on_zero_heads() {
+        // The exact H3 scenario: an attacker/corrupt-repo config.json with
+        // num_attention_heads = 0 and no explicit head_dim. Must return an
+        // Err, never panic (the crate is compiled with overflow/div checks
+        // that would abort the process on a raw `/0` here).
+        let mut config = base_model_config();
+        config.num_attention_heads = 0;
+        config.head_dim = None;
+        let err = resolve_head_dim(&config).unwrap_err();
+        assert!(err.to_string().contains("num_attention_heads"));
+    }
+
+    #[tokio::test]
+    async fn reservation_guard_releases_memory_on_drop_without_commit() {
+        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        let before = gpu_manager.get_available_memory(0).await;
+
+        {
+            let mut guard = ReservationGuard::new(gpu_manager.clone(), "leak-test");
+            gpu_manager
+                .allocate_memory(0, 1_000, "leak-test")
+                .await
+                .unwrap();
+            guard.track(0);
+            assert_eq!(gpu_manager.get_available_memory(0).await, before - 1_000);
+            // Dropped here WITHOUT calling commit() — simulates an early
+            // return or panic between reservation and a successful load.
+        }
+
+        // Drop spawns the release onto the runtime rather than blocking;
+        // give it a chance to run.
+        for _ in 0..50 {
+            if gpu_manager.get_available_memory(0).await == before {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            gpu_manager.get_available_memory(0).await,
+            before,
+            "ReservationGuard must release its tracked reservation on drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn reservation_guard_commit_prevents_release_on_drop() {
+        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        let before = gpu_manager.get_available_memory(0).await;
+
+        gpu_manager
+            .allocate_memory(0, 1_000, "committed-test")
+            .await
+            .unwrap();
+        let mut guard = ReservationGuard::new(gpu_manager.clone(), "committed-test");
+        guard.track(0);
+        guard.commit(); // ownership transferred — must NOT free on drop
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            gpu_manager.get_available_memory(0).await,
+            before - 1_000,
+            "commit() must prevent the guard from releasing the reservation"
+        );
+        // Clean up for hygiene (not asserted).
+        gpu_manager.free_memory(0, "committed-test").await;
+    }
+
+    // -----------------------------------------------------------------
+    // H7: max_loaded_models eviction race — two concurrent loads racing
+    // through evict_to_fit_and_insert must never both succeed in exceeding
+    // the cap, even though the pre-load eviction pass (only guarded by the
+    // PER-MODEL-NAME lock) can't see each other's decisions.
+    // -----------------------------------------------------------------
+
+    fn dummy_instance(name: &str) -> ModelInstance {
+        ModelInstance::new(name.to_string(), 0, vec![0], 0, 0, None)
+    }
+
+    #[tokio::test]
+    async fn evict_to_fit_and_insert_never_exceeds_cap_under_concurrency() {
+        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let loader_config = ModelLoaderConfig {
+            cache_dir: dir.path().join("models"),
+            download_dir: dir.path().join("downloads"),
+            max_loaded_models: 1,
+            ..ModelLoaderConfig::default()
+        };
+        let loader = Arc::new(ModelLoader::new(loader_config, gpu_manager).unwrap());
+
+        // Pre-populate with one already-resident model, matching the race
+        // scenario in the audit: model "a" is loaded, and TWO different new
+        // models ("b" and "c") each try to load concurrently against a cap
+        // of 1 — only one can end up resident.
+        loader
+            .loaded_models
+            .insert("a".to_string(), dummy_instance("a"));
+
+        let loader_b = loader.clone();
+        let loader_c = loader.clone();
+        let (_, _) = tokio::join!(
+            loader_b.evict_to_fit_and_insert("b", dummy_instance("b")),
+            loader_c.evict_to_fit_and_insert("c", dummy_instance("c")),
+        );
+
+        assert_eq!(
+            loader.loaded_models.len(),
+            1,
+            "max_loaded_models=1 must never be exceeded, even under concurrent loads \
+             of different model names"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // M4: calculate_memory_usage must saturate, never overflow/wrap, on a
+    // maximally-hostile config.json. `cargo test` runs in debug (overflow
+    // checks ON), so the pre-fix `usize *` chain would have PANICKED here,
+    // not just silently wrapped as it would in a release build.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn calculate_memory_usage_saturates_instead_of_overflowing() {
+        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        let (loader, _dir) = test_loader(gpu_manager);
+        let mut config = base_model_config();
+        // Every field maxed out — the worst case an attacker-controlled
+        // `config.json` (`as_u64().unwrap_or(0) as usize`) could supply.
+        config.vocab_size = usize::MAX;
+        config.hidden_size = usize::MAX;
+        config.num_layers = usize::MAX;
+        config.intermediate_size = usize::MAX;
+        config.is_moe = true;
+        config.num_experts = Some(usize::MAX);
+        let usage = loader.calculate_memory_usage(&config);
+        assert_eq!(usage, usize::MAX, "must saturate, not wrap, on overflow");
+    }
+
+    #[tokio::test]
+    async fn calculate_memory_usage_matches_hand_computation_for_sane_config() {
+        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        let (loader, _dir) = test_loader(gpu_manager);
+        let config = base_model_config(); // hidden=64, layers=2, heads=8, vocab=100, ffn=128
+        let usage = loader.calculate_memory_usage(&config);
+        let embed = 100 * 64;
+        let attn = 2 * 4 * 64 * 64;
+        let ffn = 2 * 3 * 64 * 128;
+        let norm = (2 * 2 + 1) * 64;
+        let expected = (embed + attn + ffn + norm) * 4;
+        assert_eq!(usage, expected);
     }
 }
 
