@@ -25,6 +25,140 @@ use crate::model_loader::parse_cache_type;
 /// `--parallel` value when the `llamaserver.parallel` metadata key is omitted.
 const DEFAULT_PARALLEL: u32 = 4;
 
+/// C2 — flags [`LlamaServerSpec::extra_args`] (metadata key
+/// `llamaserver.extra_args`, coordinator-controlled and, transitively,
+/// attacker-influenceable if C3/C4 auth is ever misconfigured) is allowed to
+/// contain. `extra_args` is whitespace-split verbatim and appended to the
+/// `llama-server` child's argv (`execve`-style — no shell — so this is flag
+/// injection, not shell injection, but that is still enough for e.g. `--path
+/// <dir>` to turn the child into an arbitrary-file HTTP server, `--log-file
+/// <path>` into an arbitrary write primitive, or `--host`/`--port` to
+/// silently rebind the process this loader just spawned and is tracking by a
+/// DIFFERENT port).
+///
+/// Every flag `llama-server --help` accepts that takes a filesystem path, a
+/// network address, or a credential is deliberately left OFF this list —
+/// those already have first-class, validated fields on [`LlamaServerSpec`]
+/// (`port`, `n_gpu_layers`, `n_cpu_moe`, `cache_type_k`/`v`) or simply have no
+/// legitimate use here. Flags that DUPLICATE one of those typed fields
+/// (`-np`/`--parallel`, `-c`/`--ctx-size`, `-m`/`--model`, `-ngl`/
+/// `--n-gpu-layers`, `-ncmoe`/`--n-cpu-moe`, `-ctk`/`-ctv`, `--host`,
+/// `--port`) are ALSO excluded — allowing them here would let a second,
+/// conflicting flag silently override the value this loader already used to
+/// size the KV-cache GPU reservation (H2) or to build the argv, which
+/// `llama-server`'s "last flag wins" argv parsing would accept without
+/// complaint. This is a strict ALLOWLIST: any token that looks like a flag
+/// (starts with `-`) and is not in this set is rejected outright — including
+/// flags not yet invented when this list was written.
+const ALLOWED_EXTRA_FLAGS: &[&str] = &[
+    // Sampling / generation tuning — no path or network semantics.
+    "--temp",
+    "--temperature",
+    "--top-k",
+    "--top-p",
+    "--min-p",
+    "--top-nsigma",
+    "--top-n-sigma",
+    "--repeat-last-n",
+    "--repeat-penalty",
+    "--presence-penalty",
+    "--frequency-penalty",
+    "--samplers",
+    "--mirostat",
+    "--mirostat-lr",
+    "--mirostat-ent",
+    "--dynatemp-range",
+    "--dynatemp-exp",
+    "--xtc-probability",
+    "--xtc-threshold",
+    "--typical",
+    "--typical-p",
+    "--dry-multiplier",
+    "--dry-base",
+    "--dry-allowed-length",
+    "--dry-penalty-last-n",
+    "--ignore-eos",
+    // Performance / batching / offload tuning — numbers and enums only.
+    "-fa",
+    "--flash-attn",
+    "--mlock",
+    "--mmap",
+    "--no-mmap",
+    "-t",
+    "--threads",
+    "-tb",
+    "--threads-batch",
+    "-b",
+    "--batch-size",
+    "-ub",
+    "--ubatch-size",
+    "--warmup",
+    "--no-warmup",
+    "--numa",
+    "-sm",
+    "--split-mode",
+    "-ts",
+    "--tensor-split",
+    "-mg",
+    "--main-gpu",
+    "-dev",
+    "--device",
+    "-kvo",
+    "--kv-offload",
+    "-nkvo",
+    "--no-kv-offload",
+    "-kvu",
+    "--kv-unified",
+    "-no-kvu",
+    "--no-kv-unified",
+    "--swa-full",
+    "-cb",
+    "--cont-batching",
+    "-nocb",
+    "--no-cont-batching",
+    "--context-shift",
+    "--no-context-shift",
+    "--check-tensors",
+    "--op-offload",
+    "--no-op-offload",
+    "-nr",
+    "--repack",
+    "--no-repack",
+    "-dt",
+    "--defrag-thold",
+    // RoPE scaling — numeric only.
+    "--rope-scaling",
+    "--rope-scale",
+    "--rope-freq-base",
+    "--rope-freq-scale",
+    "--yarn-orig-ctx",
+    "--yarn-ext-factor",
+    "--yarn-attn-factor",
+    "--yarn-beta-slow",
+    "--yarn-beta-fast",
+    // Template engine toggle (not `--chat-template-file`/paths).
+    "--jinja",
+    "--no-jinja",
+];
+
+/// Reject an `extra_args` token that looks like a CLI flag (starts with `-`)
+/// but is not on [`ALLOWED_EXTRA_FLAGS`]. Bare values (a flag's argument,
+/// e.g. the `20` in `--top-k 20`) are not flags themselves and pass through
+/// unchecked — the flag they belong to is what gates whether they can appear
+/// at all.
+fn validate_extra_arg(token: &str) -> Result<(), WorkerError> {
+    if token.starts_with('-') && !ALLOWED_EXTRA_FLAGS.contains(&token) {
+        return Err(WorkerError::Configuration(format!(
+            "llamaserver.extra_args: flag '{token}' is not on the allowlist \
+             (rejected — file/network/credential-affecting flags like --path, \
+             --log-file, --host, --api-key-file, --lora, --slot-save-path, \
+             --models-dir, --hf-token, etc. are never permitted here; use a \
+             typed metadata field or the worker's own config for anything else)"
+        )));
+    }
+    Ok(())
+}
+
 /// Spawn/health/kill config parsed from `ModelConfig.metadata` for a model with
 /// `engine = "llamaserver"`.
 ///
@@ -128,15 +262,25 @@ impl LlamaServerSpec {
     ///
     /// Order: `-m <path> --host <bind> --port <port> [-c <total_ctx>] -ngl
     /// <N> [--n-cpu-moe <N>] --parallel <N> [-ctk <t>] [-ctv <t>]
-    /// <extra_args...>`.
+    /// (--slots|--no-slots) <extra_args...>`.
     ///
     /// `--jinja` is intentionally NOT passed — it is default-on in current
     /// llama.cpp.
+    ///
+    /// `--slots`/`--no-slots` is always passed explicitly so the setting never
+    /// depends on the llama-server build's own default. See docs/configuration.md.
+    ///
+    /// `extra_args` is re-validated against [`ALLOWED_EXTRA_FLAGS`] here as well
+    /// as at parse time, for callers that build a spec directly.
     pub fn build_args(
         &self,
         gguf_path: &Path,
         bind_host: &str,
+        enable_slots_endpoint: bool,
     ) -> Result<Vec<String>, WorkerError> {
+        for token in &self.extra_args {
+            validate_extra_arg(token)?;
+        }
         let mut args: Vec<String> = vec![
             "-m".to_string(),
             gguf_path.to_string_lossy().into_owned(),
@@ -178,6 +322,11 @@ impl LlamaServerSpec {
             args.push("-ctv".to_string());
             args.push(v.clone());
         }
+        args.push(if enable_slots_endpoint {
+            "--slots".to_string()
+        } else {
+            "--no-slots".to_string()
+        });
         args.extend(self.extra_args.iter().cloned());
         Ok(args)
     }
@@ -274,10 +423,16 @@ pub fn llamaserver_spec_from_metadata(
         None => None,
     };
 
-    let extra_args = metadata
+    let extra_args: Vec<String> = metadata
         .get("llamaserver.extra_args")
         .map(|s| s.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
+    // C2 — validate every token against the flag allowlist BEFORE it can ever
+    // reach `Command::new(binary).args(...)`. See `validate_extra_arg`/
+    // `ALLOWED_EXTRA_FLAGS` for what is and is not permitted and why.
+    for token in &extra_args {
+        validate_extra_arg(token)?;
+    }
 
     Ok(Some(LlamaServerSpec {
         repo_id,
@@ -291,6 +446,23 @@ pub fn llamaserver_spec_from_metadata(
         cache_type_v,
         extra_args,
     }))
+}
+
+/// Reject a `llamaserver.port` outside the configured allowed range (C2
+/// defense-in-depth). The typed `port` field always drives the child's
+/// `--port`/`--host` — those flag NAMES can never appear in `extra_args`
+/// (see [`ALLOWED_EXTRA_FLAGS`]) — but an unconstrained port number could
+/// still be pointed at a privileged port or collide with another service on
+/// the host, so the coordinator-assigned value is checked against a
+/// configured range (`worker.toml`'s `llamaserver_port_min`/`_max`).
+pub fn validate_llamaserver_port(port: u16, min: u16, max: u16) -> Result<(), WorkerError> {
+    if port < min || port > max {
+        return Err(WorkerError::Configuration(format!(
+            "llamaserver.port {port} is outside the configured allowed range {min}-{max} \
+             (see worker.toml's llamaserver_port_min/llamaserver_port_max)"
+        )));
+    }
+    Ok(())
 }
 
 /// A supervised `llama-server` child process.
@@ -544,7 +716,7 @@ mod tests {
             ("gguf_file", "devstral-small-2-24b-q4_k_m.gguf"),
             ("llamaserver.port", "8081"),
             ("llamaserver.parallel", "8"),
-            ("llamaserver.extra_args", "--flash-attn -np 8"),
+            ("llamaserver.extra_args", "--flash-attn --mlock"),
             ("n_ctx", "32768"),
             ("n_gpu_layers", "20"),
             ("n_cpu_moe", "10"),
@@ -565,12 +737,96 @@ mod tests {
         assert_eq!(spec.cache_type_v, Some("q4_0".to_string()));
         assert_eq!(
             spec.extra_args,
+            vec!["--flash-attn".to_string(), "--mlock".to_string()]
+        );
+    }
+
+    // --- C2: extra_args flag allowlist --------------------------------------
+
+    #[test]
+    fn spec_rejects_disallowed_extra_arg_flags() {
+        for dangerous in [
+            "--path",
+            "--log-file",
+            "--host",
+            "--port",
+            "--api-key-file",
+            "--api-key",
+            "--lora",
+            "--lora-scaled",
+            "--slot-save-path",
+            "--media-path",
+            "--models-dir",
+            "--models-preset",
+            "--hf-token",
+            "--hf-repo",
+            "--chat-template-file",
+            "--ssl-key-file",
+            "--ssl-cert-file",
+            "-m",  // --model — a second, conflicting model path
+            "-c",  // --ctx-size — bypasses the n_ctx/total_ctx arithmetic
+            "-np", // --parallel — bypasses the typed `parallel` field
+        ] {
+            let m = meta(&[
+                ("engine", "llamaserver"),
+                ("gguf_repo_id", "x/y"),
+                ("gguf_file", "m.gguf"),
+                ("llamaserver.port", "8080"),
+                ("llamaserver.extra_args", dangerous),
+            ]);
+            let err = llamaserver_spec_from_metadata(Some(&m), -1)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(dangerous),
+                "expected rejection of '{dangerous}', got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_accepts_allowlisted_extra_arg_flags() {
+        let m = meta(&[
+            ("engine", "llamaserver"),
+            ("gguf_repo_id", "x/y"),
+            ("gguf_file", "m.gguf"),
+            ("llamaserver.port", "8080"),
+            (
+                "llamaserver.extra_args",
+                "--flash-attn --mlock --no-mmap --threads 8 --rope-scale 2.0",
+            ),
+        ]);
+        let spec = llamaserver_spec_from_metadata(Some(&m), -1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            spec.extra_args,
             vec![
                 "--flash-attn".to_string(),
-                "-np".to_string(),
-                "8".to_string()
+                "--mlock".to_string(),
+                "--no-mmap".to_string(),
+                "--threads".to_string(),
+                "8".to_string(),
+                "--rope-scale".to_string(),
+                "2.0".to_string(),
             ]
         );
+    }
+
+    // --- C2: llamaserver.port range constraint ------------------------------
+
+    #[test]
+    fn port_range_accepts_in_range() {
+        assert!(validate_llamaserver_port(8081, 1024, 65535).is_ok());
+        assert!(validate_llamaserver_port(1024, 1024, 65535).is_ok());
+        assert!(validate_llamaserver_port(65535, 1024, 65535).is_ok());
+    }
+
+    #[test]
+    fn port_range_rejects_out_of_range() {
+        assert!(validate_llamaserver_port(80, 1024, 65535).is_err());
+        assert!(validate_llamaserver_port(1023, 1024, 65535).is_err());
+        assert!(validate_llamaserver_port(100, 1024, 8000).is_err());
     }
 
     #[test]
@@ -766,7 +1022,7 @@ mod tests {
             extra_args: vec!["--flash-attn".to_string(), "--mlock".to_string()],
         };
         let args = spec
-            .build_args(Path::new("/models/m.gguf"), "0.0.0.0")
+            .build_args(Path::new("/models/m.gguf"), "0.0.0.0", false)
             .unwrap();
         assert_eq!(
             args,
@@ -790,10 +1046,54 @@ mod tests {
                 "q8_0",
                 "-ctv",
                 "q4_0",
+                "--no-slots",
                 "--flash-attn",
                 "--mlock",
             ]
         );
+    }
+
+    #[test]
+    fn build_args_enable_slots_endpoint_passes_slots_flag() {
+        let spec = LlamaServerSpec {
+            repo_id: "x/y".to_string(),
+            file: "m.gguf".to_string(),
+            port: 8080,
+            n_ctx: None,
+            parallel: DEFAULT_PARALLEL,
+            n_gpu_layers: -1,
+            n_cpu_moe: None,
+            cache_type_k: None,
+            cache_type_v: None,
+            extra_args: vec![],
+        };
+        let args = spec
+            .build_args(Path::new("/m.gguf"), "127.0.0.1", true)
+            .unwrap();
+        assert!(args.iter().any(|a| a == "--slots"));
+        assert!(!args.iter().any(|a| a == "--no-slots"));
+    }
+
+    #[test]
+    fn build_args_rejects_disallowed_extra_flag_even_if_constructed_directly() {
+        // Defense in depth: build_args re-validates extra_args, not just the
+        // metadata parser — see the doc comment on ALLOWED_EXTRA_FLAGS.
+        let spec = LlamaServerSpec {
+            repo_id: "x/y".to_string(),
+            file: "m.gguf".to_string(),
+            port: 8080,
+            n_ctx: None,
+            parallel: DEFAULT_PARALLEL,
+            n_gpu_layers: -1,
+            n_cpu_moe: None,
+            cache_type_k: None,
+            cache_type_v: None,
+            extra_args: vec!["--path".to_string(), "/etc".to_string()],
+        };
+        let err = spec
+            .build_args(Path::new("/m.gguf"), "127.0.0.1", false)
+            .unwrap_err();
+        assert!(err.to_string().contains("--path"));
     }
 
     #[test]
@@ -810,7 +1110,9 @@ mod tests {
             cache_type_v: None,
             extra_args: vec![],
         };
-        let args = spec.build_args(Path::new("/m.gguf"), "0.0.0.0").unwrap();
+        let args = spec
+            .build_args(Path::new("/m.gguf"), "0.0.0.0", false)
+            .unwrap();
         // Consumer-GPU partial offload: -ngl 20, not the "all layers" 999
         // sentinel, and no --n-cpu-moe flag since it was not configured.
         assert_eq!(
@@ -826,6 +1128,7 @@ mod tests {
                 "20",
                 "--parallel",
                 "1",
+                "--no-slots",
             ]
         );
     }
@@ -844,7 +1147,9 @@ mod tests {
             cache_type_v: None,
             extra_args: vec![],
         };
-        let args = spec.build_args(Path::new("/m.gguf"), "127.0.0.1").unwrap();
+        let args = spec
+            .build_args(Path::new("/m.gguf"), "127.0.0.1", false)
+            .unwrap();
         // No -c (n_ctx absent), no -ctk/-ctv (cache types absent), no extras.
         assert_eq!(
             args,
@@ -859,6 +1164,7 @@ mod tests {
                 "999",
                 "--parallel",
                 "4",
+                "--no-slots",
             ]
         );
     }
