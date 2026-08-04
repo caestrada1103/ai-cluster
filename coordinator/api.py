@@ -8,8 +8,10 @@ Endpoints:
     GET  /workers      - List connected workers
 """
 import asyncio
+import ipaddress
 import json
 import logging
+import re
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Type, TypeVar, Union
 
@@ -17,7 +19,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from coordinator import proxy
+from coordinator import auth, proxy
 from coordinator.models import ModelConfig, ModelRegistry
 
 logger = logging.getLogger(__name__)
@@ -228,6 +230,74 @@ def _worker_host(address: str) -> str:
     return address.rsplit(":", 1)[0] if ":" in address else address
 
 
+# ---------------------------------------------------------------------------
+# C3: POST /v1/workers/manual address validation
+# ---------------------------------------------------------------------------
+
+#: Hard cap on addresses accepted in a single POST /v1/workers/manual call.
+_MAX_MANUAL_WORKERS_PER_REQUEST = 16
+
+_HOSTNAME_RE = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$")
+
+
+def _split_host_port(address: str) -> tuple[str, int]:
+    """Split 'host:port' or '[ipv6]:port' into (host, port); ValueError on any other shape."""
+    if address.startswith("["):
+        end = address.find("]")
+        if end == -1 or address[end + 1 : end + 2] != ":":
+            raise ValueError(f"invalid address '{address}': expected '[ipv6-host]:port'")
+        host, port_str = address[1:end], address[end + 2 :]
+    else:
+        if address.count(":") != 1:
+            raise ValueError(f"invalid address '{address}': expected 'host:port'")
+        host, port_str = address.rsplit(":", 1)
+    if not host:
+        raise ValueError(f"invalid address '{address}': empty host")
+    if not port_str.isdigit():
+        raise ValueError(f"invalid address '{address}': port must be numeric")
+    port = int(port_str)
+    if not 1 <= port <= 65535:
+        raise ValueError(f"invalid address '{address}': port {port} out of range 1-65535")
+    return host, port
+
+
+def _is_well_formed_host(host: str) -> bool:
+    """True for a syntactically valid IPv4/IPv6 literal or DNS hostname."""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    return bool(_HOSTNAME_RE.match(host)) and len(host) <= 253
+
+
+def _host_allowed(host: str, allowed: List[str]) -> bool:
+    """Empty allowlist == accept any well-formed host (the auth+opt-in gate
+    on the route is the primary control then). Otherwise the host must
+    exactly match an allowed entry, OR — if the entry parses as a network —
+    fall inside that CIDR."""
+    if not allowed:
+        return True
+    for entry in allowed:
+        if entry == host:
+            return True
+        try:
+            if ipaddress.ip_address(host) in ipaddress.ip_network(entry, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _validate_manual_worker_address(address: str, allowed_hosts: List[str]) -> None:
+    """Raise ValueError for anything that isn't a plausible, allowed worker address."""
+    host, _port = _split_host_port(address)
+    if not _is_well_formed_host(host):
+        raise ValueError(f"invalid address '{address}': '{host}' is not a valid host")
+    if not _host_allowed(host, allowed_hosts):
+        raise ValueError(f"host '{host}' in address '{address}' is not in the configured allowlist")
+
+
 def _proxy_response(result: proxy.ProxyResponse) -> Response:
     """Adapt a proxy result into a FastAPI response.
 
@@ -289,6 +359,39 @@ async def _resolve_llamaserver_worker(coordinator: Any, model_cfg: ModelConfig) 
         ) from exc
 
 
+#: H5 — llama-server has no admission control of its own for these fields;
+#: the in-process path already bounds max_tokens (CompletionRequest/
+#: ChatCompletionRequest: `le=32768`) via pydantic, but the proxy path
+#: forwards raw bytes and skips that entirely. This ceiling is looser
+#: (agentic/long-context llamaserver models legitimately want more headroom)
+#: but still bounded rather than "anything the client sends, verbatim".
+_PROXY_MAX_TOKENS_CEILING = 131_072
+
+
+def _validate_proxy_envelope(data: Dict[str, Any]) -> None:
+    """Minimal sanity checks on a proxied request body BEFORE it is
+    forwarded verbatim (H5).
+
+    Deliberately NOT a full re-model of the OpenAI/Anthropic schema — that
+    would break forward compatibility with ``tools``/``tool_calls``/
+    ``thinking``/... fields, which is the entire point of proxying raw
+    bytes. Only the couple of fields llama-server has no bound of its own
+    for are checked.
+    """
+    max_tokens = data.get("max_tokens")
+    if max_tokens is not None:
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, (int, float)):
+            raise HTTPException(status_code=422, detail="'max_tokens' must be a number")
+        if not (1 <= max_tokens <= _PROXY_MAX_TOKENS_CEILING):
+            raise HTTPException(
+                status_code=422,
+                detail=f"'max_tokens' must be between 1 and {_PROXY_MAX_TOKENS_CEILING}",
+            )
+    stream = data.get("stream")
+    if stream is not None and not isinstance(stream, bool):
+        raise HTTPException(status_code=422, detail="'stream' must be a boolean")
+
+
 async def _proxy_to_llamaserver(
     request: Request,  # type: ignore[type-arg]
     coordinator: Any,
@@ -296,6 +399,7 @@ async def _proxy_to_llamaserver(
     raw_body: bytes,
     stream: bool,
     *,
+    data: Optional[Dict[str, Any]] = None,
     upstream_path: Optional[str] = None,
 ) -> Response:
     """Forward a request to the worker-local llama-server serving ``model_cfg``.
@@ -306,7 +410,11 @@ async def _proxy_to_llamaserver(
     through. ``path`` defaults to the incoming ``request.url.path``; callers pass
     ``upstream_path`` to override it (``/infill`` is served at llama-server's
     root, not under the coordinator's ``/v1`` mount — see :func:`create_infill`).
+    ``data`` (H5), when given, is sanity-checked via
+    :func:`_validate_proxy_envelope` before anything is dialed.
     """
+    if data is not None:
+        _validate_proxy_envelope(data)
     worker = await _resolve_llamaserver_worker(coordinator, model_cfg)
     if model_cfg.llamaserver_port is None:  # defensive: validated at registry load
         raise HTTPException(
@@ -380,7 +488,7 @@ async def create_completion(request: Request) -> Any:  # type: ignore[type-arg]
     model_cfg = _lookup_engine_model(data.get("model"))
     if model_cfg is not None and model_cfg.engine == "llamaserver":
         return await _proxy_to_llamaserver(
-            request, coordinator, model_cfg, raw_body, bool(data.get("stream", False))
+            request, coordinator, model_cfg, raw_body, bool(data.get("stream", False)), data=data
         )
 
     body = _parse_body(CompletionRequest, data)
@@ -410,9 +518,17 @@ async def create_completion(request: Request) -> Any:  # type: ignore[type-arg]
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except Exception as exc:
+    except ValueError as exc:
+        # H4: an unregistered model_name with pull-through disabled raises
+        # ValueError from coordinator._load_model_on_worker — a client
+        # error (bad model name), not a server error.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        # M12: never echo a raw exception string to the client (it can leak
+        # internal paths/library internals/stack details) — the real error
+        # is already captured server-side by logger.exception above.
         logger.exception("Inference failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="Internal server error") from None
 
 
 # ---------------------------------------------------------------------------
@@ -736,7 +852,7 @@ async def create_chat_completion(
     model_cfg = _lookup_engine_model(data.get("model"))
     if model_cfg is not None and model_cfg.engine == "llamaserver":
         return await _proxy_to_llamaserver(
-            request, coordinator, model_cfg, raw_body, bool(data.get("stream", False))
+            request, coordinator, model_cfg, raw_body, bool(data.get("stream", False)), data=data
         )
 
     body = _parse_body(ChatCompletionRequest, data)
@@ -794,9 +910,17 @@ async def create_chat_completion(
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except Exception as exc:
+    except ValueError as exc:
+        # H4: an unregistered model_name with pull-through disabled raises
+        # ValueError from coordinator._load_model_on_worker — a client
+        # error (bad model name), not a server error.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        # M12: never echo a raw exception string to the client (it can leak
+        # internal paths/library internals/stack details) — the real error
+        # is already captured server-side by logger.exception above.
         logger.exception("Inference failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="Internal server error") from None
 
 
 @router.post("/messages", response_model=None)
@@ -816,7 +940,7 @@ async def create_message(request: Request) -> Response:  # type: ignore[type-arg
         data.get("model"), surface="the Anthropic /v1/messages API"
     )
     return await _proxy_to_llamaserver(
-        request, coordinator, model_cfg, raw_body, bool(data.get("stream", False))
+        request, coordinator, model_cfg, raw_body, bool(data.get("stream", False)), data=data
     )
 
 
@@ -833,7 +957,7 @@ async def count_message_tokens(request: Request) -> Response:  # type: ignore[ty
     model_cfg = _require_llamaserver_model(
         data.get("model"), surface="the Anthropic /v1/messages/count_tokens API"
     )
-    return await _proxy_to_llamaserver(request, coordinator, model_cfg, raw_body, False)
+    return await _proxy_to_llamaserver(request, coordinator, model_cfg, raw_body, False, data=data)
 
 
 @router.post("/embeddings", response_model=None)
@@ -848,7 +972,7 @@ async def create_embeddings(request: Request) -> Response:  # type: ignore[type-
     coordinator = _get_coordinator(request)
     raw_body, data = await _read_json_body(request)
     model_cfg = _require_llamaserver_model(data.get("model"), surface="the /v1/embeddings API")
-    return await _proxy_to_llamaserver(request, coordinator, model_cfg, raw_body, False)
+    return await _proxy_to_llamaserver(request, coordinator, model_cfg, raw_body, False, data=data)
 
 
 @router.post("/infill", response_model=None)
@@ -881,6 +1005,7 @@ async def create_infill(request: Request) -> Response:  # type: ignore[type-arg]
         model_cfg,
         raw_body,
         bool(data.get("stream", False)),
+        data=data,
         upstream_path="/infill",
     )
 
@@ -954,9 +1079,13 @@ async def load_model(body: LoadModelRequest, request: Request) -> LoadModelRespo
         )
     except HTTPException:
         raise
-    except Exception as exc:
+    except ValueError as exc:
+        # H4: model_name absent from the registry with pull-through disabled.
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception:
+        # M12: see create_completion's identical comment.
         logger.exception("Model load failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="Internal server error") from None
 
 
 @router.delete("/models/{model_name}")
@@ -969,9 +1098,10 @@ async def unload_model(
         unloaded_from = await coordinator.unload_model(model_name, worker_id=worker_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except Exception as exc:
+    except Exception:
+        # M12: see create_completion's identical comment.
         logger.exception("Model unload failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="Internal server error") from None
     return {"status": "unloaded", "model_name": model_name, "workers": unloaded_from}
 
 
@@ -987,8 +1117,72 @@ async def list_workers(request: Request) -> List[Dict[str, Any]]:  # type: ignor
 async def add_manual_worker(
     addresses: List[str], request: Request  # type: ignore[type-arg]
 ) -> Dict[str, List[Dict[str, str]]]:
-    """Manually add a worker by its host:port address."""
+    """Manually add a worker by its host:port address.
+
+    C3: a worker registered here self-reports ``loaded_models`` and can be
+    selected by ``find_worker_for_model`` for real routed traffic (prompt
+    exfiltration + poisoned completions), and the address is passed straight
+    to ``grpc.aio.insecure_channel`` / the llamaserver HTTP proxy (SSRF). So
+    this route:
+      1. is disabled unless ``COORDINATOR_ALLOW_MANUAL_WORKER_REGISTRATION``
+         is set — most deployments never need runtime registration
+         (``COORDINATOR_STATIC_WORKERS`` covers the documented setups);
+      2. independently requires a valid ``COORDINATOR_API_KEYS`` credential
+         on THIS request regardless of whether the global
+         ``APIKeyAuthMiddleware`` happens to be a no-op elsewhere (e.g. a
+         dev deployment intentionally left open for everything else);
+      3. shape-validates every address (host:port, optional
+         ``COORDINATOR_MANUAL_WORKER_ALLOWED_HOSTS`` CIDR/host allowlist) and
+         caps the list length, all BEFORE any address is dialed.
+    """
     coordinator = _get_coordinator(request)
+    settings = coordinator.settings
+
+    if not settings.allow_manual_worker_registration:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Manual worker registration is disabled. Set "
+                "COORDINATOR_ALLOW_MANUAL_WORKER_REGISTRATION=true to enable it — see "
+                ".env.example."
+            ),
+        )
+
+    valid_keys = auth.load_api_keys()
+    if not valid_keys:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Manual worker registration requires COORDINATOR_API_KEYS to be "
+                "configured, independent of whether auth is enabled for the rest of "
+                "the API."
+            ),
+        )
+    candidate = auth._extract_candidate_key(request.headers)
+    if candidate is None or not auth._matches_any(candidate, valid_keys):
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": {"message": "invalid or missing API key", "type": "authentication_error"}
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if len(addresses) > _MAX_MANUAL_WORKERS_PER_REQUEST:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"at most {_MAX_MANUAL_WORKERS_PER_REQUEST} addresses per request "
+                f"(got {len(addresses)})"
+            ),
+        )
+
+    for address in addresses:
+        try:
+            _validate_manual_worker_address(address, settings.manual_worker_allowed_hosts)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     results: List[Dict[str, str]] = []
     for address in addresses:
         worker = await coordinator._connect_worker(address)
