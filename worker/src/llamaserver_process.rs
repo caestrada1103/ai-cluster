@@ -22,8 +22,9 @@ use tracing::{debug, info, warn};
 use crate::error::WorkerError;
 use crate::model_loader::parse_cache_type;
 
-/// `--parallel` value when the `llamaserver.parallel` metadata key is omitted.
-const DEFAULT_PARALLEL: u32 = 4;
+/// `--parallel` value ("instances") when neither `llamaserver.instances` nor
+/// `llamaserver.parallel` metadata key is set.
+const DEFAULT_PARALLEL: u32 = 1;
 
 /// C2 — flags [`LlamaServerSpec::extra_args`] (metadata key
 /// `llamaserver.extra_args`, coordinator-controlled and, transitively,
@@ -190,12 +191,11 @@ pub struct LlamaServerSpec {
     /// model's own trained context (`n_ctx_train`) is the ceiling AND the
     /// thing actually delivered, never silently shrunk underneath it.
     pub n_ctx: Option<u32>,
-    /// Continuous-batching slots, maps to `--parallel` (metadata key
-    /// `llamaserver.parallel`, default [`DEFAULT_PARALLEL`]). Raising this no
-    /// longer shrinks per-slot context (see `n_ctx` above) — it costs
-    /// `parallel` times the single-slot KV-cache footprint instead, so it
-    /// must stay sized to the available VRAM/unified memory (see the
-    /// per-entry arithmetic in `config/models.toml`).
+    /// Continuous-batching slots ("instances"), maps to `--parallel`
+    /// (metadata key `llamaserver.instances`, alias `llamaserver.parallel`;
+    /// default [`DEFAULT_PARALLEL`]). Costs `parallel` times the single-slot
+    /// KV-cache footprint — `model_loader.rs` reserves and refuses the load
+    /// if it does not fit, rather than raising it for free.
     pub parallel: u32,
     /// Transformer layers to offload to the GPU, maps to `-ngl` (metadata key
     /// `n_gpu_layers`; same key/semantics as the in-process `llamacpp`
@@ -386,10 +386,25 @@ pub fn llamaserver_spec_from_metadata(
         WorkerError::Configuration(format!("invalid llamaserver.port '{port_str}': {e}"))
     })?;
 
-    let parallel = match metadata.get("llamaserver.parallel") {
-        Some(v) => v.parse::<u32>().map_err(|e| {
-            WorkerError::Configuration(format!("invalid llamaserver.parallel '{v}': {e}"))
-        })?,
+    // `instances` is the canonical name (capacity setting); `parallel` is
+    // kept as an alias — the existing wire/argv name — so neither side of
+    // the gRPC contract has to change to adopt it.
+    let (parallel_key, parallel_raw) = match metadata.get("llamaserver.instances") {
+        Some(v) => ("llamaserver.instances", Some(v)),
+        None => ("llamaserver.parallel", metadata.get("llamaserver.parallel")),
+    };
+    let parallel = match parallel_raw {
+        Some(v) => {
+            let n = v.parse::<u32>().map_err(|e| {
+                WorkerError::Configuration(format!("invalid {parallel_key} '{v}': {e}"))
+            })?;
+            if n == 0 {
+                return Err(WorkerError::Configuration(format!(
+                    "{parallel_key} must be >= 1 (got 0)"
+                )));
+            }
+            n
+        }
         None => DEFAULT_PARALLEL,
     };
 
@@ -930,6 +945,97 @@ mod tests {
         assert!(llamaserver_spec_from_metadata(Some(&bad_cache), -1).is_err());
     }
 
+    // --- instances: canonical name, alias precedence, and >= 1 -------------
+
+    #[test]
+    fn spec_instances_key_sets_parallel() {
+        let m = meta(&[
+            ("engine", "llamaserver"),
+            ("gguf_repo_id", "x/y"),
+            ("gguf_file", "m.gguf"),
+            ("llamaserver.port", "8080"),
+            ("llamaserver.instances", "6"),
+        ]);
+        let spec = llamaserver_spec_from_metadata(Some(&m), -1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.parallel, 6);
+    }
+
+    #[test]
+    fn spec_instances_key_takes_precedence_over_parallel_alias() {
+        let m = meta(&[
+            ("engine", "llamaserver"),
+            ("gguf_repo_id", "x/y"),
+            ("gguf_file", "m.gguf"),
+            ("llamaserver.port", "8080"),
+            ("llamaserver.instances", "6"),
+            ("llamaserver.parallel", "2"),
+        ]);
+        let spec = llamaserver_spec_from_metadata(Some(&m), -1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.parallel, 6);
+    }
+
+    #[test]
+    fn spec_default_parallel_is_one() {
+        let m = meta(&[
+            ("engine", "llamaserver"),
+            ("gguf_repo_id", "x/y"),
+            ("gguf_file", "m.gguf"),
+            ("llamaserver.port", "8080"),
+        ]);
+        let spec = llamaserver_spec_from_metadata(Some(&m), -1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.parallel, 1);
+        assert_eq!(spec.parallel, DEFAULT_PARALLEL);
+    }
+
+    #[test]
+    fn spec_rejects_zero_instances_or_parallel() {
+        let zero_instances = meta(&[
+            ("engine", "llamaserver"),
+            ("gguf_repo_id", "x/y"),
+            ("gguf_file", "m.gguf"),
+            ("llamaserver.port", "8080"),
+            ("llamaserver.instances", "0"),
+        ]);
+        assert!(llamaserver_spec_from_metadata(Some(&zero_instances), -1).is_err());
+        let zero_parallel = meta(&[
+            ("engine", "llamaserver"),
+            ("gguf_repo_id", "x/y"),
+            ("gguf_file", "m.gguf"),
+            ("llamaserver.port", "8080"),
+            ("llamaserver.parallel", "0"),
+        ]);
+        assert!(llamaserver_spec_from_metadata(Some(&zero_parallel), -1).is_err());
+    }
+
+    // --- isolation hardening: raising instances must never enable /slots ---
+
+    #[test]
+    fn build_args_high_instances_still_respects_disabled_slots_endpoint() {
+        let spec = LlamaServerSpec {
+            repo_id: "x/y".to_string(),
+            file: "m.gguf".to_string(),
+            port: 8080,
+            n_ctx: None,
+            parallel: 64, // a large instances count
+            n_gpu_layers: -1,
+            n_cpu_moe: None,
+            cache_type_k: None,
+            cache_type_v: None,
+            extra_args: vec![],
+        };
+        let args = spec
+            .build_args(Path::new("/m.gguf"), "127.0.0.1", false)
+            .unwrap();
+        assert!(args.iter().any(|a| a == "--no-slots"));
+        assert!(!args.iter().any(|a| a == "--slots"));
+    }
+
     #[test]
     fn spec_rejects_bad_n_gpu_layers_or_n_cpu_moe() {
         let bad_ngl = meta(&[
@@ -1163,7 +1269,7 @@ mod tests {
                 "-ngl",
                 "999",
                 "--parallel",
-                "4",
+                "1",
                 "--no-slots",
             ]
         );
