@@ -5,10 +5,18 @@ Dockerfiles for the coordinator and worker, plus the compose stack at the repo r
 ## Quick Start
 
 ```bash
-cp .env.example .env            # set GRAFANA_ADMIN_PASSWORD (required) and HF_TOKEN
+cp .env.example .env
+# Required in .env — without all three, no worker starts and the coordinator
+# refuses to bind:
+#   GRAFANA_ADMIN_PASSWORD=...
+#   COORDINATOR_API_KEYS=...
+#   COMPOSE_PROFILES=cuda-native   # or nvidia-vulkan / amd-vulkan / intel-vulkan / rocm-native
 docker compose up -d --build
-curl http://localhost:8000/health
+curl -H "Authorization: Bearer $COORDINATOR_API_KEYS" http://localhost:8000/health
 ```
+
+No profile means no worker: the stack assumes no GPU vendor. Pick the one that
+matches your hardware. See docs/deployment.md.
 
 ## Images
 
