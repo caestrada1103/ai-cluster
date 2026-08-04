@@ -216,6 +216,7 @@ async fn async_main(
         llamaserver_bind_host: config.llamaserver_bind_host.clone(),
         // Reuse the worker's single load/inference timeout for /health polling.
         llamaserver_health_timeout_secs: config.request_timeout_secs,
+        max_loaded_models: config.max_loaded_models,
     };
     let model_loader = Arc::new(ModelLoader::new(loader_config, gpu_manager.clone())?);
 
