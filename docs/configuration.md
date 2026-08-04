@@ -88,11 +88,29 @@ Precedence for `worker_id` / `grpc_port` / `metrics_port` / `gpu_ids`:
 | `--log-json` | `LOG_JSON` | off | JSON log output |
 
 Additional env: `RUST_LOG`, `RUST_BACKTRACE`, `HF_TOKEN` (gated model downloads),
-`GPU_VRAM_GB` (VRAM hint when the vendor tool can't report it — code default 8),
-`WORKER_GRPC_AUTH_TOKEN` (shared-secret gRPC auth; wins over
-`worker.toml`'s `grpc_auth_token`), `LLAMASERVER_BINARY_PATH`.
+`GPU_VRAM_GB` (explicit VRAM override, in GB — takes precedence over any
+detected value; unset by default, including in `docker-compose.yml`),
+`GPU_MEMORY_HEADROOM_PERCENT` (default `15`; on unified-memory hardware
+where the vendor "free" figure is unreliable, the available-memory estimate
+is this percent less than total system RAM, held back as headroom for the
+OS/other processes), `WORKER_GRPC_AUTH_TOKEN` (shared-secret gRPC auth; wins
+over `worker.toml`'s `grpc_auth_token`), `WORKER_GRPC_BIND_HOST` /
+`LLAMASERVER_BIND_HOST` (win over `worker.toml`'s `grpc_bind_host` /
+`llamaserver_bind_host`; `docker-compose.yml` sets both to `0.0.0.0` per
+worker service — see [deployment.md](deployment.md)), `LLAMASERVER_BINARY_PATH`.
 Docker replicas also use `GPU_INDEX`, `GRPC_BASE_PORT`, `METRICS_BASE_PORT`
 (entrypoint computes port = base + index).
+
+### Memory detection
+
+Total VRAM comes from the CUDA driver (`cuMemGetInfo`, via `dlopen`) or a
+vendor tool (`nvidia-smi`) where available. On unified-memory hardware (e.g.
+DGX Spark) the vendor "free" figure counts reclaimable page cache as used
+and can understate available memory by tens of GB, so the *available*
+figure falls back to `GPU_MEMORY_HEADROOM_PERCENT` less than total system
+RAM instead of trusting that number. `GPU_VRAM_GB` overrides total memory
+outright when set, ahead of any detection. See "Hardening notes" below for
+the DGX Spark `nvidia-smi`/NVML failure mode this works around.
 
 ### config/worker.toml (flat — unknown keys are a hard error)
 
@@ -119,11 +137,22 @@ request_timeout_secs = 120
 
 ### llama-server (`engine = "llamaserver"`) knobs
 
+- **`instances`** (`[models.X.llamaserver] instances = N`, default `1`;
+  `parallel` is still accepted as an alias, `instances` wins if both are
+  set) — the number of concurrent conversation slots, mapped to
+  `llama-server`'s `--parallel`. Also settable per request:
+  `POST /v1/models/load {"model_name": "...", "instances": 3}`. Each slot
+  gets the *full* configured `n_ctx` (see below) — raising `instances`
+  multiplies both the `-c` value passed to `llama-server` and the KV +
+  compute memory the worker reserves before spawning it. The worker reads
+  the GGUF header and reserves that memory up front, refusing the load with
+  a resource-exhausted error (rolling back any prior reservation) if it
+  will not fit, rather than spawning `llama-server` and finding out later.
 - **`n_ctx` is per conversation slot, not a raw `-c` passthrough.**
   `llama-server` divides its own `-c` value evenly across `--parallel`
   slots (verified on hardware: `-c 262144` with `--parallel 4` reports
   `n_ctx: 65536, total_slots: 4` via `GET /props`), so the worker computes
-  `-c = n_ctx * parallel` before spawning it, keeping the registry's
+  `-c = n_ctx * instances` before spawning it, keeping the registry's
   `n_ctx` meaning "tokens per slot". `verify_props` cross-checks this
   against the live `/props` response after startup as a diagnostic (warns,
   never fails the load) — this is the mechanism that originally caught the
@@ -145,7 +174,11 @@ request_timeout_secs = 120
   duplicate a typed field above (`-np`/`--parallel`, `-c`/`--ctx-size`,
   `-m`/`--model`, `-ngl`, `-ncmoe`, `-ctk`/`-ctv`) so a conflicting flag
   can't silently override a value already used to size the KV-cache
-  reservation. Unknown flags are rejected outright.
+  reservation. Unknown flags are rejected outright. Reasoning/thinking
+  controls (`-rea`, `--reasoning`, `--reasoning-budget`,
+  `--reasoning-format`) are on the allowlist — a reasoning model otherwise
+  returns an empty `message.content` until it finishes thinking; see
+  [troubleshooting.md](troubleshooting.md).
 
 ## Model registry: config/models.toml
 
