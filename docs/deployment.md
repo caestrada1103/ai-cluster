@@ -104,6 +104,62 @@ only one model resident at a time — loading a new one evicts the
 oldest-loaded first. `0` (the default) is unlimited, for deployments with
 headroom to keep several models warm.
 
+#### Stage 1 build layout
+
+The repo root is a cargo workspace (virtual manifest, `worker` as its only
+member). Stage 1 of `docker/Dockerfile.worker` reproduces that layout inside
+`/build` (root `Cargo.toml`/`Cargo.lock` plus `worker/` and `proto/`) instead
+of flattening `worker/Cargo.toml` to `/build/Cargo.toml` — the latter breaks
+`version.workspace = true`-style inheritance, since there is no workspace root
+above it, and the build fails with `error inheriting 'edition' from workspace
+root manifest`. The build then runs from `/build/worker`, since a virtual
+workspace root rejects `cargo build --features`; output still lands in the
+workspace's shared `/build/target`, which is what the runtime stage copies
+from.
+
+#### Vendor-native RUNTIME_EXTRA_PKGS override
+
+`RUNTIME_EXTRA_PKGS` (Stage 3) defaults to `libvulkan1 mesa-vulkan-drivers
+vulkan-tools`, because Stage 2's `llama-server` is always built with
+`-DGGML_VULKAN=ON` regardless of `BACKEND`, so every variant's binary links
+`libvulkan.so.1`. Both `worker-cuda-native` and `worker-rocm-native` in
+`docker-compose.yml` set this build arg to their own vendor-specific package
+list, which *replaces* the default rather than extending it, so each must
+list the loader itself (`libvulkan1`) too. `mesa-vulkan-drivers` and
+`vulkan-tools` are deliberately left off both vendor-native variants — they
+are software/debug packages the vendor's own stack doesn't need.
+
+On `worker-cuda-native`, `libvulkan1` alone is not enough. The NVIDIA
+Container Toolkit injects the ICD `libGLX_nvidia.so.0` and its EGL
+counterpart, but not their own link-time dependencies: `libX11.so.6` /
+`libXext.so.6` (`libx11-6`, `libxext6`), and the GLVND dispatcher
+`libEGL.so.1` (`libegl1`), without which the ICD's `vk_icdGetInstanceProcAddr`
+never resolves. The loader then reports `Found no drivers!` and enumerates
+zero devices — silently, since an unloadable driver looks the same as none.
+That broke two things at once: `llama-server --list-devices` found nothing,
+and `gpu_manager.rs`, which detects GPUs through the same Vulkan path,
+registered the worker as `CPU Fallback` with 0 GB VRAM. Hence
+`libcublas-13-0 libvulkan1 libx11-6 libxext6 libegl1`, verified by
+`llama-server --list-devices` printing `Vulkan0: NVIDIA GB10` and by the
+worker registering `NVIDIA GB10 (vulkan)` with real VRAM.
+
+`worker-rocm-native` was left at `libvulkan1` only — AMD's Vulkan ICD (RADV,
+Mesa-based) does not share NVIDIA's GLVND/EGL packaging and has no reason to
+need `libx11-6`/`libxext6`/`libegl1`, but this repo has no AMD GPU to verify
+that empirically, and `rocm-native` is unbuildable on this host regardless
+(see below) — left untested rather than guessed.
+
+#### ROCm base image tag
+
+`rocm/dev-ubuntu-24.04:6.2.1` is not a published tag (`docker manifest
+inspect` returns `no such manifest`). The pin in `docker-compose.yml`
+(`worker-rocm-native`), `docker/Dockerfile.worker`'s header comment, and
+`docker/README.md`'s variants table now point at `6.2.2`, the closest
+existing tag, confirmed via `docker manifest inspect`. That tag (like the
+rest of the `rocm/dev-ubuntu-24.04` repository) publishes `linux/amd64` only,
+so `rocm-native` remains unbuildable on aarch64 hosts such as DGX Spark for
+that separate, pre-existing reason.
+
 #### Per-GPU quick start
 
 ```bash

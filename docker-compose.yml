@@ -183,10 +183,13 @@ services:
       dockerfile: docker/Dockerfile.worker
       args:
         BACKEND: rocm
-        BUILDER_IMAGE: rocm/dev-ubuntu-24.04:6.2.1
-        RUNTIME_IMAGE: rocm/dev-ubuntu-24.04:6.2.1
+        # 6.2.1 was never published; 6.2.2 is the nearest tag, and amd64-only.
+        # See docs/deployment.md.
+        BUILDER_IMAGE: rocm/dev-ubuntu-24.04:6.2.2
+        RUNTIME_IMAGE: rocm/dev-ubuntu-24.04:6.2.2
         BUILDER_EXTRA_PKGS: ""
-        RUNTIME_EXTRA_PKGS: ""
+        # Vulkan loader: Stage 2's llama-server always links it.
+        RUNTIME_EXTRA_PKGS: "libvulkan1"
     image: ai-worker-amd:latest
     environment: *worker-common-env
     volumes: *worker-common-volumes
@@ -227,7 +230,9 @@ services:
         BUILDER_IMAGE: nvidia/cuda:13.0.3-devel-ubuntu24.04
         RUNTIME_IMAGE: nvidia/cuda:13.0.3-runtime-ubuntu24.04
         BUILDER_EXTRA_PKGS: ""
-        RUNTIME_EXTRA_PKGS: "libcublas-13-0"
+        # Vulkan loader plus the injected NVIDIA ICD's own link-time deps —
+        # without them the worker sees no GPU. See docs/deployment.md.
+        RUNTIME_EXTRA_PKGS: "libcublas-13-0 libvulkan1 libx11-6 libxext6 libegl1"
     image: ai-worker-nvidia:latest
     environment: *worker-common-env
     volumes: *worker-common-volumes

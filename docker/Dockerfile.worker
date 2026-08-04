@@ -5,13 +5,13 @@
 #   Universal wgpu/Vulkan (default — AMD + NVIDIA + Intel):
 #     docker build -f docker/Dockerfile.worker -t ai-worker:latest .
 #
-#   AMD native ROCm base:
+#   AMD native ROCm base (6.2.2, not 6.2.1 — that tag was never published upstream):
 #     docker build -f docker/Dockerfile.worker -t ai-worker-amd:latest \
 #       --build-arg BACKEND=rocm \
-#       --build-arg BUILDER_IMAGE=rocm/dev-ubuntu-24.04:6.2.1 \
-#       --build-arg RUNTIME_IMAGE=rocm/dev-ubuntu-24.04:6.2.1 \
+#       --build-arg BUILDER_IMAGE=rocm/dev-ubuntu-24.04:6.2.2 \
+#       --build-arg RUNTIME_IMAGE=rocm/dev-ubuntu-24.04:6.2.2 \
 #       --build-arg BUILDER_EXTRA_PKGS="" \
-#       --build-arg RUNTIME_EXTRA_PKGS="" .
+#       --build-arg RUNTIME_EXTRA_PKGS="libvulkan1" .
 #
 #   NVIDIA native CUDA base:
 #     docker build -f docker/Dockerfile.worker -t ai-worker-nvidia:latest \
@@ -19,7 +19,9 @@
 #       --build-arg BUILDER_IMAGE=nvidia/cuda:13.0.3-devel-ubuntu24.04 \
 #       --build-arg RUNTIME_IMAGE=nvidia/cuda:13.0.3-runtime-ubuntu24.04 \
 #       --build-arg BUILDER_EXTRA_PKGS="" \
-#       --build-arg RUNTIME_EXTRA_PKGS="libcublas-13-0" .
+#       --build-arg RUNTIME_EXTRA_PKGS="libcublas-13-0 libvulkan1 libx11-6 libxext6 libegl1" .
+#     The Vulkan loader and the injected NVIDIA ICD's own deps are required:
+#     without them the worker enumerates no GPU. See docs/deployment.md.
 #     CUDA 13.0.3 (not 12.6): 12.6's nvcc predates sm_121 (Grace-Blackwell GB10,
 #     e.g. DGX Spark) support. 13.0.x devel+runtime tags are multi-arch
 #     (linux/amd64 + linux/arm64), so RTX 3080 and DGX Spark share the same tags.
@@ -96,19 +98,20 @@ ENV PATH="${ROCM_PATH}/bin:${CUDA_HOME}/bin:${PATH}" \
 
 WORKDIR /build
 
-# Copy manifest files first so the dependency layer is cached independently
-# Cargo.lock lives at the workspace root, not inside worker/
-COPY worker/Cargo.toml ./Cargo.toml
-COPY Cargo.lock ./Cargo.lock
-COPY worker/build.rs ./
-
-# Proto files are needed by build.rs for tonic code generation
-COPY proto ../proto/
+# Reproduces the cargo workspace layout (not flattened). See docs/deployment.md.
+COPY Cargo.toml Cargo.lock ./
+COPY worker/Cargo.toml worker/
+COPY worker/build.rs worker/
+COPY proto proto/
 
 # Dummy source so cargo can fetch and compile dependencies without real code
-# Note: do NOT create src/lib.rs — Cargo auto-detects it as a lib target and
-# the build would link against a dummy stub.
-RUN mkdir src && echo "fn main() {}" > src/main.rs
+# Note: do NOT create worker/src/lib.rs — Cargo auto-detects it as a lib
+# target and the build would link against a dummy stub.
+RUN mkdir -p worker/src && echo "fn main() {}" > worker/src/main.rs
+
+# cargo build --features is rejected at a virtual workspace root, so build
+# from the member package dir; workspace output still lands in /build/target.
+WORKDIR /build/worker
 
 # Build dependencies (cached layer — only invalidated by Cargo.toml changes)
 RUN cargo build --release --features="${BACKEND}${WORKER_FEATURES:+,${WORKER_FEATURES}}"
