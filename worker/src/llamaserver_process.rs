@@ -113,6 +113,13 @@ const ALLOWED_EXTRA_FLAGS: &[&str] = &[
     // Template engine toggle (not `--chat-template-file`/paths).
     "--jinja",
     "--no-jinja",
+    // Reasoning/thinking controls — enums and numbers only, no path or network
+    // semantics. Required by reasoning models, which otherwise return an empty
+    // `content` until thinking finishes. See docs/configuration.md.
+    "-rea",
+    "--reasoning",
+    "--reasoning-budget",
+    "--reasoning-format",
 ];
 
 /// Reject an `extra_args` token that looks like a CLI flag (starts with `-`)
