@@ -29,12 +29,39 @@ llamacpp_default_n_gpu_layers = -1  # -1 = offload all layers to the GPU (both e
 # and supervises a `llama-server` child per such model; the coordinator proxies
 # agentic HTTP inference (OpenAI/Anthropic tool calling, streaming) to it. The
 # binary is NOT built by cargo — install llama.cpp's `llama-server` on the host.
-# Env LLAMASERVER_BINARY_PATH wins over llamaserver_binary_path. Trusted-LAN
-# only: firewall the llamaserver ports (0.0.0.0 lets the coordinator reach them).
+# Env LLAMASERVER_BINARY_PATH wins over llamaserver_binary_path.
 # llamaserver_binary_path = "llama-server"  # PATH lookup by default; or an absolute path
-# llamaserver_bind_host = "0.0.0.0"         # --host for llama-server (LAN-reachable)
+#
+# llamaserver_bind_host default is now "127.0.0.1" (secure by default — the
+# `/slots` endpoint can leak another job's prompt text, and there is no
+# built-in auth on this port at all). Set explicitly to "0.0.0.0" below ONLY
+# because this file ships for the Docker Compose deployment, where the worker
+# and coordinator are SEPARATE containers on an isolated bridge network — the
+# coordinator can only reach "worker:<port>" if the process inside the
+# container binds a container-reachable interface. That is NOT the same as
+# LAN/Internet exposure: docker-compose.yml no longer publishes the
+# llamaserver ports to the host by default (opt in via
+# COMPOSE_PROFILES=...,expose-llamaserver — see docker-compose.yml). Running
+# the bare binary outside Docker keeps the secure 127.0.0.1 default unless you
+# edit this file.
+llamaserver_bind_host = "0.0.0.0"
+# llamaserver_enable_slots_endpoint = false  # default; leave off unless something needs /slots
 
 # worker_id = "my-worker"        # optional; auto-generated when absent everywhere
+#
+# grpc_bind_host: same reasoning as llamaserver_bind_host above — "0.0.0.0" is
+# required so the coordinator CONTAINER can reach this worker container over
+# the isolated compose network; docker-compose.yml does not publish 50051 to
+# the host by default (opt in the same way as the llamaserver ports). The bare
+# binary's own default (no worker.toml, or a worker.toml that omits this key)
+# stays "127.0.0.1".
+grpc_bind_host = "0.0.0.0"
+# grpc_auth_token wires to env WORKER_GRPC_AUTH_TOKEN (wins over this value)
+# — set it whenever a worker is reachable from more than just its own
+# coordinator container, e.g. a LAN cluster where the coordinator runs on a
+# different host and this port IS published. See docker-compose.yml /
+# .env.example (WORKER_GRPC_AUTH_TOKEN) and docs/deployment.md.
+# grpc_auth_token = "change-me"
 grpc_port = 50051
 metrics_port = 9091
 gpu_ids = [0]
