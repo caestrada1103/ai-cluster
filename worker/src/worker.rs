@@ -100,7 +100,14 @@ impl Drop for ActiveGuard {
 impl Worker for WorkerService {
     type InferStream = Pin<Box<dyn Stream<Item = Result<InferenceResponse, Status>> + Send>>;
 
-    #[instrument(skip(self))]
+    // H6: `skip(self, request)` — the default `#[instrument]` behavior
+    // records every non-skipped argument via `Debug`, and `Request<T>`
+    // derives `Debug` over BOTH its gRPC metadata (headers — including any
+    // future auth header) and its message body (which can carry full user
+    // prompts elsewhere in this file). Recording the whole `Request` at INFO
+    // would put that into every worker log. Only an explicit, reviewed,
+    // non-sensitive field (`model_name`) is recorded instead.
+    #[instrument(skip(self, request), fields(model_name = %request.get_ref().model_name))]
     async fn load_model(
         &self,
         request: Request<LoadModelRequest>,
@@ -207,7 +214,9 @@ impl Worker for WorkerService {
         }
     }
 
-    #[instrument(skip(self))]
+    // H6: see `load_model`'s doc — the prompt text lives in this request's
+    // body, so `request` itself must never be captured by the span.
+    #[instrument(skip(self, request), fields(model_name = %request.get_ref().model_name))]
     async fn infer(
         &self,
         request: Request<InferenceRequest>,
@@ -410,7 +419,9 @@ impl Worker for WorkerService {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    #[instrument(skip(self))]
+    // H6: skip `_request` too — `Empty`'s body carries nothing sensitive,
+    // but the gRPC metadata (headers) on the same `Request` might.
+    #[instrument(skip(self, _request))]
     async fn get_status(&self, _request: Request<Empty>) -> Result<Response<WorkerStatus>, Status> {
         debug!("Status request received - waiting for locks");
 
@@ -467,7 +478,8 @@ impl Worker for WorkerService {
         }))
     }
 
-    #[instrument(skip(self))]
+    // H6: see `load_model`'s doc.
+    #[instrument(skip(self, request), fields(model_name = %request.get_ref().model_name))]
     async fn unload_model(
         &self,
         request: Request<UnloadModelRequest>,
@@ -497,7 +509,8 @@ impl Worker for WorkerService {
         }
     }
 
-    #[instrument(skip(self))]
+    // H6: see `get_status`'s doc.
+    #[instrument(skip(self, _request))]
     async fn health_check(
         &self,
         _request: Request<Empty>,
