@@ -632,7 +632,7 @@ def test_distributed_fields_default_off() -> None:
     assert cfg.distributed_gpu_ids == {}
 
 
-def test_distributed_requires_llamacpp_engine() -> None:
+def test_distributed_rejects_burn_engine() -> None:
     with pytest.raises(ValueError, match="engine"):
         ModelConfig(
             name="bad-distributed-engine",
@@ -647,11 +647,24 @@ def test_distributed_requires_llamacpp_engine() -> None:
             vocab_size=0,
             max_seq_len=8192,
             intermediate_size=0,
-            engine="burn",  # distributed requires llamacpp
+            engine="burn",  # distributed requires llamacpp or llamaserver
             distributed=True,
             distributed_lead="node-1",
             distributed_peers=["node-2"],
         )
+
+
+def test_distributed_allows_llamaserver_engine() -> None:
+    """The DGX Spark tier runs engine='llamaserver'; distributed must accept it."""
+    cfg = ModelConfig(
+        **_llamaserver_kwargs(
+            distributed=True,
+            distributed_lead="gx10-ba73",
+            distributed_peers=["gx10-e670"],
+        )
+    )
+    assert cfg.distributed is True
+    assert cfg.engine == "llamaserver"
 
 
 def test_distributed_requires_lead() -> None:
@@ -717,6 +730,31 @@ def test_grpc_metadata_lead_omits_tensor_split_when_not_given() -> None:
         "gguf_file": "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
         "distributed_role": "lead",
         "rpc_peers": "10.0.0.2:50151",
+    }
+
+
+def test_grpc_metadata_lead_includes_llamaserver_metadata_for_llamaserver_engine() -> None:
+    """A distributed engine='llamaserver' lead still needs llamaserver.port/
+    .parallel — it runs a supervised llama-server, not the in-process engine."""
+    cfg = ModelConfig(
+        **_llamaserver_kwargs(
+            distributed=True,
+            distributed_lead="gx10-ba73",
+            distributed_peers=["gx10-e670"],
+        )
+    )
+    metadata = cfg.grpc_metadata_lead(
+        peer_endpoints=["10.100.88.2:50151"], tensor_split=[0.5, 0.5], instances=1
+    )
+    assert metadata == {
+        "engine": "llamaserver",
+        "gguf_repo_id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
+        "gguf_file": "qwen2.5-7b-instruct-q4_k_m.gguf",
+        "llamaserver.port": "8090",
+        "llamaserver.parallel": "1",
+        "distributed_role": "lead",
+        "rpc_peers": "10.100.88.2:50151",
+        "tensor_split": "0.5,0.5",
     }
 
 
@@ -825,6 +863,43 @@ def test_load_from_dict_parses_distributed_explicit_split() -> None:
     cfg = ModelRegistry.get_model("distributed-explicit-split-gguf")
     assert cfg is not None
     assert cfg.distributed_split == [0.6, 0.4]
+
+
+def test_load_from_dict_parses_distributed_llamaserver_engine() -> None:
+    """The DGX Spark tier's `.distributed` block uses engine='llamaserver',
+    mirroring config/models.toml's Dual-Spark tier once uncommented."""
+    ModelRegistry.load_from_dict(
+        {
+            "models": {
+                "distributed-llamaserver-gguf": {
+                    "family": "qwen",
+                    "parameters": "229B-A10B",
+                    "min_memory_gb": 205,
+                    "engine": "llamaserver",
+                    "gguf": {
+                        "repo_id": "unsloth/MiniMax-M2.7-GGUF",
+                        "file": "UD-Q6_K/MiniMax-M2.7-UD-Q6_K-00001-of-00005.gguf",
+                    },
+                    "llamaserver": {"port": 8087},
+                    "distributed": {
+                        "enabled": True,
+                        "lead": "gx10-ba73",
+                        "peers": ["gx10-e670"],
+                        "split": "auto",
+                        "rpc_port": 50152,
+                        "gpu_ids": {"gx10-ba73": [0], "gx10-e670": [0]},
+                    },
+                }
+            }
+        }
+    )
+    cfg = ModelRegistry.get_model("distributed-llamaserver-gguf")
+    assert cfg is not None
+    assert cfg.engine == "llamaserver"
+    assert cfg.distributed is True
+    assert cfg.distributed_lead == "gx10-ba73"
+    assert cfg.distributed_peers == ["gx10-e670"]
+    assert cfg.distributed_rpc_port == 50152
 
 
 def test_load_from_dict_distributed_absent_by_default() -> None:
