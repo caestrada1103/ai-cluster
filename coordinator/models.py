@@ -191,8 +191,11 @@ class ModelConfig:
                 raise ValueError("local_tensor_split values must all be > 0")
 
         if self.distributed:
-            if self.engine != "llamacpp":
-                raise ValueError("distributed models must use engine='llamacpp'")
+            if self.engine not in ("llamacpp", "llamaserver"):
+                raise ValueError(
+                    "distributed models must use engine='llamacpp' or 'llamaserver' "
+                    f"(got {self.engine!r})"
+                )
             if not self.distributed_lead:
                 raise ValueError("distributed models must set distributed_lead")
             if not self.distributed_peers:
@@ -252,14 +255,23 @@ class ModelConfig:
         return metadata
 
     def grpc_metadata_lead(
-        self, peer_endpoints: List[str], tensor_split: Optional[List[float]]
+        self,
+        peer_endpoints: List[str],
+        tensor_split: Optional[List[float]],
+        instances: Optional[int] = None,
     ) -> Dict[str, str]:
         """Metadata for the LEAD node of a distributed load.
 
         Adds `distributed_role="lead"`, `rpc_peers` (ordered "host:port"
-        list), and `tensor_split` when given, to the base gguf keys.
+        list), and `tensor_split` when given. Base keys come from
+        `_llamaserver_metadata()` for engine=="llamaserver" (the lead still
+        needs `llamaserver.port`/`.parallel` to run its supervised
+        `llama-server`) or `_gguf_metadata()` otherwise.
         """
-        metadata = self._gguf_metadata()
+        if self.engine == "llamaserver":
+            metadata = self._llamaserver_metadata(instances)
+        else:
+            metadata = self._gguf_metadata()
         metadata["distributed_role"] = "lead"
         metadata["rpc_peers"] = ",".join(peer_endpoints)
         if tensor_split is not None:

@@ -11,9 +11,30 @@ import pytest
 from fastapi.testclient import TestClient
 
 from coordinator.main import app
+from coordinator.models import ModelRegistry
 from coordinator.tests.conftest import make_settings
 
 client = TestClient(app)
+
+_DISTRIBUTED_ROUTE_REGISTRY = {
+    "models": {
+        "distributed-route-test": {
+            "family": "qwen",
+            "parameters": "32B",
+            "min_memory_gb": 20,
+            "engine": "llamacpp",
+            "gguf": {
+                "repo_id": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+                "file": "qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+            },
+            "distributed": {
+                "enabled": True,
+                "lead": "lead-1",
+                "peers": ["peer-1"],
+            },
+        }
+    }
+}
 
 
 @pytest.fixture(autouse=True)
@@ -82,3 +103,83 @@ def test_load_model_succeeds_for_registered_model() -> None:
     )
     assert response.status_code == 200
     assert response.json()["status"] == "loaded"
+
+
+# ---------------------------------------------------------------------------
+# Distributed models: dispatch to _load_distributed_model, worker_id must be
+# the configured lead (or omitted)
+# ---------------------------------------------------------------------------
+
+
+def test_load_model_distributed_dispatches_to_load_distributed_model() -> None:
+    ModelRegistry.load_from_dict(_DISTRIBUTED_ROUTE_REGISTRY)
+    settings = make_settings()
+    fake_coordinator = SimpleNamespace(
+        settings=settings,
+        workers={},
+        _load_distributed_model=AsyncMock(return_value=True),
+    )
+    app.state.coordinator = fake_coordinator
+
+    response = client.post("/v1/models/load", json={"model_name": "distributed-route-test"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "loaded"
+    assert body["worker_id"] == "lead-1"
+    fake_coordinator._load_distributed_model.assert_awaited_once()
+
+
+def test_load_model_distributed_rejects_worker_id_other_than_lead() -> None:
+    ModelRegistry.load_from_dict(_DISTRIBUTED_ROUTE_REGISTRY)
+    settings = make_settings()
+    fake_coordinator = SimpleNamespace(
+        settings=settings,
+        workers={},
+        _load_distributed_model=AsyncMock(return_value=True),
+    )
+    app.state.coordinator = fake_coordinator
+
+    response = client.post(
+        "/v1/models/load",
+        json={"model_name": "distributed-route-test", "worker_id": "peer-1"},
+    )
+
+    assert response.status_code == 422
+    assert "distributed" in response.json()["detail"]
+    fake_coordinator._load_distributed_model.assert_not_awaited()
+
+
+def test_load_model_distributed_allows_worker_id_matching_lead() -> None:
+    ModelRegistry.load_from_dict(_DISTRIBUTED_ROUTE_REGISTRY)
+    settings = make_settings()
+    fake_coordinator = SimpleNamespace(
+        settings=settings,
+        workers={},
+        _load_distributed_model=AsyncMock(return_value=True),
+    )
+    app.state.coordinator = fake_coordinator
+
+    response = client.post(
+        "/v1/models/load",
+        json={"model_name": "distributed-route-test", "worker_id": "lead-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "loaded"
+
+
+def test_load_model_distributed_reports_failure() -> None:
+    ModelRegistry.load_from_dict(_DISTRIBUTED_ROUTE_REGISTRY)
+    settings = make_settings()
+    fake_coordinator = SimpleNamespace(
+        settings=settings,
+        workers={},
+        _load_distributed_model=AsyncMock(return_value=False),
+    )
+    app.state.coordinator = fake_coordinator
+
+    response = client.post("/v1/models/load", json={"model_name": "distributed-route-test"})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"

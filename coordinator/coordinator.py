@@ -15,10 +15,37 @@ import coordinator.proto.cluster_pb2_grpc as pb_grpc
 from coordinator import audit
 from coordinator.config import Settings
 from coordinator.discovery import WorkerDiscovery
-from coordinator.models import ModelRegistry, Quantization
+from coordinator.models import ModelConfig, ModelRegistry, Quantization
 from coordinator.monitoring import metrics
 
 logger = logging.getLogger(__name__)
+
+
+def _address_host(address: str) -> str:
+    """Host portion of a 'host:port' or '[ipv6]:port' worker address."""
+    if address.startswith("[") and "]" in address:
+        return address[1 : address.index("]")]
+    return address.rsplit(":", 1)[0] if ":" in address else address
+
+
+def _largest_remainder_split(raw_weights: List[float], decimals: int = 4) -> List[float]:
+    """Normalize `raw_weights` (any positive scale) to sum to exactly 1.0.
+
+    Rounds to `decimals` places via largest-remainder (Hamilton) apportionment
+    of the rounding error, rather than truncation, so the split is
+    deterministic and always sums to 1.0.
+    """
+    total = sum(raw_weights)
+    if total <= 0:
+        raise ValueError("cannot derive a tensor split: total GPU memory is zero")
+    scale = 10**decimals
+    shares = [w / total * scale for w in raw_weights]
+    floors = [int(s) for s in shares]
+    remainder = scale - sum(floors)
+    order = sorted(range(len(shares)), key=lambda i: shares[i] - floors[i], reverse=True)
+    for i in order[:remainder]:
+        floors[i] += 1
+    return [f / scale for f in floors]
 
 
 class WorkerState(Enum):
@@ -458,11 +485,24 @@ class ClusterCoordinator:
             if worker is not None:
                 return worker
 
-            target = await self._pick_autoload_worker(model_name, session_id)
-            if target is None:
-                raise RuntimeError(f"No healthy worker available to auto-load model '{model_name}'")
+            model_config = ModelRegistry.get_model(model_name)
+            if model_config is not None and model_config.distributed:
+                # A distributed model only ever serves from its lead; loading
+                # it means loading the whole peers-then-lead set.
+                loaded = await self._load_distributed_model(model_config, caller=caller)
+                target = self.workers.get(model_config.distributed_lead or "")
+                if target is None:
+                    raise RuntimeError(
+                        f"distributed model '{model_name}' lead worker vanished mid-load"
+                    )
+            else:
+                target = await self._pick_autoload_worker(model_name, session_id)
+                if target is None:
+                    raise RuntimeError(
+                        f"No healthy worker available to auto-load model '{model_name}'"
+                    )
+                loaded = await self._load_model_on_worker(target, model_name, caller=caller)
 
-            loaded = await self._load_model_on_worker(target, model_name, caller=caller)
             if not loaded:
                 audit.record(
                     audit.ACTION_MODEL_AUTOLOAD,
@@ -509,7 +549,13 @@ class ClusterCoordinator:
         try:
             # Check if model needs to be loaded
             if ctx.model_name not in worker.loaded_models:
-                success = await self._load_model_on_worker(worker, ctx.model_name)
+                model_config = ModelRegistry.get_model(ctx.model_name)
+                if model_config is not None and model_config.distributed:
+                    # submit_request() already pinned ctx/worker to the lead;
+                    # loading it means loading the whole distributed set.
+                    success = await self._load_distributed_model(model_config)
+                else:
+                    success = await self._load_model_on_worker(worker, ctx.model_name)
                 if not success:
                     raise RuntimeError(f"Failed to load model {ctx.model_name}")
 
@@ -627,18 +673,8 @@ class ClusterCoordinator:
         try:
             if model_config:
                 # Use strict registry configuration if known
-                config_pb = pb.ModelConfig(
-                    architecture=model_config.family.value,
-                    num_layers=model_config.num_layers,
-                    hidden_size=model_config.hidden_size,
-                    num_attention_heads=model_config.num_attention_heads,
-                    num_kv_heads=model_config.num_kv_heads or 0,
-                    vocab_size=model_config.vocab_size,
-                    max_position_embeddings=model_config.max_seq_len,
-                    intermediate_size=model_config.intermediate_size,
-                    # Engine routing (empty for burn models): the worker reads
-                    # these string keys to select the llama.cpp GGUF path.
-                    metadata=model_config.grpc_metadata(instances=instances),
+                config_pb = self._build_config_pb(
+                    model_config, model_config.grpc_metadata(instances=instances)
                 )
                 if model_config.local_gpu_ids is not None:
                     # Level 1 — local multi-GPU split: send the exact GPU ids
@@ -668,48 +704,247 @@ class ClusterCoordinator:
             # model_path carries the resolved HF repo id; empty means
             # "model_name is already a repo id — download it directly".
             hf_repo_id = model_config.hf_repo_id if model_config else None
-            request = pb.LoadModelRequest(
-                model_name=model_name,
-                model_path=hf_repo_id or "",
-                config=config_pb,
-                gpu_ids=gpu_ids,
-                quantization=getattr(pb, quantization.value.upper()),
-                parallelism=pb.ParallelismStrategy.AUTO,
+            return await self._send_load_model(
+                worker, model_name, config_pb, gpu_ids, hf_repo_id, quantization, caller
             )
-
-            # Deadline covers the worker's GGUF download, not just the load —
-            # see Settings.model_load_timeout for the sizing rationale.
-            response = await worker.stub.LoadModel(
-                request, timeout=self.settings.model_load_timeout
-            )
-
-            if response.success:
-                logger.info(
-                    f"Loaded {model_name} on worker {worker.id}, "
-                    f"using {response.memory_used / 1e9:.2f}GB VRAM"
-                )
-                # Refresh state synchronously instead of waiting on the
-                # periodic health-check loop, so callers see it immediately.
-                before = set(worker.loaded_models)
-                await self._refresh_worker_state(worker)
-                # The worker may have evicted another model on its own to fit
-                # this one — the only place that eviction is observable.
-                for evicted in before - set(worker.loaded_models):
-                    audit.record(
-                        audit.ACTION_MODEL_EVICTED,
-                        caller=caller or "unknown",
-                        outcome=audit.OUTCOME_SUCCESS,
-                        model=evicted,
-                        worker=worker.id,
-                    )
-                return True
-            else:
-                logger.error(f"Failed to load model: {response.message}")
-                return False
-
         except Exception as e:
             logger.exception(f"Error loading model on worker {worker.id}: {e}")
             return False
+
+    def _build_config_pb(
+        self, model_config: ModelConfig, metadata: Dict[str, str]
+    ) -> "pb.ModelConfig":
+        """Static architecture fields + engine-routing `metadata` for one LoadModelRequest."""
+        return pb.ModelConfig(
+            architecture=model_config.family.value,
+            num_layers=model_config.num_layers,
+            hidden_size=model_config.hidden_size,
+            num_attention_heads=model_config.num_attention_heads,
+            num_kv_heads=model_config.num_kv_heads or 0,
+            vocab_size=model_config.vocab_size,
+            max_position_embeddings=model_config.max_seq_len,
+            intermediate_size=model_config.intermediate_size,
+            metadata=metadata,
+        )
+
+    async def _handle_load_response(
+        self,
+        response: "pb.LoadModelResponse",
+        worker: WorkerInfo,
+        model_name: str,
+        caller: Optional[str],
+    ) -> bool:
+        """Shared LoadModel response handling: log, refresh state, audit any eviction."""
+        if not response.success:
+            logger.error(f"Failed to load model: {response.message}")
+            return False
+
+        logger.info(
+            f"Loaded {model_name} on worker {worker.id}, "
+            f"using {response.memory_used / 1e9:.2f}GB VRAM"
+        )
+        # Refresh state synchronously instead of waiting on the periodic
+        # health-check loop, so callers see it immediately.
+        before = set(worker.loaded_models)
+        await self._refresh_worker_state(worker)
+        # The worker may have evicted another model on its own to fit this
+        # one — the only place that eviction is observable.
+        for evicted in before - set(worker.loaded_models):
+            audit.record(
+                audit.ACTION_MODEL_EVICTED,
+                caller=caller or "unknown",
+                outcome=audit.OUTCOME_SUCCESS,
+                model=evicted,
+                worker=worker.id,
+            )
+        return True
+
+    async def _send_load_model(
+        self,
+        worker: WorkerInfo,
+        model_name: str,
+        config_pb: "pb.ModelConfig",
+        gpu_ids: List[int],
+        hf_repo_id: Optional[str],
+        quantization: Quantization,
+        caller: Optional[str],
+    ) -> bool:
+        """Send one LoadModelRequest and handle the response. Shared by the
+        single-worker path and the distributed peer/lead load path, which
+        build role-specific metadata (grpc_metadata_lead/grpc_metadata_rpc_server)."""
+        request = pb.LoadModelRequest(
+            model_name=model_name,
+            model_path=hf_repo_id or "",
+            config=config_pb,
+            gpu_ids=gpu_ids,
+            quantization=getattr(pb, quantization.value.upper()),
+            parallelism=pb.ParallelismStrategy.AUTO,
+        )
+        # Deadline covers the worker's GGUF download, not just the load — see
+        # Settings.model_load_timeout for the sizing rationale.
+        response = await worker.stub.LoadModel(request, timeout=self.settings.model_load_timeout)
+        return await self._handle_load_response(response, worker, model_name, caller)
+
+    async def _resolve_distributed_workers(
+        self, model_config: ModelConfig
+    ) -> "tuple[WorkerInfo, List[tuple[str, WorkerInfo]]]":
+        """Resolve `distributed_lead`/`distributed_peers` worker_ids to registered,
+        healthy `WorkerInfo`. Raises `ValueError` naming every missing or
+        unhealthy worker_id — a distributed load never partially targets ghosts."""
+        lead_id = model_config.distributed_lead
+        if not lead_id:
+            raise ValueError(f"distributed model '{model_config.name}' has no configured lead")
+
+        async with self._workers_lock:
+            lead = self.workers.get(lead_id)
+            peer_pairs = [(pid, self.workers.get(pid)) for pid in model_config.distributed_peers]
+
+        missing = [lead_id] if lead is None else []
+        missing += [pid for pid, w in peer_pairs if w is None]
+        if missing:
+            raise ValueError(
+                f"distributed model '{model_config.name}' references unregistered "
+                f"worker(s): {', '.join(missing)}"
+            )
+
+        assert lead is not None  # narrowed by the `missing` check above
+        peers: List[tuple[str, WorkerInfo]] = [(pid, w) for pid, w in peer_pairs if w is not None]
+
+        unhealthy = [w.id for w in [lead, *(w for _, w in peers)] if w.state != WorkerState.HEALTHY]
+        if unhealthy:
+            raise ValueError(
+                f"distributed model '{model_config.name}': worker(s) not healthy: "
+                f"{', '.join(unhealthy)}"
+            )
+        return lead, peers
+
+    def _resolve_node_gpu_ids(
+        self, worker: WorkerInfo, model_config: ModelConfig, worker_id: str
+    ) -> List[int]:
+        """GPU ids `worker_id` contributes to a distributed load: the registry's
+        explicit `distributed_gpu_ids[worker_id]` when set, else every GPU the
+        worker currently reports."""
+        explicit = model_config.distributed_gpu_ids.get(worker_id)
+        if explicit is not None:
+            return list(explicit)
+        return [g.id for g in worker.gpus]
+
+    def _peer_endpoints(self, worker: WorkerInfo, gpu_ids: List[int], base_port: int) -> List[str]:
+        """'host:port' per GPU this peer lends: port `base_port + i` for the
+        i-th GPU in its own list — matches the peer's own rpc-server bind
+        range (see `ModelConfig.grpc_metadata_rpc_server`)."""
+        host = _address_host(worker.address)
+        return [f"{host}:{base_port + i}" for i in range(len(gpu_ids))]
+
+    def _derive_split_weights(self, nodes: "List[tuple[WorkerInfo, List[int]]]") -> List[float]:
+        """Tensor-split weights proportional to each contributed GPU's total
+        VRAM, flattened in `nodes` order (lead first, then each peer) and
+        GPU-id order within a node — the same layout `grpc_metadata_lead`
+        expects. Largest-remainder normalized to sum to exactly 1.0."""
+        raw: List[float] = []
+        for worker, gpu_ids in nodes:
+            by_id = {g.id: g for g in worker.gpus}
+            for gid in gpu_ids:
+                gpu = by_id.get(gid)
+                if gpu is None:
+                    raise ValueError(f"worker {worker.id} does not report GPU {gid}")
+                raw.append(float(gpu.total_memory))
+        return _largest_remainder_split(raw)
+
+    async def _rollback_distributed_peers(
+        self, model_name: str, loaded_peers: List[WorkerInfo]
+    ) -> None:
+        """Best-effort unload of every peer already loaded before a distributed
+        load aborts. Upstream llama.cpp has no partial-load recovery, so this
+        releases what was reserved rather than leaving it stranded."""
+        for worker in loaded_peers:
+            try:
+                await worker.stub.UnloadModel(
+                    pb.UnloadModelRequest(model_name=model_name), timeout=60
+                )
+                worker.loaded_models.pop(model_name, None)
+                await self._refresh_worker_state(worker)
+            except Exception as e:
+                logger.error(f"Rollback: failed to unload {model_name} from peer {worker.id}: {e}")
+
+    async def _load_distributed_model(
+        self,
+        model_config: ModelConfig,
+        quantization: Quantization = Quantization.NONE,
+        instances: Optional[int] = None,
+        caller: Optional[str] = None,
+    ) -> bool:
+        """Load a `distributed=True` model: every peer first (rpc_server role,
+        lending local GPUs), then the lead (owns the context, dials the peers).
+
+        Peers-before-lead is mandatory — the lead's `--rpc` flag needs live
+        endpoints. One failed peer or a failed lead aborts the whole load and
+        unloads whatever peers already succeeded; upstream llama.cpp has no
+        partial-load recovery, so pretending otherwise here would just hide
+        the failure until the first inference request.
+        """
+        lead, peers = await self._resolve_distributed_workers(model_config)
+
+        lead_gpu_ids = self._resolve_node_gpu_ids(
+            lead, model_config, model_config.distributed_lead or ""
+        )
+        peer_gpu_ids = {pid: self._resolve_node_gpu_ids(w, model_config, pid) for pid, w in peers}
+
+        # Step A — peers first.
+        loaded_peers: List[WorkerInfo] = []
+        for pid, worker in peers:
+            metadata = model_config.grpc_metadata_rpc_server(model_config.distributed_rpc_port)
+            config_pb = self._build_config_pb(model_config, metadata)
+            ok = await self._send_load_model(
+                worker,
+                model_config.name,
+                config_pb,
+                peer_gpu_ids[pid],
+                model_config.hf_repo_id,
+                quantization,
+                caller,
+            )
+            if not ok:
+                logger.error(
+                    f"Distributed load of '{model_config.name}' aborted: peer {worker.id} failed"
+                )
+                await self._rollback_distributed_peers(model_config.name, loaded_peers)
+                return False
+            loaded_peers.append(worker)
+
+        # Step B — GPU-granular tensor split: explicit config wins, else derive
+        # from reported VRAM (lead's own GPUs first, then each peer's, in order).
+        if model_config.distributed_split is not None:
+            split = model_config.distributed_split
+        else:
+            nodes = [(lead, lead_gpu_ids)] + [(w, peer_gpu_ids[pid]) for pid, w in peers]
+            split = self._derive_split_weights(nodes)
+
+        peer_endpoints: List[str] = []
+        for pid, worker in peers:
+            peer_endpoints.extend(
+                self._peer_endpoints(worker, peer_gpu_ids[pid], model_config.distributed_rpc_port)
+            )
+
+        # Step C — the lead.
+        lead_metadata = model_config.grpc_metadata_lead(peer_endpoints, split, instances=instances)
+        lead_config_pb = self._build_config_pb(model_config, lead_metadata)
+        ok = await self._send_load_model(
+            lead,
+            model_config.name,
+            lead_config_pb,
+            lead_gpu_ids,
+            model_config.hf_repo_id,
+            quantization,
+            caller,
+        )
+        if not ok:
+            logger.error(
+                f"Distributed load of '{model_config.name}' aborted: lead {lead.id} failed"
+            )
+            await self._rollback_distributed_peers(model_config.name, loaded_peers)
+            return False
+        return True
 
     async def unload_model(self, model_name: str, worker_id: Optional[str] = None) -> List[str]:
         """Unload a model from one worker (worker_id given) or every worker holding it.
@@ -726,6 +961,13 @@ class ClusterCoordinator:
 
         if not targets:
             raise KeyError(f"Model {model_name} is not loaded on any matching worker")
+
+        # Distributed models: unload the lead before its peers — the reverse
+        # of load order, since the lead depends on every peer while serving.
+        model_config = ModelRegistry.get_model(model_name)
+        if model_config is not None and model_config.distributed:
+            lead_id = model_config.distributed_lead
+            targets.sort(key=lambda w: 0 if w.id == lead_id else 1)
 
         unloaded_from: List[str] = []
         for worker in targets:
@@ -748,13 +990,20 @@ class ClusterCoordinator:
     async def submit_request(self, model_name: str, prompt: str, **kwargs: Any) -> RequestContext:
         """Create a request context and enqueue it. Returns immediately (streaming path)."""
         request_id = str(uuid.uuid4())
+        target_worker_id = kwargs.get("worker_id")
+        if target_worker_id is None:
+            # A distributed model only ever serves from its lead — it owns
+            # the real context and dials the peers, which hold no model.
+            model_config = ModelRegistry.get_model(model_name)
+            if model_config is not None and model_config.distributed:
+                target_worker_id = model_config.distributed_lead
         ctx = RequestContext(
             id=request_id,
             model_name=model_name,
             prompt=prompt,
             params=kwargs,
             created_at=time.time(),
-            target_worker_id=kwargs.get("worker_id"),
+            target_worker_id=target_worker_id,
         )
 
         self.active_requests[request_id] = ctx
