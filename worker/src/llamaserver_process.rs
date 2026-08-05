@@ -179,6 +179,17 @@ pub struct LlamaServerSpec {
     /// Extra `llama-server` flags appended verbatim (metadata key
     /// `llamaserver.extra_args`, whitespace-split).
     pub extra_args: Vec<String>,
+    /// Cross-node ggml-RPC peers to dial, maps to `--rpc host:port,...`.
+    /// Set only for `distributed_role = "lead"` models — populated by the
+    /// loader from `DistributedSpec::rpc_peers`, never from
+    /// `llamaserver.extra_args` (a network target is a typed field, not a
+    /// free-form flag). Empty omits `--rpc`.
+    pub rpc_peers: Vec<String>,
+    /// Per-GPU VRAM weighting for `--tensor-split`, index-aligned with this
+    /// node's `gpu_ids` followed by each peer's lent GPUs. `None` lets
+    /// llama.cpp distribute by live available memory. See
+    /// `DistributedSpec::tensor_split`.
+    pub tensor_split: Option<Vec<f32>>,
 }
 
 impl LlamaServerSpec {
@@ -236,6 +247,21 @@ impl LlamaServerSpec {
         if let Some(n) = self.n_cpu_moe {
             args.push("--n-cpu-moe".to_string());
             args.push(n.to_string());
+        }
+        // Cross-node ggml-RPC: dial peers first, then optionally bias the split.
+        if !self.rpc_peers.is_empty() {
+            args.push("--rpc".to_string());
+            args.push(self.rpc_peers.join(","));
+        }
+        if let Some(split) = &self.tensor_split {
+            args.push("--tensor-split".to_string());
+            args.push(
+                split
+                    .iter()
+                    .map(f32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
         }
         args.push("--parallel".to_string());
         args.push(self.parallel.to_string());
@@ -371,6 +397,10 @@ pub fn llamaserver_spec_from_metadata(
         cache_type_k,
         cache_type_v,
         extra_args,
+        // Filled in by the loader from DistributedSpec for a `lead` model —
+        // this parser only sees the `llamaserver.*`/`gguf.*` metadata keys.
+        rpc_peers: Vec::new(),
+        tensor_split: None,
     }))
 }
 
@@ -915,6 +945,8 @@ mod tests {
             cache_type_k: None,
             cache_type_v: None,
             extra_args: vec![],
+            rpc_peers: vec![],
+            tensor_split: None,
         };
         let args = spec
             .build_args(Path::new("/m.gguf"), "127.0.0.1", false)
@@ -958,6 +990,8 @@ mod tests {
             cache_type_k: None,
             cache_type_v: None,
             extra_args: vec![],
+            rpc_peers: vec![],
+            tensor_split: None,
         };
         // Matches the hardware-verified qwen3.6-35b-a3b-gguf sizing: 262144
         // per slot x 4 slots = 1048576 total -c.
@@ -977,6 +1011,8 @@ mod tests {
             cache_type_k: None,
             cache_type_v: None,
             extra_args: vec![],
+            rpc_peers: vec![],
+            tensor_split: None,
         };
         assert_eq!(spec.total_ctx().unwrap(), None);
     }
@@ -994,6 +1030,8 @@ mod tests {
             cache_type_k: None,
             cache_type_v: None,
             extra_args: vec![],
+            rpc_peers: vec![],
+            tensor_split: None,
         };
         assert!(spec.total_ctx().is_err());
     }
@@ -1013,6 +1051,8 @@ mod tests {
             cache_type_k: Some("q8_0".to_string()),
             cache_type_v: Some("q4_0".to_string()),
             extra_args: vec!["--flash-attn".to_string(), "--mlock".to_string()],
+            rpc_peers: vec![],
+            tensor_split: None,
         };
         let args = spec
             .build_args(Path::new("/models/m.gguf"), "0.0.0.0", false)
@@ -1059,6 +1099,8 @@ mod tests {
             cache_type_k: None,
             cache_type_v: None,
             extra_args: vec![],
+            rpc_peers: vec![],
+            tensor_split: None,
         };
         let args = spec
             .build_args(Path::new("/m.gguf"), "127.0.0.1", true)
@@ -1082,6 +1124,8 @@ mod tests {
             cache_type_k: None,
             cache_type_v: None,
             extra_args: vec!["--path".to_string(), "/etc".to_string()],
+            rpc_peers: vec![],
+            tensor_split: None,
         };
         let err = spec
             .build_args(Path::new("/m.gguf"), "127.0.0.1", false)
@@ -1102,6 +1146,8 @@ mod tests {
             cache_type_k: None,
             cache_type_v: None,
             extra_args: vec![],
+            rpc_peers: vec![],
+            tensor_split: None,
         };
         let args = spec
             .build_args(Path::new("/m.gguf"), "0.0.0.0", false)
@@ -1139,6 +1185,8 @@ mod tests {
             cache_type_k: None,
             cache_type_v: None,
             extra_args: vec![],
+            rpc_peers: vec![],
+            tensor_split: None,
         };
         let args = spec
             .build_args(Path::new("/m.gguf"), "127.0.0.1", false)
@@ -1160,6 +1208,91 @@ mod tests {
                 "--no-slots",
             ]
         );
+    }
+
+    #[test]
+    fn build_args_lead_role_emits_rpc_and_tensor_split() {
+        let spec = LlamaServerSpec {
+            repo_id: "x/y".to_string(),
+            file: "m.gguf".to_string(),
+            port: 8080,
+            n_ctx: None,
+            parallel: DEFAULT_PARALLEL,
+            n_gpu_layers: -1,
+            n_cpu_moe: None,
+            cache_type_k: None,
+            cache_type_v: None,
+            extra_args: vec![],
+            rpc_peers: vec!["10.100.88.2:50052".to_string()],
+            tensor_split: Some(vec![0.45, 0.55]),
+        };
+        let args = spec
+            .build_args(Path::new("/m.gguf"), "127.0.0.1", false)
+            .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "-m",
+                "/m.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8080",
+                "-ngl",
+                "999",
+                "--rpc",
+                "10.100.88.2:50052",
+                "--tensor-split",
+                "0.45,0.55",
+                "--parallel",
+                "1",
+                "--no-slots",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_args_no_rpc_peers_omits_rpc_and_tensor_split_flags() {
+        // Single-node models (the common case) must never see --rpc/--tensor-split.
+        let spec = LlamaServerSpec {
+            repo_id: "x/y".to_string(),
+            file: "m.gguf".to_string(),
+            port: 8080,
+            n_ctx: None,
+            parallel: DEFAULT_PARALLEL,
+            n_gpu_layers: -1,
+            n_cpu_moe: None,
+            cache_type_k: None,
+            cache_type_v: None,
+            extra_args: vec![],
+            rpc_peers: vec![],
+            tensor_split: None,
+        };
+        let args = spec
+            .build_args(Path::new("/m.gguf"), "127.0.0.1", false)
+            .unwrap();
+        assert!(!args.iter().any(|a| a == "--rpc"));
+        assert!(!args.iter().any(|a| a == "--tensor-split"));
+    }
+
+    #[test]
+    fn spec_parser_never_populates_rpc_fields_from_metadata() {
+        // rpc_peers/tensor_split come only from DistributedSpec, merged in by
+        // the loader — --rpc must never be reachable via llamaserver.extra_args
+        // or any other llamaserver.* metadata key.
+        let m = meta(&[
+            ("engine", "llamaserver"),
+            ("gguf_repo_id", "x/y"),
+            ("gguf_file", "m.gguf"),
+            ("llamaserver.port", "8080"),
+            ("rpc_peers", "10.0.0.2:50052"),
+            ("tensor_split", "0.5,0.5"),
+        ]);
+        let spec = llamaserver_spec_from_metadata(Some(&m), -1)
+            .unwrap()
+            .unwrap();
+        assert!(spec.rpc_peers.is_empty());
+        assert_eq!(spec.tensor_split, None);
     }
 
     // --- supervision (no real llama-server binary / GPU) -------------------
