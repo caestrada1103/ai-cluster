@@ -32,7 +32,7 @@ matches your hardware. See docs/deployment.md.
 |---|---|---|---|
 | Universal (default) | `docker build -f docker/Dockerfile.worker .` | `wgpu` (Vulkan) | ubuntu:24.04 |
 | AMD native | `--build-arg BACKEND=rocm --build-arg BUILDER_IMAGE=rocm/dev-ubuntu-24.04:6.2.2 --build-arg RUNTIME_IMAGE=rocm/dev-ubuntu-24.04:6.2.2 --build-arg BUILDER_EXTRA_PKGS="" --build-arg RUNTIME_EXTRA_PKGS="libvulkan1"` | `rocm` | rocm/dev-ubuntu-24.04 (amd64 only; 6.2.1 was never published) |
-| NVIDIA native | `--build-arg BACKEND=cuda --build-arg BUILDER_IMAGE=nvidia/cuda:13.0.3-devel-ubuntu24.04 --build-arg RUNTIME_IMAGE=nvidia/cuda:13.0.3-runtime-ubuntu24.04 --build-arg BUILDER_EXTRA_PKGS="" --build-arg RUNTIME_EXTRA_PKGS="libcublas-13-0 libvulkan1 libx11-6 libxext6 libegl1"` | `cuda` | nvidia/cuda 13.0.3 |
+| NVIDIA native | `--build-arg BACKEND=cuda --build-arg BUILDER_IMAGE=nvidia/cuda:13.0.3-devel-ubuntu24.04 --build-arg RUNTIME_IMAGE=nvidia/cuda:13.0.3-runtime-ubuntu24.04 --build-arg BUILDER_EXTRA_PKGS="" --build-arg RUNTIME_EXTRA_PKGS="libcublas-13-0 libvulkan1 libx11-6 libxext6 libegl1" --build-arg LLAMASERVER_BACKEND=cuda` | `cuda` | nvidia/cuda 13.0.3 |
 
 There is no `GPU_BACKEND` arg and no `hip` feature — the arg is `BACKEND`
 and the AMD feature is `rocm`.
@@ -48,11 +48,13 @@ and the AMD feature is `rocm`.
 > manifests. Note the runtime package name tracks the version:
 > `libcublas-13-0`, not `libcublas-12-6`.
 
-All three variants also bake in a `llama-server` binary (Vulkan, from a pinned
+All three variants also bake in a `llama-server` binary (from a pinned
 llama.cpp tag via `--build-arg LLAMASERVER_TAG=`) at `/usr/local/bin/llama-server`
 with `LLAMASERVER_BINARY_PATH` preset, for `engine = "llamaserver"` agentic
-models. Opt out (skip the llama.cpp compile) with
-`--build-arg LLAMASERVER_SRC=llamaserver-none`. See
+models. Its GGML backend is `--build-arg LLAMASERVER_BACKEND=` — default
+`vulkan` (portable); `cuda` on an NVIDIA `BUILDER_IMAGE` for CUDA offload
+instead (the NVIDIA native row above sets this). Opt out of the compile
+entirely with `--build-arg LLAMASERVER_SRC=llamaserver-none`. See
 docs/deployment.md "llama-server for agentic serving".
 
 > That stage needs **Node 20+** (copied in from `node:22-bookworm-slim`).
@@ -63,9 +65,9 @@ docs/deployment.md "llama-server for agentic serving".
 
 ## GPU passthrough
 
-- **AMD**: `devices: [/dev/kfd, /dev/dri]` + `group_add: [video, render]` (see the active worker service).
-- **NVIDIA**: NVIDIA Container Toolkit + `deploy.resources.reservations.devices` (see the commented block).
-- **Intel**: default image works via Mesa ANV.
+- **AMD**: `devices: [/dev/kfd, /dev/dri]` + `group_add: [video, render]` (see `worker-amd-vulkan`/`worker-rocm-native`).
+- **NVIDIA**: NVIDIA Container Toolkit + `deploy.resources.reservations.devices` (see `worker-nvidia-vulkan`/`worker-cuda-native`).
+- **Intel**: default image works via Mesa ANV (see `worker-intel-vulkan`).
 
 ## Environment variables
 

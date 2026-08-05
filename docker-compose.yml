@@ -233,6 +233,8 @@ services:
         # Vulkan loader plus the injected NVIDIA ICD's own link-time deps —
         # without them the worker sees no GPU. See docs/deployment.md.
         RUNTIME_EXTRA_PKGS: "libcublas-13-0 libvulkan1 libx11-6 libxext6 libegl1"
+        # Bundled llama-server offloads via CUDA here instead of Vulkan.
+        LLAMASERVER_BACKEND: cuda
     image: ai-worker-nvidia:latest
     environment: *worker-common-env
     volumes: *worker-common-volumes
