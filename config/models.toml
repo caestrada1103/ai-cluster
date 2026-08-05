@@ -240,7 +240,7 @@ parallel = 4  # sizing math: docs/configuration.md
 
 # [models."minimax-m2.7-gguf"]
 # family = "llama"  # no MINIMAX ModelFamily member yet; load_from_dict falls back with a warning
-# description = "MiniMax-M2.7 — MoE (229B total / 10B active), 204800 native ctx. 57.0% Terminal-Bench 2.0, the closest open-weight score to Sonnet 4.6's 59.1%. Non-commercial license. Source: https://huggingface.co/unsloth/MiniMax-M2.7-GGUF"
+# description = "MiniMax-M2.7 — MoE (229B total / 10B active), 196608 ctx. 57.0% Terminal-Bench 2.0 (vendor, unverified). Non-commercial license. Source: https://huggingface.co/unsloth/MiniMax-M2.7-GGUF"
 # parameters = "229B-A10B"
 # min_memory_gb = 205  # 175.1 GiB weights + ~28 GB KV at one slot
 # recommended_gpus = 2
@@ -248,11 +248,11 @@ parallel = 4  # sizing math: docs/configuration.md
 # engine = "llamaserver"
 #
 # [models."minimax-m2.7-gguf".gguf]
-# # UD-Q6_K verified 2026-08-04: 5 shards, 175.1 GiB total. Nothing at 4-bit or
-# # above fits a single Spark (UD-IQ4_XS is 101 GiB, leaving no KV headroom).
+# # UD-Q6_K: 5 shards, 175.1 GiB. Nothing at 4-bit or above fits a single Spark
+# # (UD-IQ4_XS is 101 GiB, leaving no KV headroom).
 # repo_id = "unsloth/MiniMax-M2.7-GGUF"
 # file = "UD-Q6_K/MiniMax-M2.7-UD-Q6_K-00001-of-00005.gguf"
-# n_ctx = 204800  # full native window; rope_scaling is null upstream
+# n_ctx = 196608  # the GGUF's n_ctx_train; asking for more is capped to this
 # cache_type_k = "q8_0"
 # cache_type_v = "q8_0"
 #
@@ -260,6 +260,17 @@ parallel = 4  # sizing math: docs/configuration.md
 # port = 8087
 # parallel = 1  # full attention on every layer — KV is ~28 GB per slot here
 # extra_args = "--jinja"
+#
+# Do NOT set a tensor split. Letting llama.cpp place layers by live available
+# memory measured best on identical nodes (17/10 GiB free) and adapts to mixed
+# hardware; hand-tuned values were worse or failed to allocate.
+#
+# [models."minimax-m2.7-gguf".distributed]
+# enabled = true
+# lead = "spark-a"
+# peers = ["spark-b"]
+# split = "auto"
+# rpc_port = 50052
 
 # --- DGX Spark tier (enable on arrival) — commented out ------------------
 # Each DGX Spark has 128 GB *unified* CPU+GPU memory (not a discrete VRAM pool
