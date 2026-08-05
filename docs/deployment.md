@@ -120,12 +120,14 @@ from.
 #### Vendor-native RUNTIME_EXTRA_PKGS override
 
 `RUNTIME_EXTRA_PKGS` (Stage 3) defaults to `libvulkan1 mesa-vulkan-drivers
-vulkan-tools`, because Stage 2's `llama-server` is always built with
-`-DGGML_VULKAN=ON` regardless of `BACKEND`, so every variant's binary links
-`libvulkan.so.1`. Both `worker-cuda-native` and `worker-rocm-native` in
-`docker-compose.yml` set this build arg to their own vendor-specific package
-list, which *replaces* the default rather than extending it, so each must
-list the loader itself (`libvulkan1`) too. `mesa-vulkan-drivers` and
+vulkan-tools`, because Stage 2's `llama-server` builds against
+`LLAMASERVER_BACKEND` (default `vulkan`; `cuda` on NVIDIA builder images —
+see section 4 below), and the main `ai-worker` binary's own GPU
+detection (`gpu_manager.rs`) always goes through Vulkan regardless of that
+choice, so every variant still needs the loader. Both `worker-cuda-native`
+and `worker-rocm-native` in `docker-compose.yml` set this build arg to their
+own vendor-specific package list, which *replaces* the default rather than
+extending it, so each must list the loader itself (`libvulkan1`) too. `mesa-vulkan-drivers` and
 `vulkan-tools` are deliberately left off both vendor-native variants — they
 are software/debug packages the vendor's own stack doesn't need.
 
@@ -292,12 +294,21 @@ present, located via worker config `llamaserver_binary_path` (env
 ### Docker (built in)
 
 The worker image bakes it in — nothing to do. `docker/Dockerfile.worker` builds
-only the `llama-server` target from a **pinned** llama.cpp release (Vulkan
-backend, statically linked) into `/usr/local/bin/llama-server` and sets
-`LLAMASERVER_BINARY_PATH`. The default universal image already ships the Vulkan
-loader (`libvulkan1` + `mesa-vulkan-drivers`), so it runs as-is. To build a
-pure-Burn / CPU-only image *without* the (heavy) llama.cpp compile, pass
-`--build-arg LLAMASERVER_SRC=llamaserver-none`.
+only the `llama-server` target from a **pinned** llama.cpp release, statically
+linked, into `/usr/local/bin/llama-server` and sets `LLAMASERVER_BINARY_PATH`.
+
+The GGML backend it's built with is `--build-arg LLAMASERVER_BACKEND=`, default
+`vulkan` (portable — matches the universal wgpu image, and runs as-is since
+that image already ships the Vulkan loader). Pass `LLAMASERVER_BACKEND=cuda`
+when also building against an NVIDIA `BUILDER_IMAGE` (e.g. `worker-cuda-native`
+in `docker-compose.yml`, which sets this by default) so the bundled
+`llama-server` offloads via CUDA instead of Vulkan. This is independent of the
+main `ai-worker` binary's own GPU detection, which always uses Vulkan (see
+"Vendor-native RUNTIME_EXTRA_PKGS override" above) regardless of
+`LLAMASERVER_BACKEND`.
+
+To build a pure-Burn / CPU-only image *without* the (heavy) llama.cpp compile,
+pass `--build-arg LLAMASERVER_SRC=llamaserver-none`.
 
 ### Bare-metal Linux
 
