@@ -17,6 +17,10 @@ metal = ["wgpu", "burn/metal"]  # macOS Metal via wgpu
 llamacpp = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:once_cell"]
 llamacpp-cuda = ["llamacpp", "llama-cpp-2?/cuda"]      # llama.cpp CUDA kernels
 llamacpp-vulkan = ["llamacpp", "llama-cpp-2?/vulkan"]  # llama.cpp Vulkan kernels
+# Cross-node ggml-RPC roles (peer + lead --rpc passthrough). No extra Rust
+# deps — spawns the external `ggml-rpc-server`/`llama-server` binaries, same
+# as the always-on `llamaserver` engine.
+llamacpp-rpc = []
 
 [dependencies]
 # Burn deep learning framework
