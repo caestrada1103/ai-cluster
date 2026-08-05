@@ -25,6 +25,8 @@
 #     CUDA 13.0.3 (not 12.6): 12.6's nvcc predates sm_121 (Grace-Blackwell GB10,
 #     e.g. DGX Spark) support. 13.0.x devel+runtime tags are multi-arch
 #     (linux/amd64 + linux/arm64), so RTX 3080 and DGX Spark share the same tags.
+#     Add --build-arg LLAMASERVER_BACKEND=cuda so the bundled llama-server
+#     also offloads via CUDA instead of Vulkan (see the llama-server note below).
 #
 # GPU passthrough (unchanged conventions):
 #   AMD    → mount /dev/kfd + /dev/dri, group_add: [video, render]
@@ -36,10 +38,12 @@
 # BACKEND=cuda variant there.
 #
 # llama-server (agentic serving, engine="llamaserver"): all variants also bake
-# in a `llama-server` binary (Stage 2), built with the Vulkan backend from a
-# pinned llama.cpp release, for real tool calling that the in-process
-# llama.cpp engine can't do. To skip the (heavy) llama.cpp compile, pass
-# --build-arg LLAMASERVER_SRC=llamaserver-none. See docs/deployment.md.
+# in a `llama-server` binary (Stage 2) from a pinned llama.cpp release, for
+# real tool calling that the in-process llama.cpp engine can't do. Backend
+# defaults to Vulkan (portable); pass --build-arg LLAMASERVER_BACKEND=cuda on
+# an NVIDIA builder image for CUDA offload instead. To skip the (heavy)
+# llama.cpp compile entirely, pass --build-arg LLAMASERVER_SRC=llamaserver-none.
+# See docs/deployment.md.
 #
 # Node.js is required to build Stage 2 (see Stage 2 comments for why
 # -DLLAMA_BUILD_UI=OFF alone doesn't avoid this).
@@ -51,6 +55,13 @@ ARG RUNTIME_IMAGE=ubuntu:24.04
 # well after the mid-March-2026 tool_calls `arguments` bug (issue #20198, fixed in
 # PR #20213). Keep any bump at or beyond that fix.
 ARG LLAMASERVER_TAG=b9941
+
+# GGML backend for the bundled llama-server: "vulkan" (default — portable
+# across AMD/NVIDIA/Intel, matches the universal wgpu image) or "cuda"
+# (NVIDIA only; pair with BUILDER_IMAGE/RUNTIME_IMAGE=nvidia/cuda for the
+# BACKEND=cuda variant). Independent of BACKEND — set both for a CUDA worker
+# whose llama-server also offloads via CUDA instead of Vulkan.
+ARG LLAMASERVER_BACKEND=vulkan
 
 # Selects which stage supplies /llama-server: the real build, or the stub.
 # Must be global — BuildKit rejects `COPY --from=${VAR}` for a stage-scoped ARG.
@@ -144,9 +155,12 @@ FROM ${BUILDER_IMAGE} AS llamaserver-build
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG LLAMASERVER_TAG
+ARG LLAMASERVER_BACKEND
 
 # glslc + spirv-headers compile the Vulkan compute shaders (no GPU needed to
-# build); libvulkan-dev links the loader.
+# build); libvulkan-dev links the loader. Installed unconditionally — small,
+# and harmless on a CUDA builder image; CUDA's own toolchain (nvcc, cuBLAS
+# dev headers) already ships in the nvidia/cuda "devel" base.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
@@ -169,8 +183,14 @@ RUN git clone --depth 1 --branch "${LLAMASERVER_TAG}" \
     https://github.com/ggml-org/llama.cpp.git /opt/llama.cpp
 
 WORKDIR /opt/llama.cpp
-RUN cmake -B build \
-    -DGGML_VULKAN=ON \
+# LLAMASERVER_BACKEND selects the GGML compute backend (see the ARG comment
+# above); anything other than "cuda" falls back to the portable Vulkan build.
+RUN case "${LLAMASERVER_BACKEND}" in \
+      cuda) GGML_BACKEND_FLAG="-DGGML_CUDA=ON" ;; \
+      *)    GGML_BACKEND_FLAG="-DGGML_VULKAN=ON" ;; \
+    esac \
+    && cmake -B build \
+    ${GGML_BACKEND_FLAG} \
     -DLLAMA_BUILD_SERVER=ON \
     -DBUILD_SHARED_LIBS=OFF \
     -DLLAMA_CURL=OFF \
