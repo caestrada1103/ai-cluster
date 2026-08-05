@@ -153,6 +153,20 @@ pub struct ModelLoaderConfig {
     /// Allowed `llamaserver.port` range, inclusive.
     pub llamaserver_port_min: u16,
     pub llamaserver_port_max: u16,
+    /// Whether this node will act as a `distributed_role = "rpc_server"`
+    /// peer at all — an explicit opt-in independent of what the coordinator
+    /// requests. See `WorkerConfig::rpc_server_enabled`.
+    pub rpc_server_enabled: bool,
+    /// Path to the `ggml-rpc-server` binary spawned for the peer role (env
+    /// `RPC_SERVER_BINARY_PATH` wins; default `"ggml-rpc-server"`).
+    pub rpc_server_binary_path: String,
+    /// `-H` bind interface for spawned `ggml-rpc-server` processes.
+    pub rpc_server_bind_host: String,
+    /// Base `-p` port; a peer lending N GPUs uses `[port, port+1, ..., port+N-1]`.
+    pub rpc_server_port: u16,
+    /// Seconds to poll a spawned `ggml-rpc-server`'s TCP port before
+    /// declaring the load failed — reuses the worker's `request_timeout_secs`.
+    pub rpc_server_health_timeout_secs: u64,
 }
 
 impl Default for ModelLoaderConfig {
@@ -174,6 +188,11 @@ impl Default for ModelLoaderConfig {
             llamaserver_enable_slots_endpoint: false,
             llamaserver_port_min: 1024,
             llamaserver_port_max: 65535,
+            rpc_server_enabled: false,
+            rpc_server_binary_path: "ggml-rpc-server".to_string(),
+            rpc_server_bind_host: "127.0.0.1".to_string(),
+            rpc_server_port: 50151,
+            rpc_server_health_timeout_secs: 120,
         }
     }
 }
@@ -223,6 +242,28 @@ pub struct ModelLoader {
     /// Allowed `llamaserver.port` range, inclusive.
     llamaserver_port_min: u16,
     llamaserver_port_max: u16,
+    /// Explicit opt-in for this node to act as an `rpc_server` peer at all.
+    #[allow(dead_code)] // read only when built with --features llamacpp-rpc
+    rpc_server_enabled: bool,
+    /// Path to the `ggml-rpc-server` binary (env/config resolved).
+    #[allow(dead_code)] // read only when built with --features llamacpp-rpc
+    rpc_server_binary_path: String,
+    /// `-H` bind interface for spawned `ggml-rpc-server` processes. Must be a
+    /// specific interconnect address — ggml-RPC has no auth.
+    #[allow(dead_code)] // read only when built with --features llamacpp-rpc
+    rpc_server_bind_host: String,
+    /// Base `-p` port; additional GPUs increment from here.
+    #[allow(dead_code)] // read only when built with --features llamacpp-rpc
+    rpc_server_port: u16,
+    /// TCP-connect poll timeout (seconds) for a spawned `ggml-rpc-server`.
+    #[allow(dead_code)] // read only when built with --features llamacpp-rpc
+    rpc_server_health_timeout_secs: u64,
+    /// Supervised `ggml-rpc-server` children for `distributed_role =
+    /// "rpc_server"` models — one entry per GPU lent, keyed by model name.
+    #[cfg(feature = "llamacpp-rpc")]
+    rpc_peer_processes: Arc<
+        DashMap<String, Vec<Arc<tokio::sync::Mutex<crate::rpc_server_process::RpcServerProcess>>>>,
+    >,
 }
 
 impl ModelLoader {
@@ -272,6 +313,13 @@ impl ModelLoader {
             llamaserver_enable_slots_endpoint: config.llamaserver_enable_slots_endpoint,
             llamaserver_port_min: config.llamaserver_port_min,
             llamaserver_port_max: config.llamaserver_port_max,
+            rpc_server_enabled: config.rpc_server_enabled,
+            rpc_server_binary_path: config.rpc_server_binary_path,
+            rpc_server_bind_host: config.rpc_server_bind_host,
+            rpc_server_port: config.rpc_server_port,
+            rpc_server_health_timeout_secs: config.rpc_server_health_timeout_secs,
+            #[cfg(feature = "llamacpp-rpc")]
+            rpc_peer_processes: Arc::new(DashMap::new()),
         })
     }
 
@@ -370,24 +418,30 @@ impl ModelLoader {
             })?;
 
         // rpc_server peers reserve VRAM for a lead elsewhere and hold no
-        // servable model — checked before gguf/Burn routing. Still a stub
-        // (no real ggml-RPC subprocess); see pending-work/11-distributed-multi-node-inference.md.
-        if let Some(dist_spec) = distributed_spec_from_metadata(model_config.map(|c| &c.metadata))?
-        {
-            if dist_spec.role == DistributedRole::RpcServer {
+        // servable model — checked before gguf/Burn routing.
+        let dist_spec = distributed_spec_from_metadata(model_config.map(|c| &c.metadata))?;
+        if let Some(spec) = &dist_spec {
+            if spec.role == DistributedRole::RpcServer {
                 return self
-                    .load_rpc_server_stub(model_name, gpu_ids, quantization, parallelism)
+                    .load_rpc_server_peer(model_name, gpu_ids, quantization, parallelism, spec)
                     .await;
             }
         }
 
         // `llamaserver` models supervise a `llama-server` child process.
         // Checked before the gguf branch, which errors on an unknown engine
-        // string like "llamaserver".
-        if let Some(spec) = llamaserver_spec_from_metadata(
+        // string like "llamaserver". A `distributed_role = "lead"` model
+        // threads its `rpc_peers`/`tensor_split` into `llama-server --rpc`.
+        if let Some(mut spec) = llamaserver_spec_from_metadata(
             model_config.map(|c| &c.metadata),
             self.llamacpp_default_n_gpu_layers,
         )? {
+            if let Some(dist) = &dist_spec {
+                if dist.role == DistributedRole::Lead {
+                    spec.rpc_peers = dist.rpc_peers.clone();
+                    spec.tensor_split = dist.tensor_split.clone();
+                }
+            }
             return self
                 .load_llamaserver_model(model_name, spec, gpu_ids, quantization, parallelism)
                 .await;
@@ -580,44 +634,135 @@ impl ModelLoader {
         Ok(instance)
     }
 
-    /// Register this node as an `rpc_server` peer for a distributed model —
-    /// stub: reserves everything free on each GPU and inserts a model-less
-    /// instance, no subprocess yet. See pending-work/11-distributed-multi-node-inference.md.
-    async fn load_rpc_server_stub(
+    /// Register this node as an `rpc_server` peer for a distributed model:
+    /// reserve this node's share of the weights, then supervise one
+    /// `ggml-rpc-server` child per GPU lent (health via TCP connect). Any
+    /// failure kills every child spawned so far and rolls back all reservations.
+    #[cfg(feature = "llamacpp-rpc")]
+    async fn load_rpc_server_peer(
         &self,
         model_name: &str,
         gpu_ids: &[u32],
         quantization: crate::cluster::Quantization,
         parallelism: crate::cluster::ParallelismStrategy,
+        dist_spec: &DistributedSpec,
     ) -> Result<ModelInstance, WorkerError> {
+        if !self.rpc_server_enabled {
+            return Err(WorkerError::Configuration(
+                "this model requests the rpc_server peer role, but rpc_server_enabled is false \
+                 in worker.toml — this node has not opted in to lending its GPU(s)"
+                    .to_string(),
+            ));
+        }
+        if self.rpc_server_bind_host == "0.0.0.0" {
+            return Err(WorkerError::Configuration(
+                "rpc_server_bind_host is 0.0.0.0 — ggml-RPC has no authentication or \
+                 encryption; bind to a specific interconnect address instead (see \
+                 worker.toml's rpc_server_bind_host)"
+                    .to_string(),
+            ));
+        }
+        if gpu_ids.is_empty() {
+            return Err(WorkerError::Configuration(
+                "rpc_server peer role requires at least one gpu_id".to_string(),
+            ));
+        }
+        if !dist_spec.rpc_devices.is_empty() && dist_spec.rpc_devices.len() != gpu_ids.len() {
+            return Err(WorkerError::Configuration(format!(
+                "rpc_devices has {} entries but {} gpu_ids were requested — must be index-aligned",
+                dist_spec.rpc_devices.len(),
+                gpu_ids.len()
+            )));
+        }
+        if dist_spec.rpc_devices.is_empty() && gpu_ids.len() > 1 {
+            return Err(WorkerError::Configuration(
+                "multiple gpu_ids requested for an rpc_server role without 'rpc_devices' \
+                 metadata to disambiguate which backend device each ggml-rpc-server process \
+                 should bind (e.g. \"CUDA0,CUDA1\")"
+                    .to_string(),
+            ));
+        }
+
         info!(
-            "Registering {} as an rpc_server peer stub on GPU(s) {:?} (no subprocess yet)",
+            "Registering {} as an rpc_server peer on GPU(s) {:?}",
             model_name, gpu_ids
         );
 
+        // Phase 1 — reserve this node's weight share before spawning anything.
+        // An explicit `rpc_reserve_bytes` (the coordinator's computed split)
+        // is split evenly across `gpu_ids`; otherwise reserve each GPU's full
+        // available memory — conservative, but correct: nothing else can be
+        // silently admitted on top of a GPU this peer already committed to
+        // ggml-rpc-server outside the tracked allocator.
+        let per_gpu_bytes: Vec<u64> = match dist_spec.rpc_reserve_bytes {
+            Some(total) => vec![total / gpu_ids.len() as u64; gpu_ids.len()],
+            None => {
+                let mut bytes = Vec::with_capacity(gpu_ids.len());
+                for &gpu_id in gpu_ids {
+                    bytes.push(self.gpu_manager.get_available_memory(gpu_id as usize).await);
+                }
+                bytes
+            }
+        };
+
         let mut reserved_gpus: Vec<usize> = Vec::new();
         let mut total_reserved: u64 = 0;
-        for &gpu_id in gpu_ids {
-            let gpu_id = gpu_id as usize;
-            let available = self.gpu_manager.get_available_memory(gpu_id).await;
-            match self
-                .gpu_manager
-                .allocate_memory(gpu_id, available, model_name)
+        for (&gpu_id, &bytes) in gpu_ids.iter().zip(per_gpu_bytes.iter()) {
+            if let Err(e) = self
+                .reserve_on_gpus(&[gpu_id], bytes, model_name, &mut reserved_gpus)
                 .await
             {
-                Ok(()) => {
-                    reserved_gpus.push(gpu_id);
-                    total_reserved += available;
-                }
+                self.rollback_reservations(&reserved_gpus, model_name).await;
+                return Err(e);
+            }
+            total_reserved += bytes;
+        }
+
+        // Phase 2 — spawn + health-check one ggml-rpc-server per GPU.
+        let base_port = dist_spec.rpc_bind_port.unwrap_or(self.rpc_server_port);
+        let health_timeout = std::time::Duration::from_secs(self.rpc_server_health_timeout_secs);
+        let mut processes: Vec<
+            Arc<tokio::sync::Mutex<crate::rpc_server_process::RpcServerProcess>>,
+        > = Vec::new();
+        for i in 0..gpu_ids.len() {
+            let Some(port) = base_port.checked_add(i as u16) else {
+                self.kill_rpc_peers_and_rollback(&processes, &reserved_gpus, model_name)
+                    .await;
+                return Err(WorkerError::Configuration(format!(
+                    "rpc_bind_port {base_port} + {i} GPU(s) overflows u16"
+                )));
+            };
+            let device = dist_spec.rpc_devices.get(i).map(String::as_str);
+            let args = crate::rpc_server_process::build_rpc_server_args(
+                &self.rpc_server_bind_host,
+                port,
+                device,
+            );
+            let mut proc = match crate::rpc_server_process::RpcServerProcess::spawn(
+                model_name,
+                &self.rpc_server_bind_host,
+                port,
+                &self.rpc_server_binary_path,
+                &args,
+            ) {
+                Ok(p) => p,
                 Err(e) => {
-                    // Roll back reservations made so far — no leak on partial failure.
-                    for &g in &reserved_gpus {
-                        self.gpu_manager.free_memory(g, model_name).await;
-                    }
+                    self.kill_rpc_peers_and_rollback(&processes, &reserved_gpus, model_name)
+                        .await;
                     return Err(e);
                 }
+            };
+            if let Err(e) = proc.wait_until_healthy(health_timeout).await {
+                let _ = proc.start_kill();
+                self.kill_rpc_peers_and_rollback(&processes, &reserved_gpus, model_name)
+                    .await;
+                return Err(e);
             }
+            processes.push(Arc::new(tokio::sync::Mutex::new(proc)));
         }
+
+        self.rpc_peer_processes
+            .insert(model_name.to_string(), processes);
 
         // `model: None` — the existing "no model attached" placeholder. A
         // stray Infer against this instance hits `ModelInstance::generate`'s
@@ -634,12 +779,45 @@ impl ModelLoader {
         self.evict_to_fit_and_insert(model_name, instance.clone())
             .await;
         info!(
-            "rpc_server peer stub {} registered ({} bytes reserved across {} GPU(s))",
+            "rpc_server peer {} registered {} process(es), {:.2} GiB reserved across {} GPU(s)",
             model_name,
-            total_reserved,
-            reserved_gpus.len()
+            gpu_ids.len(),
+            total_reserved as f64 / (1024.0 * 1024.0 * 1024.0),
+            gpu_ids.len()
         );
         Ok(instance)
+    }
+
+    /// Kill every already-spawned peer process and roll back GPU reservations
+    /// — shared cleanup for [`Self::load_rpc_server_peer`]'s failure paths.
+    #[cfg(feature = "llamacpp-rpc")]
+    async fn kill_rpc_peers_and_rollback(
+        &self,
+        processes: &[Arc<tokio::sync::Mutex<crate::rpc_server_process::RpcServerProcess>>],
+        reserved_gpus: &[usize],
+        model_name: &str,
+    ) {
+        for p in processes {
+            let _ = p.lock().await.start_kill();
+        }
+        self.rollback_reservations(reserved_gpus, model_name).await;
+    }
+
+    /// Stub used when the worker binary was built without `llamacpp-rpc`.
+    #[cfg(not(feature = "llamacpp-rpc"))]
+    async fn load_rpc_server_peer(
+        &self,
+        model_name: &str,
+        _gpu_ids: &[u32],
+        _quantization: crate::cluster::Quantization,
+        _parallelism: crate::cluster::ParallelismStrategy,
+        _dist_spec: &DistributedSpec,
+    ) -> Result<ModelInstance, WorkerError> {
+        Err(WorkerError::Configuration(format!(
+            "Model {} requires the cross-node ggml-RPC peer role, but this worker was built \
+             without the 'llamacpp-rpc' cargo feature (rebuild with --features llamacpp-rpc)",
+            model_name
+        )))
     }
 
     /// Reserve `bytes` on every id in `gpu_ids`, appending each success to
@@ -840,6 +1018,59 @@ impl ModelLoader {
         self.llamaserver_processes.contains_key(model_name)
     }
 
+    /// Reap `ggml-rpc-server` peer children that exited on their own: drop
+    /// them from the process map and `loaded_models`, free their GPU
+    /// reservations, and return the reaped names. Mirrors
+    /// [`Self::reap_exited_llamaservers`]; a peer is reaped as soon as ANY of
+    /// its per-GPU processes dies, since a partial split is not servable.
+    #[cfg(feature = "llamacpp-rpc")]
+    pub async fn reap_exited_rpc_peers(&self) -> Vec<String> {
+        let names: Vec<String> = self
+            .rpc_peer_processes
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        let mut reaped = Vec::new();
+        for name in names {
+            let procs = self
+                .rpc_peer_processes
+                .get(&name)
+                .map(|r| r.value().clone());
+            let Some(procs) = procs else { continue };
+            let mut any_dead = false;
+            for p in &procs {
+                if !p.lock().await.is_running() {
+                    any_dead = true;
+                    break;
+                }
+            }
+            if any_dead {
+                if let Some((_, procs)) = self.rpc_peer_processes.remove(&name) {
+                    for p in procs {
+                        let _ = p.lock().await.start_kill();
+                    }
+                }
+                if let Some((_, instance)) = self.loaded_models.remove(&name) {
+                    for &gpu_id in instance.gpu_ids() {
+                        self.gpu_manager.free_memory(gpu_id as usize, &name).await;
+                    }
+                }
+                warn!(
+                    "ggml-rpc-server peer for {} exited on its own — marked unloaded",
+                    name
+                );
+                reaped.push(name);
+            }
+        }
+        reaped
+    }
+
+    /// No-op stub when the worker binary was built without `llamacpp-rpc`.
+    #[cfg(not(feature = "llamacpp-rpc"))]
+    pub async fn reap_exited_rpc_peers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Drain the names evicted by the `max_loaded_models` policy since the
     /// last call, so `worker.rs` can remove each from its own copy of
     /// `loaded_models` and clear the model's metrics.
@@ -898,6 +1129,8 @@ impl ModelLoader {
             false
         };
 
+        let killed_rpc_peer = self.shutdown_rpc_peer(model_name).await;
+
         let removed = self.loaded_models.remove(model_name);
         if let Some((_, instance)) = &removed {
             for &gpu_id in instance.gpu_ids() {
@@ -912,7 +1145,35 @@ impl ModelLoader {
             }
         }
         // instance drops here — last Arc clone (worker.rs removed its copy first) frees the weights.
-        removed.is_some() || killed_server
+        removed.is_some() || killed_server || killed_rpc_peer
+    }
+
+    /// Kill every `ggml-rpc-server` child for `model_name`, if this model is
+    /// an `rpc_server` peer. Returns whether anything was found and killed.
+    #[cfg(feature = "llamacpp-rpc")]
+    async fn shutdown_rpc_peer(&self, model_name: &str) -> bool {
+        let Some((_, procs)) = self.rpc_peer_processes.remove(model_name) else {
+            return false;
+        };
+        for proc in procs {
+            if let Err(e) = proc.lock().await.shutdown().await {
+                warn!(
+                    "error shutting down ggml-rpc-server for {}: {}",
+                    model_name, e
+                );
+            }
+        }
+        info!(
+            "Unload {}: ggml-rpc-server process(es) terminated",
+            model_name
+        );
+        true
+    }
+
+    /// No-op stub when the worker binary was built without `llamacpp-rpc`.
+    #[cfg(not(feature = "llamacpp-rpc"))]
+    async fn shutdown_rpc_peer(&self, _model_name: &str) -> bool {
+        false
     }
 
     async fn load_safetensors(
@@ -1481,18 +1742,19 @@ pub fn gguf_spec_from_metadata(
 }
 
 // Distributed (cross-node ggml-RPC) metadata routing. See the metadata key
-// contract in pending-work/11-distributed-multi-node-inference.md. Only the
-// `rpc_server` role stub is wired into a load path today.
+// contract in pending-work/11-distributed-multi-node-inference.md. Both
+// roles are wired into a load path (feature `llamacpp-rpc`): `rpc_server`
+// supervises a real `ggml-rpc-server`; `lead` threads `rpc_peers`/
+// `tensor_split` into `llama-server --rpc`/`--tensor-split`.
 
 /// Which side of a cross-node ggml-RPC split this node plays for one
 /// distributed model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistributedRole {
-    /// Owns the real llama.cpp context and dials out to `rpc_peers` (not
-    /// yet implemented).
+    /// Owns the real llama.cpp context and dials out to `rpc_peers`.
     Lead,
     /// Lends this node's local GPU(s) to a lead; holds no directly-servable
-    /// model (stub).
+    /// model.
     RpcServer,
 }
 
@@ -1504,11 +1766,20 @@ pub struct DistributedSpec {
     /// Lead only: comma-separated "host:port" peers, GPU-granular. Must stay
     /// index-aligned with the peer portion of `tensor_split`.
     pub rpc_peers: Vec<String>,
-    /// rpc_server only: base port its `rpc-server` process(es) bind to.
+    /// rpc_server only: base port its `ggml-rpc-server` process(es) bind to.
     pub rpc_bind_port: Option<u16>,
     /// Lead only: combined flat split weights — [lead's own gpu_ids...,
     /// peer_1's lent GPUs..., peer_2's...].
     pub tensor_split: Option<Vec<f32>>,
+    /// rpc_server only: this node's share of the model's weight bytes to
+    /// reserve, split evenly across `gpu_ids`. `None` reserves each GPU's
+    /// full available memory (see `load_rpc_server_peer`).
+    pub rpc_reserve_bytes: Option<u64>,
+    /// rpc_server only: per-GPU `-d` device string for `ggml-rpc-server`
+    /// (e.g. `"CUDA0"`), index-aligned with `gpu_ids`. Required when more
+    /// than one gpu_id is requested; omitted for a single GPU lets
+    /// `ggml-rpc-server` use its own default device.
+    pub rpc_devices: Vec<String>,
 }
 
 /// Parse distributed-role metadata: `None` for no metadata / no
@@ -1545,11 +1816,25 @@ pub fn distributed_spec_from_metadata(
 
     let tensor_split = parse_tensor_split(metadata)?;
 
+    let rpc_reserve_bytes = match metadata.get("rpc_reserve_bytes") {
+        Some(v) => Some(v.parse::<u64>().map_err(|e| {
+            WorkerError::Configuration(format!("invalid rpc_reserve_bytes '{v}': {e}"))
+        })?),
+        None => None,
+    };
+
+    let rpc_devices = match metadata.get("rpc_devices") {
+        Some(v) if !v.is_empty() => v.split(',').map(|s| s.trim().to_string()).collect(),
+        _ => Vec::new(),
+    };
+
     Ok(Some(DistributedSpec {
         role,
         rpc_peers,
         rpc_bind_port,
         tensor_split,
+        rpc_reserve_bytes,
+        rpc_devices,
     }))
 }
 
@@ -1884,6 +2169,24 @@ mod tests {
         assert_eq!(spec.rpc_bind_port, Some(50151));
         assert!(spec.rpc_peers.is_empty());
         assert_eq!(spec.tensor_split, None);
+        assert_eq!(spec.rpc_reserve_bytes, None);
+        assert!(spec.rpc_devices.is_empty());
+    }
+
+    #[test]
+    fn distributed_spec_parses_rpc_reserve_bytes_and_devices() {
+        let m = meta(&[
+            ("distributed_role", "rpc_server"),
+            ("rpc_bind_port", "50151"),
+            ("rpc_reserve_bytes", "22548578304"),
+            ("rpc_devices", "CUDA0, CUDA1"),
+        ]);
+        let spec = distributed_spec_from_metadata(Some(&m)).unwrap().unwrap();
+        assert_eq!(spec.rpc_reserve_bytes, Some(22_548_578_304));
+        assert_eq!(
+            spec.rpc_devices,
+            vec!["CUDA0".to_string(), "CUDA1".to_string()]
+        );
     }
 
     #[test]
@@ -1902,6 +2205,15 @@ mod tests {
 
         let bad_split = meta(&[("distributed_role", "lead"), ("tensor_split", "abc")]);
         assert!(distributed_spec_from_metadata(Some(&bad_split)).is_err());
+    }
+
+    #[test]
+    fn distributed_spec_rejects_malformed_reserve_bytes() {
+        let bad_bytes = meta(&[
+            ("distributed_role", "rpc_server"),
+            ("rpc_reserve_bytes", "not-a-number"),
+        ]);
+        assert!(distributed_spec_from_metadata(Some(&bad_bytes)).is_err());
     }
 
     // rpc_server stub role, exercised through the real `ModelLoader::load_model`
@@ -2009,49 +2321,13 @@ mod tests {
         assert_eq!(gpu_manager.get_available_memory(0).await, per_instance * 4);
     }
 
+    // Without the `llamacpp-rpc` feature, an `rpc_server` model must fail
+    // with a clear "rebuild with the feature" error — and it must do so
+    // before gguf/Burn routing runs (the attached gguf metadata below would
+    // trigger a download attempt against a nonexistent repo if it ran first).
     #[tokio::test]
-    async fn rpc_server_stub_reserves_vram_and_leaves_no_model_attached() {
-        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
-        let (loader, _dir) = test_loader(gpu_manager.clone());
-
-        let metadata = meta(&[
-            ("distributed_role", "rpc_server"),
-            ("rpc_bind_port", "50151"),
-        ]);
-        let model_config = crate::cluster::ModelConfig {
-            metadata,
-            ..Default::default()
-        };
-
-        let instance = loader
-            .load_model(
-                "peer-stub",
-                None,
-                Some(&model_config),
-                &[0],
-                crate::cluster::Quantization::None,
-                crate::cluster::ParallelismStrategy::Auto,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(instance.gpu_ids(), &[0]);
-        // The stub reserved everything free on GPU 0 — available_memory drops.
-        assert_eq!(gpu_manager.get_available_memory(0).await, 0);
-
-        // A stray Infer against the placeholder returns the existing clean
-        // "no model attached" error (ModelInstance::generate), not a panic.
-        // (TextStream isn't Debug, so match instead of unwrap_err().)
-        match instance.generate("hello", 4, 0.7, 0.9, 40, None).await {
-            Err(e) => assert!(e.to_string().contains("holds no runnable model")),
-            Ok(_) => panic!("expected 'no model attached' error, got a stream"),
-        }
-    }
-
-    #[tokio::test]
-    async fn rpc_server_role_routes_before_gguf_metadata_is_consulted() {
-        // The rpc_server branch must run before gguf/Burn routing — attach
-        // gguf metadata that would trigger a download if it ran first.
+    #[cfg(not(feature = "llamacpp-rpc"))]
+    async fn rpc_server_role_without_feature_fails_clearly_and_routes_first() {
         let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
         let (loader, _dir) = test_loader(gpu_manager.clone());
 
@@ -2067,9 +2343,10 @@ mod tests {
             ..Default::default()
         };
 
-        let instance = loader
+        // ModelInstance isn't Debug, so unwrap_err() isn't available — match instead.
+        let err = match loader
             .load_model(
-                "peer-stub-2",
+                "peer-stub",
                 None,
                 Some(&model_config),
                 &[0],
@@ -2077,8 +2354,248 @@ mod tests {
                 crate::cluster::ParallelismStrategy::Auto,
             )
             .await
-            .unwrap();
-        assert_eq!(instance.gpu_ids(), &[0]);
+        {
+            Ok(_) => panic!("expected the llamacpp-rpc-required error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("llamacpp-rpc"));
+    }
+
+    // --- rpc_server peer role, real supervision (feature `llamacpp-rpc`) ---
+    // No real `ggml-rpc-server` binary is available in CI, so these use
+    // `false`/`true` as immediate-exit stand-ins to exercise the
+    // validation/reservation/rollback contract without a working peer.
+
+    #[cfg(feature = "llamacpp-rpc")]
+    fn rpc_peer_loader(
+        gpu_manager: Arc<GPUManager>,
+        binary: &str,
+    ) -> (ModelLoader, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let loader_config = ModelLoaderConfig {
+            cache_dir: dir.path().join("models"),
+            download_dir: dir.path().join("downloads"),
+            rpc_server_enabled: true,
+            rpc_server_bind_host: "127.0.0.1".to_string(),
+            rpc_server_binary_path: binary.to_string(),
+            rpc_server_health_timeout_secs: 1,
+            ..ModelLoaderConfig::default()
+        };
+        let loader = ModelLoader::new(loader_config, gpu_manager).unwrap();
+        (loader, dir)
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "llamacpp-rpc")]
+    async fn rpc_server_peer_requires_rpc_server_enabled() {
+        let gpu_manager = Arc::new(GPUManager::test_with_capacity(1_000));
+        let dir = tempfile::tempdir().unwrap();
+        let loader_config = ModelLoaderConfig {
+            cache_dir: dir.path().join("models"),
+            download_dir: dir.path().join("downloads"),
+            rpc_server_enabled: false, // not opted in
+            ..ModelLoaderConfig::default()
+        };
+        let loader = ModelLoader::new(loader_config, gpu_manager.clone()).unwrap();
+
+        let metadata = meta(&[
+            ("distributed_role", "rpc_server"),
+            ("rpc_bind_port", "50151"),
+        ]);
+        let model_config = crate::cluster::ModelConfig {
+            metadata,
+            ..Default::default()
+        };
+        let err = match loader
+            .load_model(
+                "peer",
+                None,
+                Some(&model_config),
+                &[0],
+                crate::cluster::Quantization::None,
+                crate::cluster::ParallelismStrategy::Auto,
+            )
+            .await
+        {
+            Ok(_) => panic!("expected the rpc_server_enabled error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("rpc_server_enabled"));
+        // Nothing was reserved on the refused load.
+        assert_eq!(gpu_manager.get_available_memory(0).await, 1_000);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "llamacpp-rpc")]
+    async fn rpc_server_peer_rejects_public_bind_host() {
+        let gpu_manager = Arc::new(GPUManager::test_with_capacity(1_000));
+        let dir = tempfile::tempdir().unwrap();
+        let loader_config = ModelLoaderConfig {
+            cache_dir: dir.path().join("models"),
+            download_dir: dir.path().join("downloads"),
+            rpc_server_enabled: true,
+            rpc_server_bind_host: "0.0.0.0".to_string(),
+            ..ModelLoaderConfig::default()
+        };
+        let loader = ModelLoader::new(loader_config, gpu_manager).unwrap();
+
+        let metadata = meta(&[
+            ("distributed_role", "rpc_server"),
+            ("rpc_bind_port", "50151"),
+        ]);
+        let model_config = crate::cluster::ModelConfig {
+            metadata,
+            ..Default::default()
+        };
+        let err = match loader
+            .load_model(
+                "peer",
+                None,
+                Some(&model_config),
+                &[0],
+                crate::cluster::Quantization::None,
+                crate::cluster::ParallelismStrategy::Auto,
+            )
+            .await
+        {
+            Ok(_) => panic!("expected the 0.0.0.0 bind-host error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("0.0.0.0"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "llamacpp-rpc")]
+    async fn rpc_server_peer_multi_gpu_requires_rpc_devices() {
+        let gpu_manager = Arc::new(GPUManager::test_with_capacity(1_000));
+        let (loader, _dir) = rpc_peer_loader(gpu_manager, "true");
+
+        let metadata = meta(&[
+            ("distributed_role", "rpc_server"),
+            ("rpc_bind_port", "50151"),
+        ]);
+        let model_config = crate::cluster::ModelConfig {
+            metadata,
+            ..Default::default()
+        };
+        let err = match loader
+            .load_model(
+                "peer",
+                None,
+                Some(&model_config),
+                &[0, 1],
+                crate::cluster::Quantization::None,
+                crate::cluster::ParallelismStrategy::Auto,
+            )
+            .await
+        {
+            Ok(_) => panic!("expected the missing rpc_devices error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("rpc_devices"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "llamacpp-rpc")]
+    async fn rpc_server_peer_rejects_mismatched_rpc_devices_length() {
+        let gpu_manager = Arc::new(GPUManager::test_with_capacity(1_000));
+        let (loader, _dir) = rpc_peer_loader(gpu_manager, "true");
+
+        let metadata = meta(&[
+            ("distributed_role", "rpc_server"),
+            ("rpc_bind_port", "50151"),
+            ("rpc_devices", "CUDA0"),
+        ]);
+        let model_config = crate::cluster::ModelConfig {
+            metadata,
+            ..Default::default()
+        };
+        let err = match loader
+            .load_model(
+                "peer",
+                None,
+                Some(&model_config),
+                &[0, 1],
+                crate::cluster::Quantization::None,
+                crate::cluster::ParallelismStrategy::Auto,
+            )
+            .await
+        {
+            Ok(_) => panic!("expected the mismatched rpc_devices-length error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("index-aligned"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "llamacpp-rpc")]
+    async fn rpc_server_peer_reserves_explicit_share_then_rolls_back_on_spawn_failure() {
+        // `false` exits 1 immediately, standing in for a ggml-rpc-server that
+        // fails to start (bad device, port clash) — the load must fail AND
+        // release the phase-1 reservation, not leak it.
+        let gpu_manager = Arc::new(GPUManager::test_with_capacity(10_000));
+        let (loader, _dir) = rpc_peer_loader(gpu_manager.clone(), "false");
+
+        let metadata = meta(&[
+            ("distributed_role", "rpc_server"),
+            ("rpc_bind_port", "50151"),
+            ("rpc_reserve_bytes", "4000"),
+        ]);
+        let model_config = crate::cluster::ModelConfig {
+            metadata,
+            ..Default::default()
+        };
+        let err = match loader
+            .load_model(
+                "peer",
+                None,
+                Some(&model_config),
+                &[0],
+                crate::cluster::Quantization::None,
+                crate::cluster::ParallelismStrategy::Auto,
+            )
+            .await
+        {
+            Ok(_) => panic!("expected the spawn/health failure to propagate"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("exited during startup"));
+        // Rolled back — none of the requested 4000 bytes stayed reserved.
+        assert_eq!(gpu_manager.get_available_memory(0).await, 10_000);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "llamacpp-rpc")]
+    async fn rpc_server_peer_no_reserve_bytes_falls_back_to_all_available() {
+        let gpu_manager = Arc::new(GPUManager::test_with_capacity(7_000));
+        let (loader, _dir) = rpc_peer_loader(gpu_manager.clone(), "false");
+
+        let metadata = meta(&[
+            ("distributed_role", "rpc_server"),
+            ("rpc_bind_port", "50151"),
+        ]);
+        let model_config = crate::cluster::ModelConfig {
+            metadata,
+            ..Default::default()
+        };
+        // Spawn/health still fails (stand-in binary exits immediately), but
+        // phase 1 must have reserved the GPU's FULL available memory (7000)
+        // before that — proven by the rollback restoring exactly 7000.
+        if loader
+            .load_model(
+                "peer",
+                None,
+                Some(&model_config),
+                &[0],
+                crate::cluster::Quantization::None,
+                crate::cluster::ParallelismStrategy::Auto,
+            )
+            .await
+            .is_ok()
+        {
+            panic!("expected the spawn/health failure to propagate");
+        }
+        assert_eq!(gpu_manager.get_available_memory(0).await, 7_000);
     }
 
     // resolve_head_dim (div-by-zero guard) and ReservationGuard (release-on-unwind).
