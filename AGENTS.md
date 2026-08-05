@@ -160,8 +160,11 @@ Client (REST) → Coordinator (FastAPI) → Workers (Rust: llama.cpp + Burn) →
 ## CI / GitHub Actions
 
 `.github/workflows/ci.yml` runs on every push/PR to `master` and `feature` branches:
-- **Rust job**: `cargo check --features wgpu`, `cargo check --features llamacpp` (compiles the llama.cpp engine via cmake + libclang), `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --features wgpu`
+- **Rust job** (`ubuntu-latest`): `cargo check` for `wgpu`, `llamacpp` (compiles the llama.cpp engine via cmake + libclang), `cuda`, `rocm` — the last two are type-check only, no CUDA/ROCm toolkit on the runner — plus `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --features wgpu`
+- **Rust (aarch64) job** (`ubuntu-24.04-arm`): `cargo check` for `wgpu`, `llamacpp`, `cuda`; `rocm` is deliberately skipped here — cubecl-hip 0.8.1 has an aarch64-only `Vec<i8>`/`Vec<u8>` build bug
+- **Rust (macOS/Metal) job** (`macos-latest`): `cargo check --features metal` — the only feature gated on `target_os = "macos"`, so it cannot be attempted on a Linux runner at all
 - **Python job**: `ruff check`, `black --check`, `mypy` (strict; pydantic plugin; `coordinator/proto/` excluded), `pytest coordinator/`
+- Not covered: `llamacpp-cuda`/`llamacpp-vulkan` (llama-cpp-sys-2 needs a real nvcc / Vulkan SDK build, not a toolchain-less type-check like the `cuda`/`rocm` features above)
 
 ## Worker Model Architecture
 
