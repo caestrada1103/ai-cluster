@@ -34,6 +34,8 @@ mod model_loader;
 #[path = "../models/mod.rs"]
 mod models;
 mod parallelism;
+#[cfg(feature = "llamacpp-rpc")]
+mod rpc_server_process;
 mod worker;
 
 /// Generated protobuf code
@@ -226,6 +228,21 @@ async fn async_main(
         llamaserver_enable_slots_endpoint: config.llamaserver_enable_slots_endpoint,
         llamaserver_port_min: config.llamaserver_port_min,
         llamaserver_port_max: config.llamaserver_port_max,
+        rpc_server_enabled: config.rpc_server_enabled,
+        // env RPC_SERVER_BINARY_PATH wins over the config file (mirrors LLAMASERVER_BINARY_PATH).
+        rpc_server_binary_path: std::env::var("RPC_SERVER_BINARY_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| config.rpc_server_binary_path.clone()),
+        // env RPC_SERVER_BIND_HOST wins over the config file. Never defaults
+        // to 0.0.0.0 — ggml-RPC has no auth; bind to the interconnect address.
+        rpc_server_bind_host: std::env::var("RPC_SERVER_BIND_HOST")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| config.rpc_server_bind_host.clone()),
+        rpc_server_port: config.rpc_server_port,
+        // Reuse the worker's single load/inference timeout, same as llamaserver's.
+        rpc_server_health_timeout_secs: config.request_timeout_secs,
     };
     let model_loader = Arc::new(ModelLoader::new(loader_config, gpu_manager.clone())?);
 

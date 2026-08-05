@@ -9,11 +9,14 @@
 llamacpp_n_threads = 0              # 0 = llama.cpp auto-detects thread count
 llamacpp_default_n_gpu_layers = -1  # -1 = offload all layers to the GPU (both engines)
 
-# ggml-RPC peer ("rpc_server") role for distributed cross-node GGUF splits.
-# Off by default; trusted-LAN only (ggml-RPC has no auth/encryption).
-# rpc_server_enabled = false        # true on nodes that lend local GPU(s) as an RPC peer
-# rpc_server_port = 50151           # base port; one rpc-server process per lent GPU, port+i
-# rpc_server_bind_host = "0.0.0.0"  # bind interface for the rpc-server process(es)
+# ggml-RPC peer ("rpc_server") role for distributed cross-node GGUF splits
+# (feature `llamacpp-rpc`). Off by default; ggml-RPC has no auth/encryption,
+# so bind_host must be a specific interconnect address, never "0.0.0.0" — the
+# worker refuses to load if it is. See docs/deployment.md.
+# rpc_server_enabled = false           # true on nodes that lend local GPU(s) as an RPC peer
+# rpc_server_port = 50151              # base port; one ggml-rpc-server process per lent GPU, port+i
+# rpc_server_bind_host = "10.0.0.2"    # the node's interconnect IP, e.g. a direct NIC-to-NIC link
+# rpc_server_binary_path = "ggml-rpc-server"  # PATH lookup by default; or an absolute path
 
 # llama-server engine (engine="llamaserver" models): the worker spawns and
 # supervises a `llama-server` child per such model. Binary not built by

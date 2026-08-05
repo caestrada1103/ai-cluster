@@ -275,6 +275,10 @@ register at runtime: `curl -X POST localhost:8000/v1/workers/manual -H "Content-
 - Open TCP 50051 (gRPC) worker-side and 9091 for Prometheus scrapes; 8000 coordinator-side.
 - Traffic is plaintext gRPC/HTTP — deploy on a trusted network or behind your own TLS proxy
   (built-in TLS/auth is planned, not implemented).
+- Independent workers behind the coordinator (one model per worker) is the
+  default and recommended way to use multiple machines. Splitting a single
+  model's weights across machines is a separate, narrower feature — see
+  [section 5](#5-cross-node-ggml-rpc-split-peerlead).
 
 ## 4. llama-server for agentic serving (engine = "llamaserver")
 
@@ -390,13 +394,44 @@ therefore be **reachable from the coordinator host**:
 
 Windows `llama-server` provisioning is not yet supported.
 
-## 5. Health checks
+## 5. Cross-node ggml-RPC split (peer/lead)
+
+Splitting one GGUF model's weights across two machines' GPUs, built with the
+opt-in `llamacpp-rpc` cargo feature
+(`cargo build --release --features wgpu,llamacpp-rpc`). See
+[configuration.md](configuration.md#distributed-level-2-ggml-rpc--worker-side-implemented-coordinator-wiring-pending)
+for the full metadata contract — this section covers only the binary and
+network requirements. **The coordinator does not orchestrate this yet**
+(Task 4 in the internal roadmap); today it requires assembling the gRPC
+`LoadModelRequest` metadata by hand.
+
+- **The peer node** needs llama.cpp's `ggml-rpc-server` binary (built with
+  `-DGGML_RPC=ON`, plus whatever GPU backend that node uses — CUDA, Vulkan,
+  or ROCm; this is not the same target as `llama-server` and is not built by
+  cargo). Point the worker at it via `rpc_server_binary_path`
+  (`RPC_SERVER_BINARY_PATH` env wins) and set `rpc_server_enabled = true` in
+  that node's `worker.toml` — an explicit opt-in independent of what the
+  coordinator later requests.
+- **ggml-RPC has no authentication or encryption.** Bind the peer's
+  `rpc_server_bind_host` to the interconnect address only (e.g. the private
+  IP of a direct NIC-to-NIC link or an isolated VLAN) — never `0.0.0.0`, and
+  never a NAT'd or otherwise internet-reachable interface. The worker
+  refuses to load an `rpc_server`-role model at all if that host is
+  `0.0.0.0`.
+- **The lead node** needs its normal `llama-server` binary (same as
+  [section 4](#4-llama-server-for-agentic-serving-engine--llamaserver)) —
+  llama.cpp's own `--rpc` flag dials the peer, so nothing extra is required
+  there beyond a llama.cpp build recent enough to include ggml-RPC support.
+- **Firewall:** open the peer's `rpc_server_port` range (default base 50151,
+  one port per GPU lent) to the lead node only, on the interconnect network.
+
+## 6. Health checks
 
 - Coordinator: `GET /health` → `{"status": "healthy", "workers": N}` (always 200; `starting` before ready).
 - Worker (metrics port): `GET /health` → `OK`, `GET /live` → `ALIVE`.
 - There are no `/health/live|ready|startup` coordinator routes.
 
-## 6. Upgrades
+## 7. Upgrades
 
 ```bash
 git pull
