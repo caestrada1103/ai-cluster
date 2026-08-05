@@ -119,8 +119,9 @@ cache_type_k = "q8_0"
 cache_type_v = "q8_0"
 
 # Level 2 distributed (cross-node ggml-RPC) reference schema — demonstrates the
-# `.distributed` TOML shape. Not yet wired end-to-end (needs the worker's
-# `llamacpp-rpc` feature and a peer `rpc-server` per node). See docs/configuration.md.
+# `.distributed` TOML shape. The worker side (peer/lead roles, `llamacpp-rpc`
+# feature) is implemented; the coordinator does not yet read this block, so
+# it isn't wired end-to-end. See docs/configuration.md.
 [models."qwen2.5-coder-32b-gguf".distributed]
 enabled = true
 lead = "amd-node-1"
@@ -224,9 +225,10 @@ port = 8086
 parallel = 4  # sizing math: docs/configuration.md
 
 # --- Dual-Spark tier — needs BOTH Sparks, not runnable yet ---------------
-# Cross-node ggml-RPC is not implemented (worker/src/model_loader.rs registers
-# an rpc_server stub only), so this cannot load today. Uncomment once that
-# lands and the second Spark is cabled. See docs/configuration.md.
+# The worker's rpc_server/lead roles are implemented (feature `llamacpp-rpc`),
+# but the coordinator does not yet read the `.distributed` block below, so
+# this still cannot load through the normal API today. Uncomment once that
+# coordinator wiring lands and the second Spark is cabled. See docs/configuration.md.
 #
 # LICENSE: MiniMax ships this under non-commercial terms that permit personal
 # self-hosted use. Read the LICENSE at huggingface.co/MiniMaxAI/MiniMax-M2.7
