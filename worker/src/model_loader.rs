@@ -882,13 +882,15 @@ impl ModelLoader {
         let repo = api.repo(Repo::new(spec.repo_id.clone(), RepoType::Model));
         let (gguf_path, file_size) = download_gguf(&repo, &spec.file).await?;
 
-        // Log the effective per-slot / total context before spawning, so a
-        // misconfiguration is loud even if `/props` verification below is
-        // inconclusive. llama-server divides its own `-c` evenly across
-        // `--parallel` slots — see docs/configuration.md.
+        // Log the requested `-c` before spawning, so a misconfiguration is
+        // loud even if `/props` verification below is inconclusive.
+        // llama-server does NOT divide `-c` across `--parallel` slots —
+        // every slot gets the full value passed here — see
+        // docs/configuration.md.
         match spec.total_ctx()? {
             Some(total) => info!(
-                "llama-server {}: n_ctx={} tokens/slot x parallel={} slots = {} total context (-c)",
+                "llama-server {}: n_ctx={} (registry) x parallel={} = -c {} requested \
+                 (llama-server gives every slot the full -c, not a per-slot share)",
                 model_name,
                 spec.n_ctx.unwrap_or_default(),
                 spec.parallel,
