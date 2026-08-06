@@ -153,9 +153,12 @@ pub struct LlamaServerSpec {
     /// REQUIRED — coordinator-assigned, unique per model).
     pub port: u16,
     /// Per-slot context window (metadata key `n_ctx`; `None` leaves
-    /// `llama-server`'s own default, no `-c` passed). `llama-server` divides
-    /// `-c` evenly across `--parallel` slots, so [`Self::total_ctx`]
-    /// multiplies this by `parallel` before building `-c`. See docs/configuration.md.
+    /// `llama-server`'s own default, no `-c` passed). Measured on hardware:
+    /// `llama-server` does NOT divide `-c` across `--parallel` slots — every
+    /// slot gets the full `-c` value. [`Self::total_ctx`] still multiplies
+    /// this by `parallel` before building `-c` (predates that finding), so
+    /// this is only "tokens per slot" in effect at `parallel == 1`. See
+    /// docs/configuration.md.
     pub n_ctx: Option<u32>,
     /// Continuous-batching slots ("instances"), maps to `--parallel`
     /// (metadata key `llamaserver.instances`, alias `llamaserver.parallel`;
@@ -193,9 +196,11 @@ pub struct LlamaServerSpec {
 }
 
 impl LlamaServerSpec {
-    /// The actual `-c` value: `n_ctx * parallel`, so `llama-server`'s own
-    /// division across slots reproduces `n_ctx` tokens per slot. `Ok(None)`
-    /// when `n_ctx` is unset; `Err` on `u32` overflow.
+    /// The `-c` value this worker asks `llama-server` for: `n_ctx * parallel`.
+    /// This was written assuming `llama-server` divides `-c` back down across
+    /// slots to reproduce `n_ctx` tokens per slot — measured on hardware, it
+    /// does not; every slot gets the full `-c` value. See docs/configuration.md.
+    /// `Ok(None)` when `n_ctx` is unset; `Err` on `u32` overflow.
     pub fn total_ctx(&self) -> Result<Option<u32>, WorkerError> {
         match self.n_ctx {
             None => Ok(None),
@@ -232,7 +237,9 @@ impl LlamaServerSpec {
             "--port".to_string(),
             self.port.to_string(),
         ];
-        // `-c` only when n_ctx was configured; total_ctx() = n_ctx * parallel.
+        // `-c` only when n_ctx was configured; total_ctx() = n_ctx * parallel
+        // (llama-server does not divide this back down per slot — see
+        // docs/configuration.md).
         if let Some(total_ctx) = self.total_ctx()? {
             args.push("-c".to_string());
             args.push(total_ctx.to_string());
@@ -511,7 +518,9 @@ impl LlamaServerProcess {
     /// Best-effort post-health check: `GET /props` and compare the reported
     /// context against `expected_total_ctx` ([`LlamaServerSpec::total_ctx`]),
     /// logging a warning on mismatch. Never fails the load — `/props` is a
-    /// diagnostic, not a contract. See docs/configuration.md.
+    /// diagnostic, not a contract. Note `expected_total_ctx` is the worker's
+    /// own (still `n_ctx * parallel`) request, not an independently verified
+    /// "correct" value — see docs/configuration.md.
     pub async fn verify_props(&self, expected_total_ctx: Option<u32>) {
         let Some(expected_total_ctx) = expected_total_ctx else {
             return;
@@ -993,8 +1002,10 @@ mod tests {
             rpc_peers: vec![],
             tensor_split: None,
         };
-        // Matches the hardware-verified qwen3.6-35b-a3b-gguf sizing: 262144
-        // per slot x 4 slots = 1048576 total -c.
+        // Matches the worker's current qwen3.6-35b-a3b-gguf config (262144 *
+        // 4 = 1048576). This is the worker's own request math, not a
+        // hardware-verified per-slot outcome — llama-server does not divide
+        // -c back down per slot; see docs/configuration.md.
         assert_eq!(spec.total_ctx().unwrap(), Some(1_048_576));
     }
 
