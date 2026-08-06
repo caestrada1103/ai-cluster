@@ -105,6 +105,7 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
 | **Pipeline Parallelism** | 🔶 Done (Partially) | `pipeline_parallel_llama_forward` implements layer-chunk partitioning; not yet wired to the gRPC service layer |
 | **Expert Parallelism (MoE)** | 🔄 In-Progress | `DeepSeekMoE` sparse top-k routing implemented in `worker/models/deepseek.rs`; distributed expert routing across GPUs is a stub returning an error |
 | **Data Parallelism** | ✅ Done (Completed) | Fully operational — deploy multiple independent workers (one per GPU) behind the coordinator's load balancer |
+| **Cross-Node ggml-RPC Split (GGUF)** | 🔶 Done (Partially) | Worker supervises a real `ggml-rpc-server` peer and threads `--rpc`/`--tensor-split` into the lead's `llama-server` (opt-in `llamacpp-rpc` cargo feature). Coordinator resolves `[models.X.distributed]`, loads peers before the lead, unloads lead-first, and rolls back a failed load. Both sides are unit-tested but the integrated path has not been exercised on real hardware. See `docs/configuration.md`. |
 | **Continuous Batching** | 🔲 To-Do | High-throughput inference with dynamic batching |
 | **Paged KV Cache** | 🔲 To-Do | vLLM-style memory-efficient paged attention; basic KV cache is done, the paged variant is not |
 | **Speculative Decoding** | 🔲 To-Do | 2-3x generation speedup with draft model |

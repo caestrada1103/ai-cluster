@@ -67,13 +67,21 @@ pub struct WorkerConfig {
     /// as a ggml-RPC peer (`distributed_role=rpc_server` metadata).
     pub rpc_server_enabled: bool,
 
-    /// Base TCP port this node's `rpc-server` process(es) bind to when
+    /// Base TCP port this node's `ggml-rpc-server` process(es) bind to when
     /// `rpc_server_enabled=true`. One GPU per port, starting here.
     pub rpc_server_port: u16,
 
-    /// Bind interface for the `rpc-server` process(es). ggml-RPC has no
-    /// auth — never bind this to a public interface.
-    pub rpc_server_bind_host: Option<String>,
+    /// Bind interface for the `ggml-rpc-server` process(es). Default
+    /// `"127.0.0.1"` (loopback, secure by default — unreachable from another
+    /// node, so effectively "off" until set). ggml-RPC has no auth or
+    /// encryption; opt in to a specific interconnect address, never
+    /// `"0.0.0.0"`. See docs/configuration.md.
+    pub rpc_server_bind_host: String,
+
+    /// Path to the `ggml-rpc-server` binary this worker spawns for the
+    /// `rpc_server` peer role. Not built by cargo — install llama.cpp's
+    /// `ggml-rpc-server` separately. `RPC_SERVER_BINARY_PATH` wins.
+    pub rpc_server_binary_path: String,
 
     /// Path to the `llama-server` binary the worker spawns for
     /// `engine = "llamaserver"` models. Not built by cargo — install
@@ -130,7 +138,8 @@ impl Default for WorkerConfig {
             llamacpp_default_n_gpu_layers: -1,
             rpc_server_enabled: false,
             rpc_server_port: 50151,
-            rpc_server_bind_host: None,
+            rpc_server_bind_host: "127.0.0.1".to_string(),
+            rpc_server_binary_path: "ggml-rpc-server".to_string(),
             llamaserver_binary_path: "llama-server".to_string(),
             llamaserver_bind_host: "127.0.0.1".to_string(),
             llamaserver_enable_slots_endpoint: false,
@@ -168,6 +177,7 @@ impl fmt::Debug for WorkerConfig {
             .field("rpc_server_enabled", &self.rpc_server_enabled)
             .field("rpc_server_port", &self.rpc_server_port)
             .field("rpc_server_bind_host", &self.rpc_server_bind_host)
+            .field("rpc_server_binary_path", &self.rpc_server_binary_path)
             .field("llamaserver_binary_path", &self.llamaserver_binary_path)
             .field("llamaserver_bind_host", &self.llamaserver_bind_host)
             .field(
@@ -281,16 +291,25 @@ mod tests {
         let config = WorkerConfig::default();
         assert!(!config.rpc_server_enabled);
         assert_eq!(config.rpc_server_port, 50151);
-        assert_eq!(config.rpc_server_bind_host, None);
+        // Loopback-only by default — opt in to a routable interconnect
+        // address explicitly, same precedent as llamaserver_bind_host.
+        assert_eq!(config.rpc_server_bind_host, "127.0.0.1");
+        assert_eq!(config.rpc_server_binary_path, "ggml-rpc-server");
     }
 
     #[test]
     fn test_rpc_server_keys_parse_from_flat_toml() {
-        let toml_str = "rpc_server_enabled = true\nrpc_server_port = 60000\nrpc_server_bind_host = \"0.0.0.0\"\n";
+        let toml_str = "rpc_server_enabled = true\nrpc_server_port = 60000\n\
+             rpc_server_bind_host = \"10.100.88.2\"\n\
+             rpc_server_binary_path = \"/opt/llama.cpp/ggml-rpc-server\"\n";
         let config: WorkerConfig = toml::from_str(toml_str).unwrap();
         assert!(config.rpc_server_enabled);
         assert_eq!(config.rpc_server_port, 60000);
-        assert_eq!(config.rpc_server_bind_host, Some("0.0.0.0".to_string()));
+        assert_eq!(config.rpc_server_bind_host, "10.100.88.2");
+        assert_eq!(
+            config.rpc_server_binary_path,
+            "/opt/llama.cpp/ggml-rpc-server"
+        );
     }
 
     #[test]

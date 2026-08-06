@@ -1087,8 +1087,8 @@ async def load_model(body: LoadModelRequest, request: Request) -> LoadModelRespo
             f"Valid values: {[q.value for q in Quantization]} (only 'none' is loadable today)",
         ) from exc
 
+    target_config = ModelRegistry.get_model(body.model_name)
     if body.instances is not None:
-        target_config = ModelRegistry.get_model(body.model_name)
         if target_config is None or target_config.engine != "llamaserver":
             raise HTTPException(
                 status_code=422,
@@ -1096,6 +1096,51 @@ async def load_model(body: LoadModelRequest, request: Request) -> LoadModelRespo
             )
 
     try:
+        if target_config is not None and target_config.distributed:
+            # A distributed model always serves from its lead — reject a
+            # worker_id that names anything else instead of silently ignoring it.
+            if body.worker_id is not None and body.worker_id != target_config.distributed_lead:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Model '{body.model_name}' is distributed; worker_id must be its "
+                        f"configured lead '{target_config.distributed_lead}' or omitted"
+                    ),
+                )
+            success = await coordinator._load_distributed_model(
+                target_config,
+                quantization=quantization,
+                instances=body.instances,
+                caller=caller.id,
+            )
+            lead_worker_id = target_config.distributed_lead
+            if success:
+                audit.record(
+                    audit.ACTION_MODEL_LOAD,
+                    caller=caller.id,
+                    outcome=audit.OUTCOME_SUCCESS,
+                    model=body.model_name,
+                    worker=lead_worker_id,
+                )
+                return LoadModelResponse(
+                    status="loaded",
+                    model_name=body.model_name,
+                    worker_id=lead_worker_id,
+                )
+            audit.record(
+                audit.ACTION_MODEL_LOAD,
+                caller=caller.id,
+                outcome=audit.OUTCOME_FAILURE,
+                model=body.model_name,
+                worker=lead_worker_id,
+                detail="peer or lead reported failure",
+            )
+            return LoadModelResponse(
+                status="failed",
+                model_name=body.model_name,
+                message="Distributed model load failed (peer or lead reported failure)",
+            )
+
         if body.worker_id is not None:
             worker_info = coordinator.workers.get(body.worker_id)
             if worker_info is None:

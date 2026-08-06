@@ -422,9 +422,10 @@ impl Worker for WorkerService {
     async fn get_status(&self, _request: Request<Empty>) -> Result<Response<WorkerStatus>, Status> {
         debug!("Status request received - waiting for locks");
 
-        // Reap any llama-server children that exited on their own so status
-        // reports them as unloaded (process exit implies unloaded).
-        let reaped = self.model_loader.reap_exited_llamaservers().await;
+        // Reap any llama-server/ggml-rpc-server children that exited on their
+        // own so status reports them as unloaded (process exit implies unloaded).
+        let mut reaped = self.model_loader.reap_exited_llamaservers().await;
+        reaped.extend(self.model_loader.reap_exited_rpc_peers().await);
         if !reaped.is_empty() {
             let mut models = self.loaded_models.write().await;
             for name in &reaped {

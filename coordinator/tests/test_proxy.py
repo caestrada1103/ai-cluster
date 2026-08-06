@@ -15,6 +15,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.responses import Response, StreamingResponse
 
+import coordinator.proto.cluster_pb2 as pb
 from coordinator import proxy
 from coordinator.api import (
     _validate_proxy_envelope,
@@ -544,6 +545,76 @@ async def test_autoload_load_failure_raises(monkeypatch: Any) -> None:
 
     with pytest.raises(RuntimeError, match="Failed to load"):
         await coord.ensure_llamaserver_model_loaded("agentic-loadfail")
+
+
+def _register_distributed_llamaserver_model(
+    name: str = "agentic-distributed", port: int = 8303, lead: str = "lead-1", peers: Any = None
+) -> ModelConfig:
+    """A distributed engine='llamaserver' model (the DGX Spark tier shape)."""
+    cfg = ModelConfig(
+        name=name,
+        family=ModelFamily.QWEN,
+        parameters="229B-A10B",
+        min_memory_gb=205,
+        recommended_gpus=2,
+        max_gpus=2,
+        num_layers=0,
+        hidden_size=0,
+        num_attention_heads=0,
+        vocab_size=0,
+        max_seq_len=204800,
+        intermediate_size=0,
+        engine="llamaserver",
+        gguf_repo_id="unsloth/MiniMax-M2.7-GGUF",
+        gguf_file="UD-Q6_K/MiniMax-M2.7-UD-Q6_K-00001-of-00005.gguf",
+        llamaserver_port=port,
+        distributed=True,
+        distributed_lead=lead,
+        distributed_peers=peers if peers is not None else ["peer-1"],
+    )
+    ModelRegistry.MODELS[name] = cfg
+    return cfg
+
+
+@pytest.mark.asyncio
+async def test_autoload_dispatches_to_distributed_load_for_distributed_model(
+    monkeypatch: Any,
+) -> None:
+    """A distributed model must auto-load via `_load_distributed_model` (peers
+    then lead), never the single-worker `_load_model_on_worker` path, and
+    must return the LEAD worker regardless of which node the router might
+    otherwise have picked."""
+    from unittest.mock import AsyncMock
+
+    from coordinator.coordinator import ClusterCoordinator, WorkerInfo, WorkerState
+
+    _register_distributed_llamaserver_model(name="agentic-distributed", port=8303)
+    coord = ClusterCoordinator(make_settings())
+    lead = WorkerInfo(id="lead-1", address="10.0.0.1:50051", channel=AsyncMock(), stub=AsyncMock())
+    lead.state = WorkerState.HEALTHY
+    peer = WorkerInfo(id="peer-1", address="10.0.0.2:50051", channel=AsyncMock(), stub=AsyncMock())
+    peer.state = WorkerState.HEALTHY
+    coord.workers["lead-1"] = lead
+    coord.workers["peer-1"] = peer
+
+    calls = []
+
+    async def fake_distributed_load(model_config: Any, **kwargs: Any) -> bool:
+        calls.append(model_config.name)
+        lead.loaded_models["agentic-distributed"] = pb.LoadedModelInfo(
+            model_name="agentic-distributed"
+        )
+        return True
+
+    single_worker_load = AsyncMock()
+    monkeypatch.setattr(coord, "_load_distributed_model", fake_distributed_load)
+    monkeypatch.setattr(coord, "_load_model_on_worker", single_worker_load)
+
+    result = await coord.ensure_llamaserver_model_loaded("agentic-distributed")
+
+    assert result is lead
+    assert calls == ["agentic-distributed"]
+    single_worker_load.assert_not_awaited()
 
 
 @pytest.mark.asyncio

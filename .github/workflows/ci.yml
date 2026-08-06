@@ -71,6 +71,14 @@ jobs:
       - name: cargo check (cuda feature build.rs / nccl-detection logic)
         run: cargo check -p ai-worker --features cuda
 
+      # cubecl-hip only registers rustc-link-lib directives; `cargo check`
+      # never invokes the linker, so no ROCm install is needed here (same
+      # idea as the cuda check above). x86_64 only: cubecl-hip 0.8.1 has an
+      # aarch64-only Vec<i8>/Vec<u8> c_char build bug, verified 2026-08-04 —
+      # see the rust-arm64 job, which deliberately omits this check.
+      - name: cargo check (rocm feature)
+        run: cargo check -p ai-worker --features rocm
+
       - name: cargo fmt --check
         run: cargo fmt -p ai-worker -- --check
 
@@ -124,6 +132,38 @@ jobs:
       # motivated the CUDA base image bump in docker/Dockerfile.worker.
       - name: cargo check (cuda feature build.rs / nccl-detection logic)
         run: cargo check -p ai-worker --features cuda
+
+      # rocm deliberately excluded here: cubecl-hip 0.8.1 has an aarch64-only
+      # Vec<i8>/Vec<u8> c_char build bug, verified 2026-08-04. Tracked on the
+      # x86_64 rust job above; revisit once upstream fixes it.
+
+  rust-macos:
+    name: Rust (macOS/Metal)
+    # metal is the only feature in worker/Cargo.toml gated on
+    # target_os = "macos" (cubecl-wgpu's msl backend) — it can't even be
+    # attempted on a Linux runner, hence its own job.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        run: brew list protobuf &>/dev/null || brew install protobuf
+
+      - name: cargo check (metal feature)
+        run: cargo check -p ai-worker --features metal
 
   python:
     name: Python

@@ -170,7 +170,10 @@ OS/other processes), `WORKER_GRPC_AUTH_TOKEN` (shared-secret gRPC auth; wins
 over `worker.toml`'s `grpc_auth_token`), `WORKER_GRPC_BIND_HOST` /
 `LLAMASERVER_BIND_HOST` (win over `worker.toml`'s `grpc_bind_host` /
 `llamaserver_bind_host`; `docker-compose.yml` sets both to `0.0.0.0` per
-worker service — see [deployment.md](deployment.md)), `LLAMASERVER_BINARY_PATH`.
+worker service — see [deployment.md](deployment.md)), `LLAMASERVER_BINARY_PATH`,
+`RPC_SERVER_BIND_HOST` / `RPC_SERVER_BINARY_PATH` (win over `worker.toml`'s
+`rpc_server_bind_host` / `rpc_server_binary_path`; see "Distributed (Level 2,
+ggml-RPC)" below — unlike the other binds, never set this to `0.0.0.0`).
 Docker replicas also use `GPU_INDEX`, `GRPC_BASE_PORT`, `METRICS_BASE_PORT`
 (entrypoint computes port = base + index).
 
@@ -206,6 +209,10 @@ request_timeout_secs = 120
 # llamaserver_port_min = 1024                  # allowed llamaserver.port range
 # llamaserver_port_max = 65535
 # max_n_ctx = 262144                           # ceiling on caller-supplied n_ctx
+# rpc_server_enabled = false                   # opt this node into lending GPU(s) (feature llamacpp-rpc)
+# rpc_server_bind_host = "127.0.0.1"           # secure by default — set to the interconnect address, never 0.0.0.0
+# rpc_server_binary_path = "ggml-rpc-server"   # RPC_SERVER_BINARY_PATH env var wins
+# rpc_server_port = 50151                      # base port; a peer lending N GPUs uses port..port+N-1
 ```
 
 ### llama-server (`engine = "llamaserver"`) knobs
@@ -386,14 +393,95 @@ repo_id = "org/real-hf-repo"     # what the worker downloads (model_path)
   `finish_reason="length"`. Pass `--reasoning off` at the process level, or
   per-request via `{"chat_template_kwargs": {"enable_thinking": true}}`.
 
-### Distributed (Level 2, ggml-RPC) — schema only, not runnable yet
+### Distributed (Level 2, ggml-RPC)
 
-The `[models.<key>.distributed]` block (see `qwen2.5-coder-32b-gguf` in
-`config/models.toml`) documents the TOML shape for splitting one GGUF model
-across multiple machines via ggml-RPC. It isn't usable yet: it needs the
-worker's `llamacpp-rpc` feature built, a running `rpc-server` process on
-each peer node, and coordinator support for reading the block — none of
-which exist today.
+`[models.<key>.distributed]` (see `qwen2.5-coder-32b-gguf` in
+`config/models.toml`) splits one GGUF model's pipeline layers across a
+"lead" node (owns the real llama.cpp context) and one or more "rpc_server"
+peer nodes that only lend local GPU memory over the network:
+
+```toml
+[models."qwen2.5-coder-32b-gguf".distributed]
+enabled = true
+lead = "amd-node-1"                    # worker_id, must be a registered worker
+peers = ["amd-node-2", "amd-node-3"]   # worker_ids, loaded before the lead
+split = "auto"                         # "auto" or an explicit weight list, e.g. [0.5, 0.3, 0.2]
+rpc_port = 50151                       # base ggml-RPC port each peer binds from
+
+[models."qwen2.5-coder-32b-gguf".distributed.gpu_ids]
+amd-node-1 = [0]     # GPU ids that node contributes; omit a node to use every GPU it reports
+amd-node-2 = [0]
+amd-node-3 = [0]
+```
+
+`distributed = true` requires `engine = "llamacpp"` or `engine =
+"llamaserver"` (any other engine is rejected at config-load time). The DGX
+Spark tier's MiniMax-M2.7 entry uses `engine = "llamaserver"`, since it
+needs the worker-supervised `llama-server` process for real tool calling.
+
+Build the worker with the opt-in feature: `cargo build --release --features
+wgpu,llamacpp-rpc`.
+
+**Coordinator orchestration** (`ClusterCoordinator._load_distributed_model`
+in `coordinator/coordinator.py`): resolves `lead`/`peers` to registered,
+`HEALTHY` workers (a missing or unhealthy worker_id fails the whole load
+with no RPC sent at all); loads every peer FIRST, then the lead; computes
+the tensor split from `distributed_split` when given, else derives it from
+each contributed GPU's reported `total_memory` (largest-remainder/Hamilton
+apportionment, so weights always sum to exactly 1.0); unloads in the
+reverse order (lead first, then peers) since the lead depends on every peer
+while serving. One failed peer or a failed lead aborts the whole load and
+unloads whatever peers already succeeded — upstream llama.cpp has no
+partial-load recovery, so this never leaves a half-loaded model around.
+Inference for a distributed model is auto-pinned to its lead (the peers
+hold no servable model).
+
+**Worker roles**, set via the `distributed_role` metadata key:
+
+- **`rpc_server` (peer)** — lends this node's GPU(s), never loads a
+  servable model itself. The worker spawns one `ggml-rpc-server` child per
+  GPU id requested (ports `rpc_bind_port`, `rpc_bind_port + 1`, …), health
+  via a raw TCP connect (ggml-RPC has no HTTP surface), and kills it on
+  unload. Requires `rpc_server_enabled = true` in that node's
+  `worker.toml` — an explicit second opt-in beyond what the coordinator
+  requests — and a non-`0.0.0.0` `rpc_server_bind_host`.
+- **`lead`** — owns the real `llama-server` process and dials out to the
+  peers. `rpc_peers` and `tensor_split` are threaded into
+  `llama-server --rpc`/`--tensor-split`; both come from `distributed_role =
+  "lead"` metadata, never from `llamaserver.extra_args` — a network target
+  is a typed field here, not a free-form flag.
+
+**gRPC metadata contract** (`ModelConfig.grpc_metadata_rpc_server`/
+`grpc_metadata_lead` in `coordinator/models.py`, carried in the existing
+`ModelConfig.metadata` map — no proto change):
+
+| Key | Sent to | Meaning |
+|---|---|---|
+| `distributed_role` | peer, lead | `"rpc_server"` or `"lead"` |
+| `rpc_bind_port` | peer | base port for that peer's own `ggml-rpc-server` process(es); a node lending *k* GPUs binds `rpc_bind_port .. rpc_bind_port+k-1` |
+| `rpc_reserve_bytes` | peer | this node's share of the weights to reserve, split evenly across `gpu_ids`; omit to conservatively reserve each GPU's full available memory |
+| `rpc_devices` | peer | comma-separated `-d` value per GPU, e.g. `"CUDA0,CUDA1"` — required whenever more than one `gpu_id` is requested, since there is no portable way to guess a backend's device-naming scheme |
+| `rpc_peers` | lead | comma-separated `"host:port"` list, one entry per peer GPU, GPU-index-aligned with `tensor_split`'s peer portion |
+| `tensor_split` | lead | comma-separated weights. **Peers come first, the lead's own GPUs last** |
+
+**Leave `tensor_split` unset unless you have a reason.** llama.cpp then
+places layers by live available memory, which measured better than any
+hand-tuned value on identical nodes and adapts to mixed hardware. Note the
+ordering above is easy to invert, and a wrong split fails the load outright
+with `failed to allocate compute buffers`.
+
+Measured on two DGX Sparks over a 200 Gb/s ConnectX-7 link: splitting a
+35B-A3B GGUF cost -3.0% generation and gained +44% prefill versus one node.
+A 175 GiB model that fits no single node served at 18.19 tok/s with working
+tool calls. Both sides are unit-tested, but the coordinator-driven path has
+not yet been exercised on real hardware — those figures come from invoking
+llama.cpp directly. See `pending-work/18-dual-spark-when-cable-arrives.md`
+(internal, gitignored) for the full write-up and the llama.cpp RPC defects
+to plan around (partial-graph failure kills the whole server, no
+`--split-mode row` support, `--split-mode tensor` crashes MoE models).
+
+ggml-RPC has no auth or encryption — bind a peer's port to the trusted
+interconnect interface only, never a public one.
 
 ## Monitoring configs
 
