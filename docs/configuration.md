@@ -221,13 +221,15 @@ request_timeout_secs = 120
   `parallel` is still accepted as an alias, `instances` wins if both are
   set) — the number of concurrent conversation slots, mapped to
   `llama-server`'s `--parallel`. Also settable per request:
-  `POST /v1/models/load {"model_name": "...", "instances": 3}`. Each slot
-  gets the *full* configured `n_ctx` (see below) — raising `instances`
-  multiplies both the `-c` value passed to `llama-server` and the KV +
-  compute memory the worker reserves before spawning it. The worker reads
-  the GGUF header and reserves that memory up front, refusing the load with
-  a resource-exhausted error (rolling back any prior reservation) if it
-  will not fit, rather than spawning `llama-server` and finding out later.
+  `POST /v1/models/load {"model_name": "...", "instances": 3}`. Measured on
+  hardware, `llama-server` does **not** divide `-c` across slots — every
+  slot gets the *full* `-c` value (see the `n_ctx` note below). The worker
+  still computes `-c = n_ctx * instances` before spawning, so today raising
+  `instances` grows every slot's actual context ceiling, not just the
+  memory reserved for it. The worker reads the GGUF header and reserves
+  memory for that `-c` value up front, refusing the load with a
+  resource-exhausted error (rolling back any prior reservation) if it will
+  not fit, rather than spawning `llama-server` and finding out later.
 - **Slot affinity** (`COORDINATOR_LLAMASERVER_SLOT_AFFINITY`, default on):
   when a model has 2+ slots, the coordinator derives a stable slot index
   from the caller id (`sha256`, so it survives a restart) and injects
@@ -253,15 +255,29 @@ request_timeout_secs = 120
   callers can collide onto the same slot (there are more possible callers
   than slots, and nothing reserves one). Treat it as a consistency hint, not
   a guarantee — and note the mapping shifts if `instances` changes.
-- **`n_ctx` is per conversation slot, not a raw `-c` passthrough.**
-  `llama-server` divides its own `-c` value evenly across `--parallel`
-  slots (verified on hardware: `-c 262144` with `--parallel 4` reports
-  `n_ctx: 65536, total_slots: 4` via `GET /props`), so the worker computes
-  `-c = n_ctx * instances` before spawning it, keeping the registry's
-  `n_ctx` meaning "tokens per slot". `verify_props` cross-checks this
-  against the live `/props` response after startup as a diagnostic (warns,
-  never fails the load) — this is the mechanism that originally caught the
-  behavior.
+- **`n_ctx`, `-c`, and `--parallel` — measured, not assumed.** An earlier
+  version of this doc claimed `llama-server` divides its own `-c` value
+  evenly across `--parallel` slots. That is **false** for the current
+  build. Measured directly:
+  ```
+  -c 8192   (default --parallel): n_slots=4, n_ctx_slot=8192,   kv_unified=true
+  -c 196608 --parallel 1:         n_slots=1, n_ctx_slot=196608, kv_unified=false
+  ```
+  Every slot got the *full* `-c` value, not `-c / parallel`. With more than
+  one slot, `kv_unified=true` — slots share one KV pool instead of each
+  owning a private one. The worker's current code still computes
+  `-c = n_ctx * instances` before spawning (a holdover from the disproven
+  division assumption above), so it does **not** produce "`n_ctx` tokens
+  per slot" today — it gives *every* slot `n_ctx * instances` tokens.
+  Until that worker-side math is revisited, treat the registry's `n_ctx`
+  as accurate only at `instances = 1`; at higher `instances` the effective
+  per-slot ceiling is larger than `n_ctx` and, per the model's own
+  `n_ctx_train`, llama.cpp may cap an inflated `-c` and log "possible
+  training context overflow" rather than honor it. `verify_props`
+  cross-checks the spawned server's reported context against the worker's
+  own (still-multiplied) expectation as a diagnostic (warns, never fails
+  the load) — it flags a mismatch with what the worker *asked for*, not an
+  independent correctness check of that request.
 - **`n_gpu_layers`** (`-ngl`): partial-offload knob for consumer GPUs that
   can't fit every layer in VRAM; negative = offload all layers.
 - **`n_cpu_moe`** (`--n-cpu-moe <N>`): keeps the first `N` layers' MoE
@@ -280,9 +296,17 @@ request_timeout_secs = 120
   `-m`/`--model`, `-ngl`, `-ncmoe`, `-ctk`/`-ctv`) so a conflicting flag
   can't silently override a value already used to size the KV-cache
   reservation. Unknown flags are rejected outright. Reasoning/thinking
-  controls (`-rea`, `--reasoning`, `--reasoning-budget`,
-  `--reasoning-format`) are on the allowlist — a reasoning model otherwise
-  returns an empty `message.content` until it finishes thinking; see
+  controls — `-rea`/`--reasoning on|off|auto`, `--reasoning-budget N`
+  (token budget for thinking; `-1` unrestricted, `0` ends thinking
+  immediately), and `--reasoning-format` are on the allowlist; a reasoning
+  model otherwise returns an empty `message.content` until it finishes
+  thinking. `llama-server` also supports `--reasoning-budget-message` and
+  `--reasoning-preserve`, which are not yet on this worker's allowlist.
+  **Prefer `--reasoning-budget N` over `--reasoning off`** — it keeps
+  reasoning while bounding it, instead of disabling it outright. Watch for
+  the failure mode either way: reasoning on with a low `max_tokens` can
+  consume the whole budget on thinking and return empty `content` with
+  `finish_reason: "length"` before any answer is produced. See
   [troubleshooting.md](troubleshooting.md).
 
 ## Model registry: config/models.toml
@@ -376,22 +400,32 @@ repo_id = "org/real-hf-repo"     # what the worker downloads (model_path)
   or move to a 24 GB+ card.
 - **16 GB AMD fleet, Qwen3-Coder-30B-A3B**: 18.6 GB of Q4_K_M weights alone
   don't fit a 16 GB card even before KV cache, so MoE experts must be
-  partially CPU-offloaded via `n_cpu_moe`. `parallel` costs `parallel`×
-  the KV footprint (see the per-slot `n_ctx` note above), so raising it
-  needs proportionally more VRAM headroom.
+  partially CPU-offloaded via `n_cpu_moe`. The worker's `-c = n_ctx *
+  instances` math (see the `n_ctx`/`instances` notes above) still means
+  raising `instances` grows the `-c` value it asks `llama-server` for, so
+  raising it needs proportionally more VRAM headroom — but each slot now
+  shares one `kv_unified` pool sized to that `-c` value rather than each
+  slot owning a private multiple of it.
 - **DGX Spark tier (GB10, 121.6 GiB unified memory), Qwen3.6-35B-A3B**:
   hybrid-attention — only ~1 layer in 4 holds a real KV cache, the rest use
   a fixed ~63 MiB recurrent buffer that doesn't grow with context. Measured
   KV: 1360 MiB at 131072 total context, 2720 MiB at 262144 (linear). At
-  `n_ctx=262144, parallel=4` (total context 1,048,576): KV ≈10.6 GiB +
-  ~22.4 GB Q4_K_XL weights ≈ ~33 GB against 121 GiB unified memory (~88 GiB
-  headroom) — `parallel=4` isn't a memory ceiling here, it matches the
-  worker's default parallelism. Qwen3.6 is a reasoning model: with thinking
-  on, `message.content` stays empty until the chain-of-thought (in
-  `reasoning_content`) finishes — a short prompt can burn the whole
-  `max_tokens` budget on thinking and return empty content with
-  `finish_reason="length"`. Pass `--reasoning off` at the process level, or
-  per-request via `{"chat_template_kwargs": {"enable_thinking": true}}`.
+  `n_ctx=262144, instances=4` the worker currently asks for `-c =
+  1,048,576` (KV ≈10.6 GiB by the same linear rate) + ~22.4 GB Q4_K_XL
+  weights ≈ ~33 GB against 121 GiB unified memory (~88 GiB headroom) —
+  memory isn't the ceiling here. But `1,048,576` is 4x this model's own
+  262144 native training context, and per llama.cpp's own
+  training-context ceiling that inflated `-c` may get capped (logged as
+  "possible training context overflow") rather than honored — the
+  worker-side `n_ctx * instances` math predates the hardware finding above
+  and hasn't been reconciled with this model's `n_ctx_train` yet. Qwen3.6
+  is a reasoning model: with thinking on, `message.content` stays empty
+  until the chain-of-thought (in `reasoning_content`) finishes — a short
+  prompt can burn the whole `max_tokens` budget on thinking and return
+  empty content with `finish_reason="length"`. Prefer `--reasoning-budget
+  N` at the process level (keeps reasoning, bounds it) over `--reasoning
+  off` (drops it outright); per-request, `{"chat_template_kwargs":
+  {"enable_thinking": false}}` disables it for that call.
 
 ### Distributed (Level 2, ggml-RPC)
 
@@ -467,8 +501,24 @@ hold no servable model).
 **Leave `tensor_split` unset unless you have a reason.** llama.cpp then
 places layers by live available memory, which measured better than any
 hand-tuned value on identical nodes and adapts to mixed hardware. Note the
-ordering above is easy to invert, and a wrong split fails the load outright
-with `failed to allocate compute buffers`.
+ordering above is easy to invert — with `--rpc`, llama.cpp enumerates RPC
+peers *first* and the local GPU *last*, so `--tensor-split 0.55,0.45` sends
+`0.55` to the peer and `0.45` to the lead, not the other way around.
+Getting it backwards can fail the load outright with
+`ggml_gallocr_reserve_n_impl: failed to allocate CUDA0 buffer`. Measured,
+at full context on two identical 121 GiB nodes:
+
+| `--tensor-split` (peer,lead) | Lead free | Peer free |
+|---|---|---|
+| `0.40,0.60` | failed to allocate | — |
+| `0.45,0.55` | 6 GiB | 19 GiB |
+| `0.55,0.45` | 27 GiB | 0 GiB |
+| omitted (auto) | **17 GiB** | **10 GiB** |
+
+Roughly 2 GiB of headroom shifts per `0.01` of split. Omitting
+`--tensor-split` measured best on both balance and speed here, and it's the
+only option of the four that adapts automatically to non-identical
+hardware — hence the recommendation above.
 
 Measured on two DGX Sparks over a 200 Gb/s ConnectX-7 link: splitting a
 35B-A3B GGUF cost -3.0% generation and gained +44% prefill versus one node.
