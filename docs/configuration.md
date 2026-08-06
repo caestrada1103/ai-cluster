@@ -255,24 +255,34 @@ request_timeout_secs = 120
   callers can collide onto the same slot (there are more possible callers
   than slots, and nothing reserves one). Treat it as a consistency hint, not
   a guarantee — and note the mapping shifts if `instances` changes.
-- **`n_ctx`, `-c`, and `--parallel` — measured, not assumed.** An earlier
-  version of this doc claimed `llama-server` divides its own `-c` value
-  evenly across `--parallel` slots. That is **false** for the current
-  build. Measured directly:
+- **`n_ctx`, `-c`, and `--parallel` — it depends on `kv_unified`.** Whether
+  `llama-server` divides `-c` across slots is not fixed; it follows the
+  unified-KV mode, whose default is *"enabled if number of slots is auto"*:
+
+  | Slots | `kv_unified` | `-c` behaviour |
+  |---|---|---|
+  | auto (no `--parallel`) | `true` | one shared KV pool; each slot sees the full `-c` |
+  | explicit `--parallel N` | `false` | private per-slot caches; `-c` is divided by N |
+
+  Measured on hardware, all three consistent with that rule:
   ```
-  -c 8192   (default --parallel): n_slots=4, n_ctx_slot=8192,   kv_unified=true
-  -c 196608 --parallel 1:         n_slots=1, n_ctx_slot=196608, kv_unified=false
+  -c 8192   no --parallel (auto):  n_slots=4, n_ctx_slot=8192,   kv_unified=true
+  -c 196608 --parallel 1:          n_slots=1, n_ctx_slot=196608, kv_unified=false
+  -c 262144 --parallel 4:          n_slots=4, n_ctx_slot=65536,  kv_unified=false
   ```
-  Every slot got the *full* `-c` value, not `-c / parallel`. With more than
-  one slot, `kv_unified=true` — slots share one KV pool instead of each
-  owning a private one. Since that measurement, the worker passes the
-  registry's `n_ctx` straight through as `-c`, unmultiplied — every slot
-  gets exactly `n_ctx` tokens regardless of `instances`, so `-c` never
-  exceeds the model's own `n_ctx_train` on account of `instances` alone.
-  `verify_props` cross-checks the spawned server's reported context
-  against this same expectation as a diagnostic (warns, never fails the
-  load) — it flags a mismatch with what the worker *asked for*, not an
-  independent correctness check of that request.
+  **The worker always passes `--parallel`**, so slots are never auto and the
+  divided branch always applies. It therefore sends `-c = n_ctx * instances`
+  so each slot ends up with the registry's `n_ctx`. Note this means `-c`
+  itself can exceed the model's `n_ctx_train` when `instances > 1`; that is
+  expected — the per-slot result is what must stay within the model's limit.
+
+  A model can opt into the shared-pool branch with `--kv-unified` in
+  `extra_args`, in which case the multiplication over-allocates. Do not set
+  it unless you have measured what you get.
+
+  `verify_props` cross-checks the spawned server's reported per-slot context
+  times its slot count against the requested `-c`, as a diagnostic (warns,
+  never fails the load).
 - **`n_gpu_layers`** (`-ngl`): partial-offload knob for consumer GPUs that
   can't fit every layer in VRAM; negative = offload all layers.
 - **`n_cpu_moe`** (`--n-cpu-moe <N>`): keeps the first `N` layers' MoE
