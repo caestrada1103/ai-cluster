@@ -147,10 +147,9 @@ amd-node-3 = [0]
 #   instances   (int, optional)  -> --parallel <N> conversation slots, default 1
 #                                     (alias: parallel; overridable per-load)
 #   extra_args  (string, optional) -> whitespace-split, appended to the argv
-# Worker still passes -c = n_ctx * parallel; llama-server does NOT divide
-# -c across slots (measured on hardware) — every slot gets the full -c
-# value. n_ctx is only accurate as "tokens per slot" at parallel=1. See
-# docs/configuration.md before raising parallel on any model here.
+# Worker passes -c = n_ctx unmultiplied; llama-server does NOT divide -c
+# across slots (measured on hardware) — every slot gets the full n_ctx
+# value regardless of parallel. See docs/configuration.md.
 
 # --- 16 GB AMD fleet (ACTIVE today) ------------------------------------
 
@@ -167,7 +166,7 @@ engine = "llamaserver"
 # Verified against unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF (14.3 GiB, Q4_K_M).
 repo_id = "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF"
 file = "Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"  # single file, 14.3 GiB
-n_ctx = 16384  # exact per-slot ctx: parallel=1 below, so -c = n_ctx * 1
+n_ctx = 16384  # -c passed to llama-server as-is, regardless of parallel below
 # q8_0 KV cache; VRAM is razor-thin on this 16 GB card. See docs/configuration.md for the sizing math.
 cache_type_k = "q8_0"
 cache_type_v = "q8_0"
@@ -189,7 +188,7 @@ engine = "llamaserver"
 # Verified against unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF (18.6 GiB, Q4_K_M).
 repo_id = "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF"
 file = "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"  # single file, 18.6 GiB
-n_ctx = 32768  # exact per-slot ctx: parallel=1 below, so -c = n_ctx * 1
+n_ctx = 32768  # -c passed to llama-server as-is, regardless of parallel below
 cache_type_k = "q8_0"
 cache_type_v = "q8_0"
 n_cpu_moe = 40  # keeps the first 40 layers' MoE experts on CPU so the model fits a 16 GB card
@@ -216,10 +215,8 @@ engine = "llamaserver"
 repo_id = "unsloth/Qwen3.6-35B-A3B-GGUF"
 file = "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
 # n_gpu_layers omitted (all layers fit this host's unified memory).
-n_ctx = 262144  # the model's full native window; parallel=4 below means the
-# worker's current -c = n_ctx * parallel math asks for -c=1,048,576 (4x
-# native) — may get capped by llama.cpp's own training-context ceiling
-# instead of honored. See docs/configuration.md "n_ctx, -c, and --parallel".
+n_ctx = 262144  # the model's full native window; passed to -c as-is (not
+# multiplied by parallel below), so every slot gets exactly this context.
 # q8_0 roughly halves KV vs the f16 default.
 cache_type_k = "q8_0"
 cache_type_v = "q8_0"

@@ -223,11 +223,11 @@ request_timeout_secs = 120
   `llama-server`'s `--parallel`. Also settable per request:
   `POST /v1/models/load {"model_name": "...", "instances": 3}`. Measured on
   hardware, `llama-server` does **not** divide `-c` across slots — every
-  slot gets the *full* `-c` value (see the `n_ctx` note below). The worker
-  still computes `-c = n_ctx * instances` before spawning, so today raising
-  `instances` grows every slot's actual context ceiling, not just the
-  memory reserved for it. The worker reads the GGUF header and reserves
-  memory for that `-c` value up front, refusing the load with a
+  slot gets the *full* `-c` value, which is exactly the registry's `n_ctx`
+  (see the `n_ctx` note below). Raising `instances` grows how many
+  concurrent conversations can use that context, not any single slot's
+  ceiling. The worker reads the GGUF header and reserves memory for
+  `n_ctx * instances` up front, refusing the load with a
   resource-exhausted error (rolling back any prior reservation) if it will
   not fit, rather than spawning `llama-server` and finding out later.
 - **Slot affinity** (`COORDINATOR_LLAMASERVER_SLOT_AFFINITY`, default on):
@@ -265,18 +265,13 @@ request_timeout_secs = 120
   ```
   Every slot got the *full* `-c` value, not `-c / parallel`. With more than
   one slot, `kv_unified=true` — slots share one KV pool instead of each
-  owning a private one. The worker's current code still computes
-  `-c = n_ctx * instances` before spawning (a holdover from the disproven
-  division assumption above), so it does **not** produce "`n_ctx` tokens
-  per slot" today — it gives *every* slot `n_ctx * instances` tokens.
-  Until that worker-side math is revisited, treat the registry's `n_ctx`
-  as accurate only at `instances = 1`; at higher `instances` the effective
-  per-slot ceiling is larger than `n_ctx` and, per the model's own
-  `n_ctx_train`, llama.cpp may cap an inflated `-c` and log "possible
-  training context overflow" rather than honor it. `verify_props`
-  cross-checks the spawned server's reported context against the worker's
-  own (still-multiplied) expectation as a diagnostic (warns, never fails
-  the load) — it flags a mismatch with what the worker *asked for*, not an
+  owning a private one. Since that measurement, the worker passes the
+  registry's `n_ctx` straight through as `-c`, unmultiplied — every slot
+  gets exactly `n_ctx` tokens regardless of `instances`, so `-c` never
+  exceeds the model's own `n_ctx_train` on account of `instances` alone.
+  `verify_props` cross-checks the spawned server's reported context
+  against this same expectation as a diagnostic (warns, never fails the
+  load) — it flags a mismatch with what the worker *asked for*, not an
   independent correctness check of that request.
 - **`n_gpu_layers`** (`-ngl`): partial-offload knob for consumer GPUs that
   can't fit every layer in VRAM; negative = offload all layers.
@@ -298,10 +293,9 @@ request_timeout_secs = 120
   reservation. Unknown flags are rejected outright. Reasoning/thinking
   controls — `-rea`/`--reasoning on|off|auto`, `--reasoning-budget N`
   (token budget for thinking; `-1` unrestricted, `0` ends thinking
-  immediately), and `--reasoning-format` are on the allowlist; a reasoning
-  model otherwise returns an empty `message.content` until it finishes
-  thinking. `llama-server` also supports `--reasoning-budget-message` and
-  `--reasoning-preserve`, which are not yet on this worker's allowlist.
+  immediately), `--reasoning-budget-message`, `--reasoning-preserve`, and
+  `--reasoning-format` are on the allowlist; a reasoning model otherwise
+  returns an empty `message.content` until it finishes thinking.
   **Prefer `--reasoning-budget N` over `--reasoning off`** — it keeps
   reasoning while bounding it, instead of disabling it outright. Watch for
   the failure mode either way: reasoning on with a low `max_tokens` can
@@ -400,26 +394,22 @@ repo_id = "org/real-hf-repo"     # what the worker downloads (model_path)
   or move to a 24 GB+ card.
 - **16 GB AMD fleet, Qwen3-Coder-30B-A3B**: 18.6 GB of Q4_K_M weights alone
   don't fit a 16 GB card even before KV cache, so MoE experts must be
-  partially CPU-offloaded via `n_cpu_moe`. The worker's `-c = n_ctx *
-  instances` math (see the `n_ctx`/`instances` notes above) still means
-  raising `instances` grows the `-c` value it asks `llama-server` for, so
-  raising it needs proportionally more VRAM headroom — but each slot now
-  shares one `kv_unified` pool sized to that `-c` value rather than each
-  slot owning a private multiple of it.
+  partially CPU-offloaded via `n_cpu_moe`. `n_ctx` passes straight through
+  as `-c` (see the `n_ctx`/`instances` notes above), so raising `instances`
+  doesn't change `-c` at all — it only reserves `n_ctx` worth of KV memory
+  per added slot, and each slot shares one `kv_unified` pool sized to `-c`
+  rather than owning a private copy of it.
 - **DGX Spark tier (GB10, 121.6 GiB unified memory), Qwen3.6-35B-A3B**:
   hybrid-attention — only ~1 layer in 4 holds a real KV cache, the rest use
   a fixed ~63 MiB recurrent buffer that doesn't grow with context. Measured
   KV: 1360 MiB at 131072 total context, 2720 MiB at 262144 (linear). At
-  `n_ctx=262144, instances=4` the worker currently asks for `-c =
-  1,048,576` (KV ≈10.6 GiB by the same linear rate) + ~22.4 GB Q4_K_XL
-  weights ≈ ~33 GB against 121 GiB unified memory (~88 GiB headroom) —
-  memory isn't the ceiling here. But `1,048,576` is 4x this model's own
-  262144 native training context, and per llama.cpp's own
-  training-context ceiling that inflated `-c` may get capped (logged as
-  "possible training context overflow") rather than honored — the
-  worker-side `n_ctx * instances` math predates the hardware finding above
-  and hasn't been reconciled with this model's `n_ctx_train` yet. Qwen3.6
-  is a reasoning model: with thinking on, `message.content` stays empty
+  `n_ctx=262144, instances=4` the worker asks `llama-server` for
+  `-c = 262144` — exactly this model's native training context, not a
+  multiple of it (the worker no longer multiplies `-c` by `instances`).
+  KV ≈10.6 GiB by the same linear rate (2720 MiB per slot × 4 slots) +
+  ~22.4 GB Q4_K_XL weights ≈ ~33 GB against 121 GiB unified memory (~88 GiB
+  headroom) — memory isn't the ceiling here. Qwen3.6 is a reasoning model:
+  with thinking on, `message.content` stays empty
   until the chain-of-thought (in `reasoning_content`) finishes — a short
   prompt can burn the whole `max_tokens` budget on thinking and return
   empty content with `finish_reason="length"`. Prefer `--reasoning-budget
