@@ -883,13 +883,14 @@ impl ModelLoader {
         let (gguf_path, file_size) = download_gguf(&repo, &spec.file).await?;
 
         // Log the requested `-c` before spawning, so a misconfiguration is
-        // loud even if `/props` verification below is inconclusive. Every
-        // slot gets this full value — llama-server does not divide `-c`
-        // across `--parallel` slots. See docs/configuration.md.
-        match spec.total_ctx() {
+        // loud even if `/props` verification below is inconclusive.
+        match spec.total_ctx()? {
             Some(total) => info!(
-                "llama-server {}: -c {} requested for {} slot(s) (every slot gets the full value)",
-                model_name, total, spec.parallel
+                "llama-server {}: -c {} requested = {} tokens/slot across {} slot(s)",
+                model_name,
+                total,
+                spec.n_ctx.unwrap_or(0),
+                spec.parallel
             ),
             None => info!(
                 "llama-server {}: no n_ctx configured — using llama-server's own default context \
@@ -984,7 +985,7 @@ impl ModelLoader {
         }
 
         // Best-effort cross-check against what llama-server actually started with.
-        process.verify_props(spec.total_ctx()).await;
+        process.verify_props(spec.total_ctx()?).await;
 
         // Register the supervised child + a model-less instance (inference goes
         // through the coordinator HTTP proxy, not this worker's gRPC Infer).
