@@ -2645,7 +2645,8 @@ mod tests {
 
     #[tokio::test]
     async fn reservation_guard_releases_memory_on_drop_without_commit() {
-        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        // Synthetic device — a GPU-less CI runner reports 0 available.
+        let gpu_manager = Arc::new(GPUManager::test_with_capacity(10_000));
         let before = gpu_manager.get_available_memory(0).await;
 
         {
@@ -2678,7 +2679,8 @@ mod tests {
 
     #[tokio::test]
     async fn reservation_guard_commit_prevents_release_on_drop() {
-        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        // Synthetic device — a GPU-less CI runner reports 0 available.
+        let gpu_manager = Arc::new(GPUManager::test_with_capacity(10_000));
         let before = gpu_manager.get_available_memory(0).await;
 
         gpu_manager
