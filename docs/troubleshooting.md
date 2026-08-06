@@ -127,10 +127,10 @@ rocm-smi                      # AMD
   thinking may use (`-1` unrestricted, `0` ends thinking immediately)
   while still keeping reasoning on, rather than disabling it outright
   (what the shipped `qwen3.6-35b-a3b-gguf` entry currently does). Other
-  related flags: `--reasoning-format` and, on `llama-server` builds new
-  enough to support them, `--reasoning-budget-message` /
-  `--reasoning-preserve` (not yet on this worker's `extra_args`
-  allowlist). Per-request, disable thinking for a single call via
+  related flags on the allowlist: `--reasoning-format`,
+  `--reasoning-budget-message`, and `--reasoning-preserve` (the latter two
+  need a `llama-server` build new enough to support them). Per-request,
+  disable thinking for a single call via
   `{"chat_template_kwargs": {"enable_thinking": false}}`.
 - **`llamaserver.extra_args: flag '...' is not on the allowlist`** — the
   load was rejected before spawning `llama-server`. Flags with filesystem,
