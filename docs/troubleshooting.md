@@ -120,10 +120,17 @@ rocm-smi                      # AMD
   chain-of-thought into `message.reasoning_content` and leaves `content`
   empty until thinking finishes. A short prompt can burn the entire
   `max_tokens` budget on thinking and return empty `content` with
-  `finish_reason="length"` if a client only reads `content`. Fix at the
-  process level with `extra_args = "--reasoning off"` in the model's
-  `[models.X.llamaserver]` block (what the shipped `qwen3.6-35b-a3b-gguf`
-  entry does), or per-request via
+  `finish_reason="length"` if a client only reads `content` — the budget
+  was consumed by thinking before an answer started. **Prefer
+  `--reasoning-budget N` over `--reasoning off`** in the model's
+  `[models.X.llamaserver]` `extra_args` — it bounds how many tokens
+  thinking may use (`-1` unrestricted, `0` ends thinking immediately)
+  while still keeping reasoning on, rather than disabling it outright
+  (what the shipped `qwen3.6-35b-a3b-gguf` entry currently does). Other
+  related flags: `--reasoning-format` and, on `llama-server` builds new
+  enough to support them, `--reasoning-budget-message` /
+  `--reasoning-preserve` (not yet on this worker's `extra_args`
+  allowlist). Per-request, disable thinking for a single call via
   `{"chat_template_kwargs": {"enable_thinking": false}}`.
 - **`llamaserver.extra_args: flag '...' is not on the allowlist`** — the
   load was rejected before spawning `llama-server`. Flags with filesystem,
