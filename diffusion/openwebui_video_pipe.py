@@ -29,8 +29,8 @@ def _round_frames(n: int) -> int:
 class Pipe:
     class Valves(BaseModel):
         base_url: str = Field(
-            default="http://127.0.0.1:8090",
-            description="sd-server base URL",
+            default="http://127.0.0.1:8091",
+            description="sd-server base URL. Point at the video instance, local or remote.",
         )
         width: int = Field(default=720, description="Output width")
         height: int = Field(default=1280, description="Output height")

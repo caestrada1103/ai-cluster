@@ -66,7 +66,20 @@ SD_EXTRA_ARGS="--diffusion-model /models/diffusion_models/Wan2.2-I2V-A14B-LowNoi
   ./scripts/run-diffusion.sh --name ai-sd-video --port 8091
 ```
 
-Point the video Pipe's `base_url` Valve at the video instance.
+Point the video Pipe's `base_url` Valve at the video instance (`http://127.0.0.1:8091`
+by default).
+
+The two instances need not share a host. To run the video generator on another
+machine, set `SD_SERVER_HOST` to an address that machine's peers can reach, and
+point the Pipe's `base_url` there:
+
+```bash
+SD_SERVER_HOST=10.0.0.2 SD_SERVER_PORT=8091 SD_EXTRA_ARGS="..." \
+  ./scripts/run-diffusion.sh --name ai-sd-video
+```
+
+Because the model is loaded per process, this splits the workload across
+machines; it does not pool memory for a single generation.
 
 ## Models
 
@@ -140,7 +153,7 @@ works around this: it appears as a selectable model, **"Video
 
 | Valve | Default | Purpose |
 |---|---|---|
-| `base_url` | `http://127.0.0.1:8090` | `sd-server` base URL |
+| `base_url` | `http://127.0.0.1:8091` | `sd-server` base URL (the video instance) |
 | `width` | `720` | Output width |
 | `height` | `1280` | Output height |
 | `video_frames` | `97` | Frame count, rounded to 4n+1 |
