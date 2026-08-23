@@ -379,6 +379,41 @@ services:
     mem_limit: ${OPEN_WEBUI_MEM_LIMIT:-2g}
     pids_limit: 512
 
+  # ==========================================================================
+  # sd-server (stable-diffusion.cpp) — optional image/video generation.
+  # NVIDIA GPU reservation shown here (works for RTX 3080 and DGX Spark alike
+  # via SD_IMAGE_TAG); AMD/Intel: use scripts/run-diffusion.sh instead.
+  #   COMPOSE_PROFILES=diffusion docker compose up -d sd-server
+  # ==========================================================================
+  sd-server:
+    profiles: ["diffusion"]
+    image: ${SD_IMAGE:-ghcr.io/leejet/stable-diffusion.cpp:${SD_IMAGE_TAG:-master-cuda-spark}}
+    container_name: ai-sd-server
+    environment:
+      - SD_MODEL=${SD_MODEL:-}
+      - SD_EXTRA_ARGS=${SD_EXTRA_ARGS:-}
+    # Image entrypoint is /sd-cli; override it to reach the server binary.
+    entrypoint: ["sh", "-c"]
+    command:
+      - 'exec /sd-server --listen-ip 0.0.0.0 --listen-port 8080 $${SD_MODEL:+-m /models/$$SD_MODEL} $$SD_EXTRA_ARGS'
+    volumes:
+      - ${SD_MODELS_DIR:-./models/diffusion}:/models:ro
+      - ${SD_OUTPUT_DIR:-./data/diffusion}:/output
+    networks:
+      - ai-cluster-net
+    # Not published by default — see docker-compose.expose-ports.yml.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_INDEX:-0}"]
+              capabilities: [gpu]
+    logging: *default-logging
+    restart: unless-stopped
+    mem_limit: ${SD_MEM_LIMIT:-8g}
+    pids_limit: 512
+
 networks:
   ai-cluster-net:
     driver: bridge

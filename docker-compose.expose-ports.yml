@@ -59,3 +59,7 @@ services:
   open-webui:
     ports:
       - "8080:8080"
+
+  sd-server:
+    ports:
+      - "${SD_SERVER_PORT:-8090}:8080"

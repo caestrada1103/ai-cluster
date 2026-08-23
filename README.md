@@ -75,6 +75,7 @@ Whether you have a single workstation with multiple GPUs or a rack of servers, A
 | **REST API** | OpenAI-compatible API for easy integration |
 | **Streaming** | Stream tokens as they're generated |
 | **Quantization** | Planned — FP16/INT8/INT4/FP8 (weights load as FP32 today; non-NONE requests are rejected) |
+| **Image & Video Generation** | Optional stable-diffusion.cpp `sd-server` add-on, wired into Open-WebUI (native image engine + a video Pipe function) — see [Diffusion Guide](docs/diffusion.md) |
 
 ### Advanced Features
 
@@ -311,6 +312,7 @@ for a lighter `llamacpp`-engine example instead of `llamaserver`.
 | [Configuration Guide](docs/configuration.md) | All configuration options explained |
 | [Deployment Guide](docs/deployment.md) | Single machine, cluster, Kubernetes, cloud |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues and solutions |
+| [Diffusion Guide](docs/diffusion.md) | Optional image/video generation (`sd-server`), Open-WebUI wiring |
 
 ### Quick Links
 
@@ -319,6 +321,7 @@ for a lighter `llamacpp`-engine example instead of `llamaserver`.
 - [API Examples](#api-reference)
 - [Sizing Examples (measured on real hardware)](docs/configuration.md#sizing-examples-measured-on-real-hardware)
 - [Security: Secure by Default](#security-secure-by-default)
+- [Diffusion Guide (Image & Video Generation)](docs/diffusion.md)
 
 ---
 
