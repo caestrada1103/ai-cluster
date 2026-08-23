@@ -883,13 +883,14 @@ impl ModelLoader {
         let (gguf_path, file_size) = download_gguf(&repo, &spec.file).await?;
 
         // Log the requested `-c` before spawning, so a misconfiguration is
-        // loud even if `/props` verification below is inconclusive. Every
-        // slot gets this full value — llama-server does not divide `-c`
-        // across `--parallel` slots. See docs/configuration.md.
-        match spec.total_ctx() {
+        // loud even if `/props` verification below is inconclusive.
+        match spec.total_ctx()? {
             Some(total) => info!(
-                "llama-server {}: -c {} requested for {} slot(s) (every slot gets the full value)",
-                model_name, total, spec.parallel
+                "llama-server {}: -c {} requested = {} tokens/slot across {} slot(s)",
+                model_name,
+                total,
+                spec.n_ctx.unwrap_or(0),
+                spec.parallel
             ),
             None => info!(
                 "llama-server {}: no n_ctx configured — using llama-server's own default context \
@@ -984,7 +985,7 @@ impl ModelLoader {
         }
 
         // Best-effort cross-check against what llama-server actually started with.
-        process.verify_props(spec.total_ctx()).await;
+        process.verify_props(spec.total_ctx()?).await;
 
         // Register the supervised child + a model-less instance (inference goes
         // through the coordinator HTTP proxy, not this worker's gRPC Infer).
@@ -2644,7 +2645,8 @@ mod tests {
 
     #[tokio::test]
     async fn reservation_guard_releases_memory_on_drop_without_commit() {
-        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        // Synthetic device — a GPU-less CI runner reports 0 available.
+        let gpu_manager = Arc::new(GPUManager::test_with_capacity(10_000));
         let before = gpu_manager.get_available_memory(0).await;
 
         {
@@ -2677,7 +2679,8 @@ mod tests {
 
     #[tokio::test]
     async fn reservation_guard_commit_prevents_release_on_drop() {
-        let gpu_manager = Arc::new(GPUManager::new(&[0]).await.unwrap());
+        // Synthetic device — a GPU-less CI runner reports 0 available.
+        let gpu_manager = Arc::new(GPUManager::test_with_capacity(10_000));
         let before = gpu_manager.get_available_memory(0).await;
 
         gpu_manager

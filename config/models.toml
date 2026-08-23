@@ -147,9 +147,9 @@ amd-node-3 = [0]
 #   instances   (int, optional)  -> --parallel <N> conversation slots, default 1
 #                                     (alias: parallel; overridable per-load)
 #   extra_args  (string, optional) -> whitespace-split, appended to the argv
-# Worker passes -c = n_ctx unmultiplied; llama-server does NOT divide -c
-# across slots (measured on hardware) — every slot gets the full n_ctx
-# value regardless of parallel. See docs/configuration.md.
+# n_ctx is PER SLOT. The worker always passes --parallel, so llama-server
+# splits -c into private per-slot caches; the worker sends n_ctx * parallel
+# so each slot gets n_ctx. See docs/configuration.md.
 
 # --- 16 GB AMD fleet (ACTIVE today) ------------------------------------
 
