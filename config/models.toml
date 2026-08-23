@@ -230,6 +230,35 @@ extra_args = "--reasoning off"
 port = 8086
 parallel = 4  # sizing math: docs/configuration.md
 
+[models."qwen3.8-27b-gguf"]
+family = "qwen"
+description = "Qwen3.8-27B — dense 27.78B, hybrid attention (16 of 64 layers full, 48 Gated DeltaNet linear, so KV is ~1/4 a conventional 27B), native multimodal, Apache 2.0, 262144 native ctx. Source: https://huggingface.co/Qwen/Qwen3.8-27B"
+parameters = "27B"
+# 29.1 GB Q8_0 weights + 8.6 GB KV per slot. Only 16 of 64 layers keep a KV
+# cache, so several slots still fit one Spark.
+min_memory_gb = 64
+recommended_gpus = 1
+max_gpus = 1
+engine = "llamaserver"
+
+# Runs on llama.cpp b9941 unchanged: the GGUF declares arch qwen35 (config
+# model_type "qwen3_5"), already supported. "Qwen3.8" names the release, not a
+# new architecture. Validated on a DGX Spark — loads, generates, calls tools.
+[models."qwen3.8-27b-gguf".gguf]
+repo_id = "bartowski/Qwen3.8-27B-GGUF"
+file = "Qwen3.8-27B-Q8_0.gguf"  # 29.1 GB
+# 262144 is n_ctx_train. Asking for more is clamped to it — YaRN rope scaling
+# was tried and did not lift the cap.
+n_ctx = 262144
+cache_type_k = "q8_0"
+cache_type_v = "q8_0"
+
+[models."qwen3.8-27b-gguf".llamaserver]
+port = 8088
+parallel = 4
+# Thinking is on by default; --reasoning off trades quality for latency.
+extra_args = "--jinja"
+
 # --- Dual-Spark tier — needs BOTH nodes ----------------------------------
 # Values below are measured, not estimated: served across two nodes over
 # ggml-RPC on 2026-08-05 at 18.19 tok/s generation and 642 tok/s prefill, with

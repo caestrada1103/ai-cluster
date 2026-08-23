@@ -426,6 +426,26 @@ repo_id = "org/real-hf-repo"     # what the worker downloads (model_path)
   N` at the process level (keeps reasoning, bounds it) over `--reasoning
   off` (drops it outright); per-request, `{"chat_template_kwargs":
   {"enable_thinking": false}}` disables it for that call.
+- **DGX Spark tier (GB10), Qwen3.8-27B**: dense 27.78B with the same
+  hybrid-attention idea as Qwen3.6 — `full_attention_interval = 4`, so 16 of
+  64 layers hold a KV cache and the other 48 use Gated DeltaNet linear
+  attention with a fixed-size recurrent state. From the config (`head_dim`
+  256, 4 KV heads), q8_0 KV works out to ~32 KiB/token, or ~8.6 GB per slot
+  at 262144. With 29.1 GB of Q8_0 weights that is ~64 GB against 121 GiB.
+  Two things are worth knowing before adding it:
+  - **The architecture is `qwen35`, not a new one.** The GGUF inherits it
+    from the model's `model_type = "qwen3_5"`; "Qwen3.8" names the release.
+    A llama.cpp build old enough to predate the model still runs it, so
+    check `src/llama-arch.cpp` for the arch string rather than comparing
+    build numbers. Quantizers' "made with release bNNNNN, you'll need that
+    or newer" README lines are boilerplate and are not evidence either way.
+  - **262144 is a hard ceiling.** It is the GGUF's `n_ctx_train`. Asking for
+    more logs `n_ctx_seq (N) > n_ctx_train (262144)` and llama.cpp then
+    clamps the slot back to 262144. Adding `--rope-scaling yarn --rope-scale
+    4 --yarn-orig-ctx 262144` does not lift the cap: the slot still comes up
+    at 262144. Community "1M context" claims for this model refer to a YaRN
+    configuration upstream does not ship — `config.json` has no
+    `rope_scaling` block — so treat `n_ctx_train` as the real limit.
 
 ### Distributed (Level 2, ggml-RPC)
 
