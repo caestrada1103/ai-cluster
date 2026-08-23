@@ -32,6 +32,10 @@ TODO.md
 !models/.gitkeep
 /worker/data/
 
+# Generated output
+/data/*
+!data/.gitkeep
+
 # Config
 /config/local.yaml
 .env
